@@ -13,7 +13,9 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
-build/
+# setuptools build output only — anchored to repo root so it doesn't swallow
+# the `relife/build/` package (the build-orchestration module).
+/build/
 
 # Workspaces the agent builds in (override per-project as needed)
 /workspace/

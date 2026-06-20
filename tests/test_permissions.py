@@ -50,6 +50,7 @@ def test_powershell_treated_like_bash():
 
 def test_trusted_mcp_allows():
     assert d("mcp__relife_memory__memory_recall", {"query": "x"}) == "allow"
+    assert d("mcp__relife_build__build_plan_set", {"milestones": []}) == "allow"
 
 
 def test_unknown_mcp_asks():

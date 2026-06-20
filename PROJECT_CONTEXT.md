@@ -62,8 +62,17 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 17 passing (`python -m pytest tests/`). Covers permission classify, store
-save/recall, skills, and the recall hook injecting memory+skills.
+**Tests:** 26 passing (`python -m pytest tests/`). Covers permission classify, store
+save/recall, skills, the recall hook injecting memory+skills, and the build ledger +
+ledger MCP tools (deterministic — no live agent).
+
+**Large builds (`relife build`) — added post-v1.** Orchestration layer for projects too big
+for one context: the orchestrator decomposes the spec into milestones (persisted in a
+`BuildLedger` at `data/builds/<id>/`), delegates each to a fresh-context `builder` subagent via
+the Task tool (keeps the orchestrator's context small), and is **resumable** — `relife build
+--resume` continues after a Max session limit using the ledger + persisted `session_id`. See
+`relife/build/`. Parallel milestones deferred. Not yet exercised in a live end-to-end run
+(deterministic tests cover the persistence layer; live smoke pending, budget-aware).
 
 ## 5. File map (`D:\ReLife`)
 
@@ -72,7 +81,7 @@ pyproject.toml              # deps: claude-agent-sdk, typer, rich
 PROJECT_CONTEXT.md          # this file
 README.md
 relife/
-  cli.py                    # Typer: `relife do "<task>"`, `relife chat`  (--workspace)
+  cli.py                    # Typer: `relife do`, `relife chat`, `relife build` (--workspace)
   agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming)
   config.py                 # MODEL, EFFORT, paths, agent_env() (gh PATH), default_mcp_servers()
   permissions.py            # classify() + make_permission_callback() (can_use_tool)
@@ -83,8 +92,14 @@ relife/
     skills.py               # Markdown skill files, keyword recall
     server.py               # in-process MCP server (memory_save/recall, skill_write/find)
     _text.py                # shared tokenizer w/ stopwords
-data/                       # gitignored runtime: relife.db, skills/, logs
-tests/                      # 17 unit/integration tests
+  build/                    # `relife build`: orchestrated, resumable large builds
+    ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
+    server.py               # relife_build MCP server (plan_set/milestone_update/status)
+    agents.py               # `builder` subagent definition (Task-delegated milestones)
+    orchestrator.py         # run_build(): decompose → delegate → resume
+    prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
+data/                       # gitignored runtime: relife.db, skills/, builds/, logs
+tests/                      # 26 unit/integration tests
 ```
 
 ## 6. Setup / run

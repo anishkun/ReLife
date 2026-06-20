@@ -20,6 +20,7 @@ EFFORT = "high"  # low | medium | high | xhigh | max  — agentic work wants hig
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_DIR.parent
 DATA_DIR = PROJECT_ROOT / "data"          # gitignored: db + logs
+BUILDS_DIR = DATA_DIR / "builds"          # one subdir per orchestrated `relife build`
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
 
@@ -30,6 +31,7 @@ DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 def ensure_dirs() -> None:
     """Create runtime directories that must exist before a run."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BUILDS_DIR.mkdir(parents=True, exist_ok=True)
     DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 

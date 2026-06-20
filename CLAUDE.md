@@ -15,7 +15,9 @@ python -m pytest tests/test_permissions.py::test_name -v   # single test
 
 relife do "<task>"                # one-shot: run a task to completion
 relife chat                       # interactive multi-turn session
-# both accept --workspace/-w PATH (default ./workspace) — the dir the agent works in
+relife build "<spec>"             # orchestrated large build (decompose → delegate → resume)
+relife build --resume [ID]        # continue a build (most recent for the workspace if no ID)
+# all accept --workspace/-w PATH (default ./workspace) — the dir the agent works in
 ```
 
 Prereqs to actually *run* the agent (not needed for tests): Python ≥3.11, Node.js (`npx` for the browser MCP), a logged-in `claude` CLI on Max, and authenticated `gh`.
@@ -38,6 +40,14 @@ Two retrieval stores, both keyword + recency, **no embeddings** in v1 (the publi
 - `_text.py` — shared stopword tokenizer used by both stores' recall.
 
 The system prompt uses the **`claude_code` preset** with `prompts/system.md` appended (persona + safety + memory/skill instructions). `setting_sources=None` deliberately prevents inheriting the surrounding repo's Claude Code settings.
+
+### Build orchestration (`relife/build/`)
+`relife build` scales to large projects the single-context `do` loop can't: it **decomposes → delegates → resumes**.
+- `ledger.py` — `BuildLedger`: durable plan + progress at `data/builds/<id>/ledger.json` (+ a `plan.md` mirror). Source of truth for resume. Pure/deterministic.
+- `server.py` — in-process MCP server `relife_build` (tools `build_plan_set`/`build_milestone_update`/`build_status`), bound to one ledger per run via closure. Surfaces as `mcp__relife_build__*` → already auto-allowed by the trusted `mcp__relife` prefix (no permission change).
+- `agents.py` — the `builder` `AgentDefinition` the orchestrator delegates each milestone to via the **Task** tool, so each milestone runs in a *fresh context* (the orchestrator stays small). Parallel milestones are deliberately deferred.
+- `orchestrator.py` — `run_build()`: wires ledger + server + builder + the `prompts/orchestrator.md` persona, streams the run, and persists `ResultMessage.session_id` so `--resume` continues the same session. Resume also re-injects the ledger state, so it's robust even if the CLI session is gone.
+- `build_options` (agent.py) gained `system_prompt`/`agents`/`resume`/`max_budget_usd` params to support this; `do`/`chat` are unchanged.
 
 ## Non-obvious constraints
 

@@ -44,12 +44,20 @@ console = Console(legacy_windows=False)
 CanUseTool = Callable[[str, dict[str, Any], Any], Awaitable[Any]]
 
 
-def _system_prompt() -> dict[str, Any]:
-    """Use the Claude Code preset (keeps strong coding behavior) + our persona."""
-    append = ""
-    if config.SYSTEM_PROMPT_FILE.exists():
-        append = config.SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+def preset_system_prompt(append_file: Path | None = None) -> dict[str, Any]:
+    """Claude Code preset (keeps strong coding behavior) + an appended persona.
+
+    ``append_file`` defaults to the standard ReLife persona; callers like the
+    build orchestrator pass their own file to swap in a different persona.
+    """
+    path = append_file or config.SYSTEM_PROMPT_FILE
+    append = path.read_text(encoding="utf-8") if path.exists() else ""
     return {"type": "preset", "preset": "claude_code", "append": append}
+
+
+def _system_prompt() -> dict[str, Any]:
+    """Default persona append (the standard `do`/`chat` system prompt)."""
+    return preset_system_prompt()
 
 
 def build_options(
@@ -59,17 +67,30 @@ def build_options(
     can_use_tool: CanUseTool | None = None,
     mcp_servers: dict[str, Any] | None = None,
     hooks: dict[str, Any] | None = None,
+    system_prompt: dict[str, Any] | None = None,
+    agents: dict[str, Any] | None = None,
+    resume: str | None = None,
+    max_budget_usd: float | None = None,
 ) -> ClaudeAgentOptions:
-    """Assemble ClaudeAgentOptions from config + per-run overrides."""
+    """Assemble ClaudeAgentOptions from config + per-run overrides.
+
+    ``agents`` defines subagents the model can delegate to via the Task tool
+    (used by ``relife build``). ``resume`` continues a prior CLI session by id.
+    ``system_prompt`` overrides the default persona append (the orchestrator
+    swaps in its own).
+    """
     return ClaudeAgentOptions(
         model=config.MODEL,
         effort=config.EFFORT,
-        system_prompt=_system_prompt(),
+        system_prompt=system_prompt or _system_prompt(),
         cwd=str(cwd),
         permission_mode=permission_mode or config.DEFAULT_PERMISSION_MODE,
         can_use_tool=can_use_tool,
         mcp_servers=mcp_servers or {},
         hooks=hooks,
+        agents=agents,
+        resume=resume,
+        max_budget_usd=max_budget_usd,
         # Ensure CLIs like `gh` are on PATH for the agent subprocess.
         env=config.agent_env(),
         # Don't inherit the surrounding repo's Claude Code settings — ReLife is

@@ -14,6 +14,7 @@ import typer
 
 from . import config
 from .agent import run_chat, run_task
+from .build.orchestrator import run_build
 from .hooks import memory_hooks
 from .permissions import make_permission_callback
 
@@ -65,6 +66,51 @@ def chat(
     anyio.run(
         lambda: run_chat(
             cwd=ws, can_use_tool=can_use_tool, mcp_servers=mcp_servers, hooks=hooks
+        )
+    )
+
+
+@app.command("build")
+def build(
+    spec: Optional[str] = typer.Argument(
+        None, help="What to build, in plain language. Omit when using --resume."
+    ),
+    workspace: Optional[Path] = typer.Option(
+        None, "--workspace", "-w", help="Directory the agent builds in."
+    ),
+    resume: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        help="Resume a build. Pass a build id, or use the flag with no value "
+        "to resume the most recent build for this workspace.",
+        is_flag=False,
+        flag_value="__latest__",
+    ),
+    budget: Optional[float] = typer.Option(
+        None, "--budget", help="Optional max usage-equivalent budget (USD) for the run."
+    ),
+) -> None:
+    """Orchestrate a large, multi-milestone build (decompose → delegate → resume)."""
+    ws = _resolve_workspace(workspace)
+    typer.secho(f"workspace: {ws}", fg=typer.colors.BRIGHT_BLACK)
+
+    resume_id: Optional[str] = None
+    if resume is not None:
+        resume_id = None if resume == "__latest__" else resume
+    elif not spec:
+        typer.secho("Provide a spec to build, or --resume a prior build.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    can_use_tool = make_permission_callback(ws)
+    hooks = memory_hooks()
+    anyio.run(
+        lambda: run_build(
+            spec,
+            cwd=ws,
+            can_use_tool=can_use_tool,
+            hooks=hooks,
+            resume_id=resume_id,
+            budget=budget,
         )
     )
 
