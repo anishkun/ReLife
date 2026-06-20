@@ -1,0 +1,19 @@
+# ReLife runtime data (memory db, logs) — never commit
+/data/
+*.db
+*.sqlite3
+
+# Local, machine-specific Claude Code settings (permission allowlists etc.)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Workspaces the agent builds in (override per-project as needed)
+/workspace/
