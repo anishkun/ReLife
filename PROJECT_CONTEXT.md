@@ -146,9 +146,8 @@ relife chat
   **public** repo `anishkun/ReLife` (https://github.com/anishkun/ReLife). Added a proprietary
   "All Rights Reserved" `LICENSE` (custom → GitHub shows no license badge, by design).
   `.claude/settings.local.json` is gitignored (machine-local).
-- **Test repo `anishkun/relife-demo` — DELETE PENDING.** User chose to delete it, but `gh`
-  lacks the `delete_repo` scope. Grant once with
-  `gh auth refresh -h github.com -s delete_repo`, then `gh repo delete anishkun/relife-demo --yes`.
+- **Test repo `anishkun/relife-demo` — ✅ DELETED.** Removed via the GitHub web UI
+  (the `gh` token lacked the `delete_repo` scope). API confirms 404.
 - **Full live skills round-trip** (scaffold twice, second run reuses skill) was deferred by
   the session limit; each half is proven separately. Run when budget is comfortable.
 - **Phase 2/3:** standalone MCP memory server; always-on daemon + UI; outward capabilities
