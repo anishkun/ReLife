@@ -71,8 +71,12 @@ for one context: the orchestrator decomposes the spec into milestones (persisted
 `BuildLedger` at `data/builds/<id>/`), delegates each to a fresh-context `builder` subagent via
 the Task tool (keeps the orchestrator's context small), and is **resumable** — `relife build
 --resume` continues after a Max session limit using the ledger + persisted `session_id`. See
-`relife/build/`. Parallel milestones deferred. Not yet exercised in a live end-to-end run
-(deterministic tests cover the persistence layer; live smoke pending, budget-aware).
+`relife/build/`. Parallel milestones deferred. **Exercised live end-to-end & verified:**
+build `20260620-…-0c1b` (multi-service FastAPI+CLI+tests todo app, 7 milestones, 60 tests)
+and build `20260621-…-a556` (`tempconv` CLI, 4 milestones, 41 tests, $1.39 usage-equiv). Both
+decomposed → delegated each milestone to a fresh-context `builder` → completed within budget;
+deterministic tests still cover the persistence layer. Resume path not yet triggered live (no
+session limit hit), but `session_id` is persisted for it.
 
 ## 5. File map (`D:\ReLife`)
 
