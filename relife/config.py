@@ -21,8 +21,47 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_DIR.parent
 DATA_DIR = PROJECT_ROOT / "data"          # gitignored: db + logs
 BUILDS_DIR = DATA_DIR / "builds"          # one subdir per orchestrated `relife build`
+SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
+WORKFLOWS_DIR = DATA_DIR / "workflows"    # one Markdown file per learned workflow
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
+
+
+# --- Cognitive memory model ------------------------------------------------
+# ReLife's memory behaves like a brain: each item's relevance rises when it is
+# used (reinforcement) and decays when ignored (forgetting). These tunables
+# control that curve and how recall fuses meaning + keywords + activation.
+#
+# Activation (ACT-R-inspired):
+#   activation = ln(1 + use_count) - DECAY*ln(1 + age_days(last_used))
+#                + IMPORTANCE_BOOST*importance
+DECAY = float(os.environ.get("RELIFE_DECAY", "0.35"))          # forgetting rate
+IMPORTANCE_BOOST = 1.5     # how strongly explicit importance lifts activation
+
+# Forgetting (archival) — applied by the consolidation sweep, never by recall.
+FORGET_THRESHOLD = 0.20    # archive when activation falls below this …
+MIN_FORGET_AGE_DAYS = 14.0 # … and the item has been idle at least this long …
+PIN_THRESHOLD = 0.80       # … and importance is under this (>= is "pinned").
+
+# Fused recall score = weighted sum of the four signals.
+W_SEM = 0.45               # semantic similarity (local embeddings)
+W_KW = 0.30                # keyword overlap (FTS5 / tokens)
+W_ACT = 0.15               # cognitive activation (decay/reinforcement)
+W_IMP = 0.10               # explicit importance
+
+# Stage-1 candidate generation (keeps recall cheap on large stores).
+CANDIDATE_TOPN = 50        # max candidates pulled before fuse-ranking
+SEM_CANDIDATE_THRESHOLD = 0.60  # a zero-keyword row is a candidate only above this
+
+# Embeddings — a LOCAL ONNX model (no API key, runs offline). Soft-optional:
+# if unavailable, recall degrades to keyword + activation.
+EMBED_MODEL = os.environ.get("RELIFE_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDINGS_ENABLED = os.environ.get("RELIFE_EMBEDDINGS", "auto")  # auto|on|off
+
+# Consolidation ("sleep" pass).
+RECUR_THRESHOLD = 3        # a signature must repeat this many times to be a pattern
+AUTO_CONSOLIDATE = os.environ.get("RELIFE_AUTO_CONSOLIDATE", "1") != "0"
+CONSOLIDATE_EVERY = 5      # auto-run after this many new episodes/events
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

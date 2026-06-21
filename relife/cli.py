@@ -115,5 +115,51 @@ def build(
     )
 
 
+@app.command("consolidate")
+def consolidate_cmd() -> None:
+    """Run a memory consolidation ('sleep') pass now: fade unused memories, merge
+    duplicates, detect recurring patterns, and synthesize workflows."""
+    config.ensure_dirs()
+    from .memory import consolidate
+
+    report = consolidate.run_consolidation()
+    typer.secho(f"Consolidation: {report.summary()}", fg=typer.colors.GREEN)
+    for name in report.workflows_created:
+        typer.secho(f"  + workflow: {name}", fg=typer.colors.CYAN)
+    for p in report.patterns[:10]:
+        typer.secho(f"  · pattern: {p}", fg=typer.colors.BRIGHT_BLACK)
+
+
+memory_app = typer.Typer(help="Inspect long-term memory.")
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("stats")
+def memory_stats() -> None:
+    """Show memory counts, activation, and what has faded."""
+    config.ensure_dirs()
+    from .memory import events, skills, store, workflows
+
+    mems = store.all_memories(include_archived=True)
+    active = [m for m in mems if m.status == "active"]
+    archived = [m for m in mems if m.status != "active"]
+    by_kind: dict[str, int] = {}
+    for m in active:
+        by_kind[m.kind] = by_kind.get(m.kind, 0) + 1
+
+    typer.secho("Long-term memory", fg=typer.colors.BRIGHT_WHITE, bold=True)
+    typer.echo(f"  active: {len(active)}   archived (faded): {len(archived)}")
+    for kind, n in sorted(by_kind.items()):
+        typer.echo(f"    {kind}: {n}")
+    typer.echo(f"  skills: {skills.count()}   workflows: {workflows.count()}   events: {events.count()}")
+
+    top = sorted(active, key=lambda m: m.activation(), reverse=True)[:5]
+    if top:
+        typer.secho("  strongest right now:", fg=typer.colors.BRIGHT_BLACK)
+        for m in top:
+            snippet = m.text if len(m.text) <= 60 else m.text[:57] + "..."
+            typer.echo(f"    [{m.activation():.2f}] {snippet}")
+
+
 if __name__ == "__main__":
     app()

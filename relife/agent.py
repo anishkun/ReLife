@@ -119,6 +119,26 @@ def _render(msg: Any) -> None:
         pass
 
 
+def _maybe_consolidate() -> None:
+    """Run a background-style consolidation pass if enough has accrued.
+
+    Brain-like upkeep after a run: fade unused memories, merge duplicates, and
+    learn workflows from recurring tool sequences. Deterministic and cheap (no
+    LLM); throttled by event volume and fully fail-safe so it never disrupts a
+    completed task.
+    """
+    try:
+        from .memory import consolidate
+
+        if not consolidate.should_auto_run():
+            return
+        report = consolidate.run_consolidation()
+        if report.archived or report.merged or report.workflows_created:
+            console.print(f"[dim]· memory consolidated: {report.summary()}[/]")
+    except Exception:
+        pass
+
+
 def _tool_brief(inp: dict[str, Any]) -> str:
     """One-line hint of what a tool call is doing."""
     if not isinstance(inp, dict):
@@ -155,6 +175,7 @@ async def run_task(
         await client.query(prompt)
         async for msg in client.receive_response():
             _render(msg)
+    _maybe_consolidate()
 
 
 async def run_chat(
@@ -180,9 +201,11 @@ async def run_chat(
                 user = console.input("[bold blue]you ›[/] ").strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]bye[/]")
+                _maybe_consolidate()
                 return
             if user.lower() in {"exit", "quit"}:
                 console.print("[dim]bye[/]")
+                _maybe_consolidate()
                 return
             if not user:
                 continue

@@ -18,9 +18,11 @@ better over time.** You give it a task in plain English ("scaffold a weather
 CLI", "build me a todo app"); it plans, writes code, runs tests, uses git, and
 can drive a web browser — all on its own, asking permission only for things that
 reach *outside* your machine (sending email, publishing packages). After each
-job it can **write down what it learned** (facts + reusable how-to "skills") so
-the next run is smarter. It runs on your **Claude Code Max subscription**, not a
-paid-per-call API key.
+job it **writes down what it learned** (facts, reusable "skills", and multi-step
+"workflows"), and its memory works **like a brain** — what it keeps using stays
+sharp, what it ignores quietly fades, and it even **invents its own workflows**
+from things it finds itself repeating. It runs on your **Claude Code Max
+subscription**, not a paid-per-call API key.
 
 That's the whole product. Everything below is *how* that paragraph is true.
 
@@ -132,26 +134,33 @@ most useful thing to understand; everything else is a variation.
         │                           hooks) and opens a streaming session.
         ▼
  6. ── UserPromptSubmit hook fires ──
-        │                           hooks._recall_hook looks up memories + skills
-        │                           matching "scaffold a weather CLI" and silently
-        │                           prepends them to the prompt as extra context.
+        │                           hooks._recall_hook looks up memories + skills +
+        │                           workflows matching "scaffold a weather CLI",
+        │                           silently prepends them as extra context, AND
+        │                           reinforces them (recall = a use → they get stronger).
         ▼
  7. Claude works.                   It thinks, then calls tools: Write a file,
         │                           run `pytest`, `git init`, etc. EVERY tool call
         │                           is intercepted by step 2's gatekeeper:
         │                              • Read/Write-in-workspace/test/git → allowed
         │                              • email/publish/write-outside-workspace → ASK you
+        │                           A PostToolUse hook also journals each call to the
+        │                           event log (raw material for learning workflows).
         ▼
  8. agent._render(msg)              Each streamed message is pretty-printed:
         │                           "→ Write weather/cli.py", "✓ done", etc.
         ▼
- 9. (optional) Claude calls memory_save / skill_write to record a lesson, so the
-    next run benefits. Then the session ends.
+ 9. (optional) Claude calls memory_save / skill_write / workflow_save to record a
+    lesson, so the next run benefits.
+        ▼
+10. ── consolidation ("sleep") ──   When the run ends, if enough has happened,
+    ReLife fades unused memories, merges duplicates, and turns repeated tool
+    sequences into new workflows — automatically. Then the session ends.
 ```
 
 The whole architecture is just: **assemble options → stream Claude → gate every
-tool call → render.** `do` and `chat` differ only in step 5 (chat loops, asking
-you for the next message each time).
+tool call → render → consolidate.** `do` and `chat` differ only in step 5 (chat
+loops, asking you for the next message each time).
 
 ---
 
@@ -227,30 +236,61 @@ defines ReLife's personality, its safety rules, and — crucially — *tells the
 to save durable lessons to memory/skills* after finishing work. (The build
 orchestrator swaps in `build/prompts/orchestrator.md` instead.)
 
-### The memory layer — `relife/memory/`
+### The memory layer — `relife/memory/` (works like a brain)
 
-This is ReLife's notebook. **Two stores, both using plain keyword + recency
-matching — no AI embeddings yet** (kept simple for v1; the API is designed so a
-vector search can be slotted in later without callers noticing).
+This is ReLife's notebook, and it's the cleverest part. The big idea: **a
+memory's relevance isn't fixed.** It *rises* every time the memory gets used and
+*fades* when it sits unused — just like human memory. Finished, never-touched-
+again notes quietly sink out of view; the things ReLife keeps relying on stay
+sharp. And it doesn't just store notes — it **watches what it does and invents
+its own multi-step workflows** from repetition.
 
-- **`store.py`** — facts/preferences/episodes in a SQLite database
-  (`data/relife.db`). `save(text, kind, tags)` inserts a memory (exact duplicates
-  just refresh their timestamp instead of piling up). `recall(query, k)` scores
-  every memory by *how many words overlap* with your query plus a small bonus for
-  *being recent*, and returns the top `k`. Zero-overlap memories are excluded, so
-  an unrelated task surfaces nothing.
-- **`skills.py`** — reusable *procedures*, one Markdown-with-frontmatter file each
-  under `data/skills/`. A skill is a mini how-to ("how to push a new repo to
-  GitHub"). Recall is the same keyword approach but **name matches count double**.
-- **`server.py`** — wraps both stores as the **MCP server** named `relife_memory`,
-  exposing four tools to Claude: `memory_save`, `memory_recall`, `skill_write`,
-  `skill_find`. Because the name starts with `relife`, the permission policy
-  auto-trusts them.
-- **`_text.py`** — the shared tokenizer (lowercases, splits into words, drops
-  stop-words like "the"/"a") used by both stores' recall scoring.
+The four signals that decide what surfaces (all fused into one score):
+*does it mean the same thing?* (semantic) · *do the words overlap?* (keyword) ·
+*how strong is it right now?* (activation — the rise/fade) · *how important did we
+mark it?* (importance).
 
-**Fact vs. skill:** a *fact* is a thing that's true ("the user prefers ruff");
-a *skill* is a procedure you can replay ("steps to scaffold a FastAPI service").
+- **`cognitive.py`** — the **pure math** of the brain model (no database, no AI,
+  so it's trivially testable). It computes a memory's **activation**: more uses +
+  more recent = stronger; long idle = weaker. It also decides when something has
+  faded enough to **forget** (archive). This file is *why* memory behaves alive.
+- **`store.py`** — the facts/preferences/episodes/patterns database
+  (`data/relife.db`). `recall(query)` is **two-stage** so it stays fast even with
+  huge memory: first a cheap **index** (SQLite FTS5) narrows millions of rows to a
+  handful of candidates, then the full four-signal score ranks just those.
+  Recalling a memory **reinforces** it (recall is a use). Re-saving the same text
+  strengthens it instead of duplicating. Faded memories are **archived, not
+  deleted** — reversible, like a memory you *could* still dredge up.
+- **`embeddings.py`** — gives recall its *sense of meaning*. A small model runs
+  **locally on your machine** (no API key, works offline) to turn text into
+  vectors so "set up CI" can match "configure the test pipeline" even with no
+  shared words. It's **optional**: not installed → memory just falls back to
+  keyword matching, nothing breaks. (`pip install -e ".[embeddings]"` to enable.)
+- **`skills.py`** — single reusable *procedures*, one Markdown file each under
+  `data/skills/` ("how to push a new repo to GitHub").
+- **`workflows.py`** — *multi-step* procedures: an ordered chain of stages
+  ("scaffold → test → make repo → push"), under `data/workflows/`. The difference
+  from a skill is that the value is in the **sequence**.
+- **`events.py`** — a quiet journal of every tool the agent uses. On its own it's
+  boring; it's the **raw material** the next file mines for patterns.
+- **`consolidate.py`** — ReLife's **"sleep" pass.** Periodically (after runs, or
+  via `relife consolidate`) it does brain-like housekeeping: **fades/archives**
+  unused memories, **merges** duplicates, and — the magic part — scans the event
+  journal for **action sequences it keeps repeating** and **writes them up as new
+  workflows automatically.** So ReLife literally learns "whenever I do X I tend to
+  do Y then Z" and saves that plan for next time. (Deliberately kept AI-free so
+  it's cheap and safe to run on its own.)
+- **`server.py`** — wraps all of the above as the **MCP server** `relife_memory`,
+  exposing the tools Claude calls: `memory_save` (with an `importance` dial),
+  `memory_recall`, `memory_forget`, `skill_write`/`skill_find`,
+  `workflow_save`/`workflow_find`, and `memory_consolidate`. Names start with
+  `relife` → the permission policy auto-trusts them.
+- **`_text.py`** — the shared tokenizer (lowercases, splits words, drops
+  stop-words like "the"/"a") used by every keyword path.
+
+**Fact vs. skill vs. workflow:** a *fact* is a thing that's true ("the user
+prefers ruff"); a *skill* is one procedure you can replay ("scaffold a FastAPI
+service"); a *workflow* is a multi-stage plan ("ship a new service end to end").
 
 ---
 
@@ -364,10 +404,12 @@ D:\ReLife\
 │   ├─ tempconv-smoke/      the live-test output (a working CLI + 41 tests)
 │   └─ todo-smoke/          an earlier full-app build
 ├─ data/                    runtime stuff (gitignored — not in version control)
-│   ├─ relife.db            the memory database (facts/preferences/episodes)
+│   ├─ relife.db            memory DB (facts/preferences/episodes/patterns + event log)
 │   ├─ skills/              saved skill files (one .md each)
+│   ├─ workflows/           learned multi-step workflows (one .md each)
+│   ├─ consolidate_state.json   bookkeeping for the auto "sleep" pass
 │   └─ builds/<id>/         one folder per `relife build` (ledger.json + plan.md)
-├─ tests/                   26 deterministic tests (no live AI — safe & fast)
+├─ tests/                   50 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
 └─ HOW_IT_WORKS.md          ← you are here (the friendly guide)
@@ -382,15 +424,17 @@ D:\ReLife\
   were set, ReLife would refuse to use it. Heavy runs (especially big builds) draw
   on the *same* usage budget as your interactive Claude Code — so a giant build
   can hit "you've hit your session limit." That's exactly what `--resume` is for.
-- **The tests never call the live model.** All 26 tests are deterministic — they
+- **The tests never call the live model.** All 50 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
-  ledger persistence), not Claude. So you can run them freely without spending
-  budget. Prefer them for checking changes.
+  the cognitive activation/decay math, workflow learning, ledger persistence), not
+  Claude. So you can run them freely without spending budget.
 - **The agent has two shells on Windows** (`Bash` and `PowerShell`) and the
   permission policy gates both identically.
-- **Memory is "dumb" on purpose (for now).** Keyword + recency, no embeddings.
-  It's good enough for v1 and the API is built so a smarter vector search can drop
-  in later invisibly.
+- **Memory fades and learns on its own.** Relevance rises with use and decays when
+  ignored; the "sleep" pass forgets stale notes and invents workflows from
+  repeated actions — all without you asking. Semantic (meaning-based) recall is a
+  *local* model with no API key, and is optional: skip the install and memory
+  gracefully falls back to keyword matching.
 - **The orchestrator doesn't write your code.** During a build, the actual coding
   is done by the disposable `builder` subagents; the orchestrator only plans and
   tracks. If you watch a build and wonder why the "main" agent isn't typing
@@ -404,8 +448,10 @@ D:\ReLife\
 2. You run `relife do / chat / build`; it works inside a **workspace** (its desk).
 3. **Permissions** let it act freely on code/git but stop at outward actions.
 4. **MCP servers** give it extra hands: a **browser** and its own **memory**.
-5. A **hook** auto-feeds it relevant past **memories + skills** before each prompt.
-6. After a job it can **save facts/skills** so it improves over time.
+5. A **hook** auto-feeds it relevant past **memories + skills + workflows** before
+   each prompt — and using a memory makes it **stronger** (unused ones **fade**).
+6. After a job it **saves facts/skills/workflows**, and a **"sleep" pass** forgets
+   stale notes and **learns new workflows** from repeated actions — so it improves.
 7. For **big** jobs, `relife build` **plans milestones → delegates each to a
    fresh builder → records everything in a ledger**, which makes it **resumable**.
 8. It runs on your **Max subscription**; deterministic **tests** verify the

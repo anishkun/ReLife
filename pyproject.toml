@@ -9,6 +9,14 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+# Local, offline semantic recall (ONNX, no API key). Soft-optional: memory
+# degrades to keyword + activation recall when this isn't installed.
+#   pip install -e ".[embeddings]"
+embeddings = [
+    "fastembed>=0.3",
+]
+
 [project.scripts]
 relife = "relife.cli:app"
 

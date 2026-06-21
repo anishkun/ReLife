@@ -24,12 +24,22 @@ Long-term memory:
   preference, a project convention, where something lives, or the outcome of a
   task — save it with `memory_save`. Keep each memory self-contained and concise.
   Don't save transient detail or things obvious from the code/repo.
+- Your memory works like a brain: memories you keep using stay strong, while
+  ones left unused slowly fade and are archived. Set `importance` higher (~0.8+)
+  on things that must persist regardless of use (core preferences, key
+  conventions); leave it default for ordinary facts. Use `memory_forget` to
+  retire a memory you know is done with (e.g. a completed one-off work item).
 
-Skills (reusable procedures):
-- Relevant saved skills are also surfaced automatically before a task. When one
-  applies, follow it rather than re-deriving the approach. You can also call
-  `skill_find` to search explicitly.
+Skills (reusable procedures) and workflows (multi-step plans):
+- Relevant saved skills and workflows are surfaced automatically before a task.
+  When one applies, follow it rather than re-deriving the approach. You can also
+  call `skill_find` / `workflow_find` to search explicitly.
 - After you succeed at a task you're likely to repeat (scaffolding a project,
-  pushing a repo, a multi-step setup), record the concrete steps that worked
-  with `skill_write`. Update an existing skill rather than duplicating it. This
-  is how you get faster and more reliable over time.
+  pushing a repo), record the concrete steps with `skill_write`. When the value
+  is in a *sequence* of stages (e.g. scaffold → test → create repo → push),
+  capture it as a `workflow_save` instead. Update an existing one rather than
+  duplicating it. This is how you get faster and more reliable over time.
+- Memory consolidation runs automatically in the background: it fades unused
+  memories, merges duplicates, and notices recurring action sequences — turning
+  them into workflows for you. You can trigger it yourself with
+  `memory_consolidate` to reflect and tidy up.

@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-06-20.
+> Last updated: 2026-06-21.
 
 ## 1. Vision
 
@@ -62,9 +62,27 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 26 passing (`python -m pytest tests/`). Covers permission classify, store
-save/recall, skills, the recall hook injecting memory+skills, and the build ledger +
-ledger MCP tools (deterministic — no live agent).
+**Tests:** 50 passing (`python -m pytest tests/`). Covers permission classify, store
+save/recall, skills, the recall hook injecting memory+skills+workflows, the build
+ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
+math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
+the event log, and the consolidation pass (deterministic — no live agent).
+
+**Cognitive memory v2 — added post-v1.** The memory layer now behaves like a brain:
+relevance **rises with use and fades when idle** (ACT-R-style activation in
+`cognitive.py`), recall **fuses semantic + keyword + activation + importance** and is
+**two-stage** (FTS5 candidates → fuse-rank) so it scales, and a **consolidation
+("sleep") pass** (`consolidate.py`) auto-runs after tasks to forget stale memories,
+dedupe, and **synthesize workflows from recurring tool sequences** it observes via a
+new event log. Semantic recall uses a **local** embedding model (`fastembed`, ONNX,
+no API key) and is soft-optional — absent it degrades to keyword + activation. New
+modules: `cognitive.py`, `embeddings.py`, `workflows.py`, `events.py`,
+`consolidate.py`; new MCP tools (`memory_forget`, `workflow_save/find`,
+`memory_consolidate`, `importance` on `memory_save`); new CLI (`relife consolidate`,
+`relife memory stats`). Consolidation is deliberately deterministic/LLM-free to
+protect the Max budget (LLM enrichment of synthesized workflows deferred).
+Verified deterministically + a temp-dir smoke (reinforcement reorders recall, stale
+memory archived, a recurring Read→Edit→Bash sequence learned as a workflow).
 
 **Large builds (`relife build`) — added post-v1.** Orchestration layer for projects too big
 for one context: the orchestrator decomposes the spec into milestones (persisted in a
@@ -91,10 +109,15 @@ relife/
   permissions.py            # classify() + make_permission_callback() (can_use_tool)
   hooks.py                  # UserPromptSubmit recall hook (memory + skills)
   prompts/system.md         # persona + safety + memory/skill instructions
-  memory/
-    store.py                # SQLite facts/episodes, keyword+recency recall
-    skills.py               # Markdown skill files, keyword recall
-    server.py               # in-process MCP server (memory_save/recall, skill_write/find)
+  memory/                   # cognitive memory: relevance rises w/ use, fades when idle
+    cognitive.py            # pure ACT-R-style activation/fused_score/should_archive
+    store.py                # SQLite (schema v2), FTS5 + two-stage fused recall, decay
+    embeddings.py           # soft-optional LOCAL semantic vectors (fastembed; no API key)
+    skills.py               # single reusable procedures (Markdown files)
+    workflows.py            # multi-step procedures (ordered skill/action chains)
+    events.py               # tool-event log (raw material for pattern detection)
+    consolidate.py          # "sleep" pass: decay/forget, dedupe, learn workflows
+    server.py               # MCP server: memory/skill/workflow/forget/consolidate tools
     _text.py                # shared tokenizer w/ stopwords
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
