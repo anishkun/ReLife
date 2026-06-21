@@ -62,18 +62,23 @@ def fused_score(
     keyword: float,
     act: float,
     importance: float,
+    kind: str | None = None,
 ) -> float:
     """Combine the four recall signals into one ranking score.
 
     ``semantic`` and ``keyword`` are expected in [0, 1]; ``act`` is raw
     activation (squashed here); ``importance`` is [0, 1]. Weights live in config
-    so the balance can be tuned in one place.
+    so the balance can be tuned in one place. ``kind`` adds a small per-kind
+    prior (``config.KIND_RECALL_BOOST``) so durable kinds rank slightly higher
+    at equal evidence; it is optional and defaults to neutral.
     """
+    boost = config.KIND_RECALL_BOOST.get(kind, 0.0) if kind else 0.0
     return (
         config.W_SEM * float(semantic)
         + config.W_KW * float(keyword)
         + config.W_ACT * sigmoid(act)
         + config.W_IMP * float(importance)
+        + boost
     )
 
 
@@ -104,3 +109,24 @@ def should_archive(
         now=now,
     )
     return act < config.FORGET_THRESHOLD
+
+
+def should_hard_delete(
+    *,
+    last_used_at: float,
+    importance: float,
+    kind: str,
+    now: float | None = None,
+) -> bool:
+    """Whether an already-archived memory has been idle long enough to delete.
+
+    The slow second tier of forgetting: a memory that was soft-archived and then
+    left untouched past ``HARD_DELETE_AGE_DAYS`` is removed for good, so the store
+    doesn't grow without bound. ``preference`` memories and pinned items
+    (``importance >= PIN_THRESHOLD``) are exempt — though in practice they are
+    never archived, so this is just defence in depth. Callers apply this only to
+    rows already in the ``archived`` state.
+    """
+    if kind == "preference" or importance >= config.PIN_THRESHOLD:
+        return False
+    return age_days(last_used_at, now) >= config.HARD_DELETE_AGE_DAYS

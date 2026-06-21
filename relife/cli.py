@@ -120,9 +120,9 @@ def consolidate_cmd() -> None:
     """Run a memory consolidation ('sleep') pass now: fade unused memories, merge
     duplicates, detect recurring patterns, and synthesize workflows."""
     config.ensure_dirs()
-    from .memory import consolidate
+    from .memory.client import default_client
 
-    report = consolidate.run_consolidation()
+    report = default_client().consolidate()
     typer.secho(f"Consolidation: {report.summary()}", fg=typer.colors.GREEN)
     for name in report.workflows_created:
         typer.secho(f"  + workflow: {name}", fg=typer.colors.CYAN)
@@ -138,9 +138,10 @@ app.add_typer(memory_app, name="memory")
 def memory_stats() -> None:
     """Show memory counts, activation, and what has faded."""
     config.ensure_dirs()
-    from .memory import events, skills, store, workflows
+    from .memory import events, skills, workflows
+    from .memory.client import default_client
 
-    mems = store.all_memories(include_archived=True)
+    mems = default_client().all_memories(include_archived=True)
     active = [m for m in mems if m.status == "active"]
     archived = [m for m in mems if m.status != "active"]
     by_kind: dict[str, int] = {}

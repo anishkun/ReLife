@@ -13,7 +13,8 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from . import consolidate, skills, store, workflows
+from . import skills, workflows
+from .client import default_client
 
 
 @tool(
@@ -33,7 +34,14 @@ from . import consolidate, skills, store, workflows
             "tags": {"type": "string", "description": "Optional comma-separated keywords to aid recall."},
             "importance": {
                 "type": "number",
-                "description": "0..1 salience. Higher = resists fading. Use ~0.8+ for things that must persist (key preferences/conventions); ~0.5 default; lower for transient context.",
+                "description": (
+                    "0..1 salience — higher resists fading (>= 0.8 is effectively "
+                    "pinned and never auto-archived). Guidance: 0.8-1.0 for durable "
+                    "user preferences/conventions and hard constraints that must "
+                    "persist; ~0.6 for project facts worth keeping a while; ~0.4 or "
+                    "lower for transient/episodic context that should fade unless "
+                    "reused. Omit to use a sensible default for the kind."
+                ),
             },
         },
         "required": ["text"],
@@ -41,7 +49,7 @@ from . import consolidate, skills, store, workflows
 )
 async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        mid = store.save(
+        mid = default_client().save(
             text=args["text"],
             kind=args.get("kind", "fact"),
             tags=args.get("tags", ""),
@@ -67,7 +75,7 @@ async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
-    hits = store.recall(args["query"], k=int(args.get("k", 5)), reinforce=True)
+    hits = default_client().recall(args["query"], k=int(args.get("k", 5)), reinforce=True)
     if not hits:
         return {"content": [{"type": "text", "text": "(no relevant memories)"}]}
     lines = [f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "") for m in hits]
@@ -136,11 +144,10 @@ async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
-    hits = store.recall(args["query"], k=1)
-    if not hits:
+    forgotten = default_client().forget(args["query"])
+    if forgotten is None:
         return {"content": [{"type": "text", "text": "(nothing matched; nothing forgotten)"}]}
-    store.archive(hits[0].id)
-    return {"content": [{"type": "text", "text": f"Archived: {hits[0].text}"}]}
+    return {"content": [{"type": "text", "text": f"Archived: {forgotten.text}"}]}
 
 
 @tool(
@@ -203,7 +210,7 @@ async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        report = consolidate.run_consolidation()
+        report = default_client().consolidate()
     except Exception as e:  # noqa: BLE001
         return {"content": [{"type": "text", "text": f"Error consolidating: {e}"}], "is_error": True}
     lines = [f"Consolidation: {report.summary()}."]

@@ -79,3 +79,13 @@ def test_duplicate_save_reinforces(tmp_path):
     assert a == b
     assert s.count() == 1
     assert s.get(a).use_count >= 1  # the re-save counted as a use
+
+
+def test_injectable_stores_are_isolated(tmp_path):
+    """Two MemoryStore instances on different files don't share state."""
+    a = store_mod.MemoryStore(tmp_path / "a.db")
+    b = store_mod.MemoryStore(tmp_path / "b.db")
+    a.save("Only in store A.", tags="alpha")
+    assert a.count() == 1
+    assert b.count() == 0
+    assert a.recall("store A") and b.recall("store A") == []

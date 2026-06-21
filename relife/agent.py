@@ -129,11 +129,12 @@ def _maybe_consolidate() -> None:
     """
     try:
         from .memory import consolidate
+        from .memory.client import default_client
 
         if not consolidate.should_auto_run():
             return
-        report = consolidate.run_consolidation()
-        if report.archived or report.merged or report.workflows_created:
+        report = default_client().consolidate()
+        if report.archived or report.deleted or report.merged or report.workflows_created:
             console.print(f"[dim]· memory consolidated: {report.summary()}[/]")
     except Exception:
         pass
