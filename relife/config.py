@@ -116,6 +116,19 @@ RECUR_THRESHOLD = 3        # a signature must repeat this many times to be a pat
 AUTO_CONSOLIDATE = os.environ.get("RELIFE_AUTO_CONSOLIDATE", "1") != "0"
 CONSOLIDATE_EVERY = 5      # auto-run after this many new episodes/events
 
+# REM ("dream") pass — the OPT-IN, LLM-driven deep review (`relife dream`). Unlike
+# the deterministic consolidation above, REM asks the model to act as an
+# adversarial critic over recent memories: it flags contradictions, safety/
+# alignment problems, hallucinated/garbage memories, and mis-weighted importance.
+# It is deliberately **never auto-run** (no AUTO flag) — it spends Max budget, so
+# the user triggers it when they know budget is comfortable. The model is an
+# ADVISOR only: its verdicts are applied deterministically, reversibly (archive,
+# never delete), confidence-gated, and capped, so a bad pass can't corrupt memory.
+REM_BATCH_MAX = 40         # max memories reviewed (the "replay buffer") per pass
+REM_REFERENCE_MAX = 30     # max established (pinned/pref/pattern) memories sent as context
+REM_MIN_CONFIDENCE = 0.7   # ignore any critic verdict below this confidence
+REM_MAX_PRUNE_FRACTION = 0.25  # never archive more than this share of the buffer in one pass
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 

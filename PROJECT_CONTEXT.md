@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-06-21.
+> Last updated: 2026-06-22.
 
 ## 1. Vision
 
@@ -120,6 +120,7 @@ relife/
     workflows.py            # multi-step procedures (ordered skill/action chains)
     events.py               # injectable EventLog (tool-event log for pattern detection)
     consolidate.py          # "sleep" pass: decay/forget + hard-delete, (semantic) dedupe, learn workflows
+    rem.py                  # opt-in "dream" pass (`relife dream`): LLM adversarial critic; prunes/reweights, reversibly
     server.py               # MCP server (tools route through default_client()): memory/skill/workflow tools
     _text.py                # shared tokenizer w/ stopwords
   build/                    # `relife build`: orchestrated, resumable large builds
@@ -185,6 +186,19 @@ relife chat
   migrations, 10k+ benchmark; (C) the memory-only **service seam** (`MemoryService` + `MemoryClient`/
   `LocalMemoryClient`, all consumers via `default_client()`). 67 tests green. See
   `.claude/plans/keen-wiggling-octopus.md` for the design.
+- **REM "dream" pass — ✅ DONE (this phase).** Added `relife dream` (and `memory_dream` MCP
+  tool): the **only** LLM-driven memory path, deliberately **opt-in / never auto-run** so it
+  never silently spends Max budget. The model is an *adversarial critic* over a bounded,
+  watermarked "replay buffer" of recent memories; it can only **prune (archive, reversible)** or
+  **reweight (importance)** — never edit text. Every verdict is confidence-gated + prune-capped +
+  journaled (`data/rem_journal.jsonl`), so a misbehaving critic can't corrupt memory. The
+  deterministic `consolidate.py` stays LLM-free (guard tests enforce both invariants). New:
+  `memory/rem.py`, `prompts/rem.md`, `agent.ask_model_oneshot`, `store.set_importance`,
+  `MemoryService/Client.dream`. 77 tests green (was 67). **Honest expectation:** this is a
+  *qualitative/safety* improvement (contradiction/hallucination/alignment pruning) with
+  diminishing returns — it does not change recall ranking, so it is not "exponentially" more
+  accurate; budget is gated for *risk* reasons, not just cost. Live `relife dream` smoke deferred
+  to a comfortable-budget window.
 - **Phase 2/3 (next):** flip `LocalMemoryClient` → an `HttpMemoryClient` against a standalone
   long-lived memory **daemon** (the seam now makes this a drop-in); always-on agent + UI; outward
   capabilities (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host

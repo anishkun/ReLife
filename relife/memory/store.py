@@ -331,6 +331,16 @@ class MemoryStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
 
+    def set_importance(self, mem_id: int, importance: float) -> None:
+        """Set a memory's importance (clamped to 0..1). Used by the REM pass to
+        recalibrate salience; does not touch use_count/recency."""
+        imp = max(0.0, min(1.0, float(importance)))
+        self.init_db()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE memories SET importance = ? WHERE id = ?", (imp, mem_id)
+            )
+
     # --- read ---------------------------------------------------------------
     def _candidates(self, conn, q_terms: set[str], q_vec, include_archived: bool):
         """Stage 1: a bounded candidate set from FTS5 keyword + semantic scan."""
@@ -495,6 +505,10 @@ def archive(mem_id: int) -> None:
 
 def delete(mem_id: int) -> None:
     _store().delete(mem_id)
+
+
+def set_importance(mem_id: int, importance: float) -> None:
+    _store().set_importance(mem_id, importance)
 
 
 def recall(

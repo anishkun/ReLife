@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -97,6 +98,43 @@ def build_options(
         # self-contained and defines its own behavior.
         setting_sources=None,
     )
+
+
+async def _deny_all_tools(tool_name: str, tool_input: dict[str, Any], context: Any):
+    """A ``can_use_tool`` that denies everything — for pure reasoning calls."""
+    return PermissionResultDeny(message="Tool use is disabled for this call.")
+
+
+async def ask_model_oneshot(
+    system_prompt: str, prompt: str, *, cwd: Path | None = None
+) -> tuple[str, float | None]:
+    """One-shot text-in / text-out model judgment (no tools, no MCP, no hooks).
+
+    Used by the REM ("dream") pass to run the model as an adversarial critic over
+    memory. Returns ``(text, cost_usd)``. Tools are hard-denied so the call is
+    fully non-interactive and can never touch the filesystem or take an action —
+    the model is a pure advisor here. Streaming transport is required because we
+    attach a ``can_use_tool`` callback (the deny-all gate).
+    """
+    options = build_options(
+        cwd=cwd or config.PROJECT_ROOT,
+        can_use_tool=_deny_all_tools,
+        mcp_servers={},
+        hooks=None,
+        system_prompt=system_prompt,  # plain critic prompt, not the ReLife preset
+    )
+    chunks: list[str] = []
+    cost: float | None = None
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        chunks.append(block.text)
+            elif isinstance(msg, ResultMessage):
+                cost = getattr(msg, "total_cost_usd", None)
+    return "".join(chunks), cost
 
 
 def _render(msg: Any) -> None:

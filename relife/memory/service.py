@@ -76,3 +76,11 @@ class MemoryService:
     def consolidate(self) -> _consolidate.ConsolidationReport:
         """Run the deterministic consolidation ('sleep') pass."""
         return _consolidate.run_consolidation()
+
+    async def dream(self, ask_model=None):
+        """Run the opt-in, LLM-driven REM ('dream') pass — an adversarial critic
+        over recent memory. Like ``consolidate``, it operates on the module-level
+        store. The model is an advisor; mutations stay deterministic/reversible."""
+        from . import rem
+
+        return await rem.run_rem(ask_model)

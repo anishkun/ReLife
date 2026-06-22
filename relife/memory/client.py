@@ -28,6 +28,7 @@ class MemoryClient(Protocol):
     def all_memories(self, include_archived: bool = ...) -> list[Memory]: ...
     def count(self, include_archived: bool = ...) -> int: ...
     def consolidate(self): ...
+    async def dream(self, ask_model=...): ...
 
 
 class LocalMemoryClient:
@@ -55,6 +56,9 @@ class LocalMemoryClient:
 
     def consolidate(self):
         return self._svc.consolidate()
+
+    async def dream(self, ask_model=None):
+        return await self._svc.dream(ask_model)
 
 
 _default: LocalMemoryClient | None = None

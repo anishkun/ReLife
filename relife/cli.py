@@ -130,6 +130,25 @@ def consolidate_cmd() -> None:
         typer.secho(f"  · pattern: {p}", fg=typer.colors.BRIGHT_BLACK)
 
 
+@app.command("dream")
+def dream_cmd(
+    max_memories: Optional[int] = typer.Option(
+        None, "--max", help="Max memories to review this pass (default from config)."
+    ),
+) -> None:
+    """Run an opt-in REM ('dream') pass: the model reviews recent memories as an
+    adversarial critic and reversibly prunes/reweights them. Unlike `consolidate`
+    this uses the model (spends Max budget) — run it when budget is comfortable."""
+    config.ensure_dirs()
+    from .memory import rem
+
+    typer.secho("Dreaming (REM pass) — reviewing recent memories…", fg=typer.colors.BRIGHT_BLACK)
+    report = anyio.run(lambda: rem.run_rem(batch_max=max_memories))
+    typer.secho(f"REM pass: {report.summary()}", fg=typer.colors.GREEN)
+    for note in report.notes:
+        typer.secho(f"  · {note}", fg=typer.colors.BRIGHT_BLACK)
+
+
 memory_app = typer.Typer(help="Inspect long-term memory.")
 app.add_typer(memory_app, name="memory")
 

@@ -221,6 +221,23 @@ async def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
 
+@tool(
+    "memory_dream",
+    "Run an opt-in REM ('dream') pass: the model reviews recent memories as an "
+    "adversarial critic — flagging contradictions, unsafe/hallucinated memories, "
+    "and mis-weighted importance — then archives (reversibly) or reweights them. "
+    "This is more expensive than memory_consolidate (it uses the model), so use "
+    "it sparingly when a deep, qualitative tidy-up of memory is warranted.",
+    {"type": "object", "properties": {}},
+)
+async def memory_dream(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        report = await default_client().dream()
+    except Exception as e:  # noqa: BLE001
+        return {"content": [{"type": "text", "text": f"Error during REM pass: {e}"}], "is_error": True}
+    return {"content": [{"type": "text", "text": f"REM pass: {report.summary()}."}]}
+
+
 def memory_server():
     """Return the McpSdkServerConfig for the memory + skills + workflows server."""
     return create_sdk_mcp_server(
@@ -235,5 +252,6 @@ def memory_server():
             workflow_save,
             workflow_find,
             memory_consolidate,
+            memory_dream,
         ],
     )
