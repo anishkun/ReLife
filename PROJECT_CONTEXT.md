@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-06-21.
+> Last updated: 2026-06-22.
 
 ## 1. Vision
 
@@ -110,14 +110,18 @@ relife/
   hooks.py                  # UserPromptSubmit recall hook (memory + skills)
   prompts/system.md         # persona + safety + memory/skill instructions
   memory/                   # cognitive memory: relevance rises w/ use, fades when idle
-    cognitive.py            # pure ACT-R-style activation/fused_score/should_archive
-    store.py                # SQLite (schema v2), FTS5 + two-stage fused recall, decay
+    cognitive.py            # pure ACT-R-style activation/fused_score/should_archive/should_hard_delete
+    store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay
+    vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested)
+    service.py              # MemoryService — in-process facade over MemoryStore
+    client.py               # MemoryClient seam; LocalMemoryClient (default transport) + default_client()
     embeddings.py           # soft-optional LOCAL semantic vectors (fastembed; no API key)
     skills.py               # single reusable procedures (Markdown files)
     workflows.py            # multi-step procedures (ordered skill/action chains)
-    events.py               # tool-event log (raw material for pattern detection)
-    consolidate.py          # "sleep" pass: decay/forget, dedupe, learn workflows
-    server.py               # MCP server: memory/skill/workflow/forget/consolidate tools
+    events.py               # injectable EventLog (tool-event log for pattern detection)
+    consolidate.py          # "sleep" pass: decay/forget + hard-delete, (semantic) dedupe, learn workflows
+    rem.py                  # opt-in "dream" pass (`relife dream`): LLM adversarial critic; prunes/reweights, reversibly
+    server.py               # MCP server (tools route through default_client()): memory/skill/workflow tools
     _text.py                # shared tokenizer w/ stopwords
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
@@ -126,7 +130,8 @@ relife/
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
-tests/                      # 26 unit/integration tests
+scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
+tests/                      # 67 tests (63 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
@@ -173,9 +178,31 @@ relife chat
   (the `gh` token lacked the `delete_repo` scope). API confirms 404.
 - **Full live skills round-trip** (scaffold twice, second run reuses skill) was deferred by
   the session limit; each half is proven separately. Run when budget is comfortable.
-- **Phase 2/3:** standalone MCP memory server; always-on daemon + UI; outward capabilities
-  (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host (hosted
-  memory stores, MCP vaults, GitHub mounting, scheduled deployments).
+- **Long-term memory deepening — ✅ DONE (this phase).** Four tracks landed behind the unchanged
+  `mcp__relife_memory__*` contract: (A) smarter recall/forgetting — `RECALL_FLOOR`, kind-aware
+  `fused_score`, semantic dedup, tiered hard-delete; (B) better save/surface — kind-based default
+  importance, recall-hook de-dup + size budget, deterministic episode capture on `Stop`;
+  (D) scale — `VectorIndex` seam (brute-force + self-tested optional `sqlite-vec`), `user_version`
+  migrations, 10k+ benchmark; (C) the memory-only **service seam** (`MemoryService` + `MemoryClient`/
+  `LocalMemoryClient`, all consumers via `default_client()`). 67 tests green. See
+  `.claude/plans/keen-wiggling-octopus.md` for the design.
+- **REM "dream" pass — ✅ DONE (this phase).** Added `relife dream` (and `memory_dream` MCP
+  tool): the **only** LLM-driven memory path, deliberately **opt-in / never auto-run** so it
+  never silently spends Max budget. The model is an *adversarial critic* over a bounded,
+  watermarked "replay buffer" of recent memories; it can only **prune (archive, reversible)** or
+  **reweight (importance)** — never edit text. Every verdict is confidence-gated + prune-capped +
+  journaled (`data/rem_journal.jsonl`), so a misbehaving critic can't corrupt memory. The
+  deterministic `consolidate.py` stays LLM-free (guard tests enforce both invariants). New:
+  `memory/rem.py`, `prompts/rem.md`, `agent.ask_model_oneshot`, `store.set_importance`,
+  `MemoryService/Client.dream`. 77 tests green (was 67). **Honest expectation:** this is a
+  *qualitative/safety* improvement (contradiction/hallucination/alignment pruning) with
+  diminishing returns — it does not change recall ranking, so it is not "exponentially" more
+  accurate; budget is gated for *risk* reasons, not just cost. Live `relife dream` smoke deferred
+  to a comfortable-budget window.
+- **Phase 2/3 (next):** flip `LocalMemoryClient` → an `HttpMemoryClient` against a standalone
+  long-lived memory **daemon** (the seam now makes this a drop-in); always-on agent + UI; outward
+  capabilities (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host
+  (hosted memory stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember
 

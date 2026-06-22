@@ -60,3 +60,30 @@ def test_event_hook_logs_tool_use(tmp_path):
     anyio.run(lambda: hooks._event_hook(inp, None, None))
     assert ev.count() == 1
     assert ev.recent_events()[0].tool == "Edit"
+
+
+def test_stop_hook_captures_episode(tmp_path):
+    _isolate(tmp_path)
+    sid = "sess-1"
+    # A prompt arrives, then several tool calls happen, then the run stops.
+    anyio.run(lambda: hooks._recall_hook({"prompt": "build a python cli", "session_id": sid}, None, None))
+    for tool in ("Read", "Edit", "Bash"):
+        anyio.run(lambda t=tool: hooks._event_hook(
+            {"tool_name": t, "tool_input": {}, "session_id": sid}, None, None))
+
+    anyio.run(lambda: hooks._episode_hook({"session_id": sid}, None, None))
+
+    episodes = [m for m in store.all_memories() if m.kind == "episode"]
+    assert episodes, "expected an episode to be captured on Stop"
+    assert "build a python cli" in episodes[0].text.lower()
+    assert "Read" in episodes[0].text  # the tool approach is recorded
+
+
+def test_stop_hook_skips_trivial_runs(tmp_path):
+    _isolate(tmp_path)
+    sid = "sess-2"
+    anyio.run(lambda: hooks._recall_hook({"prompt": "tiny task", "session_id": sid}, None, None))
+    anyio.run(lambda: hooks._event_hook(
+        {"tool_name": "Read", "tool_input": {}, "session_id": sid}, None, None))
+    anyio.run(lambda: hooks._episode_hook({"session_id": sid}, None, None))
+    assert [m for m in store.all_memories() if m.kind == "episode"] == []

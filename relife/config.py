@@ -43,25 +43,91 @@ FORGET_THRESHOLD = 0.20    # archive when activation falls below this …
 MIN_FORGET_AGE_DAYS = 14.0 # … and the item has been idle at least this long …
 PIN_THRESHOLD = 0.80       # … and importance is under this (>= is "pinned").
 
+# Default importance by kind, used when the caller doesn't specify one. Durable
+# kinds (preferences, learned patterns) start more salient so they resist fading;
+# episodes start lower because most task outcomes are transient. An explicit
+# `importance` argument always overrides these.
+DEFAULT_IMPORTANCE = {
+    "preference": 0.7,
+    "pattern": 0.65,
+    "fact": 0.5,
+    "episode": 0.45,
+}
+
+# Hard-forgetting (deletion) — a second, slower tier. An already-archived memory
+# that has stayed idle this long is permanently deleted by consolidation, so the
+# store doesn't accumulate dead rows forever. Preferences and pinned items are
+# exempt (they are never archived in the first place).
+HARD_DELETE_AGE_DAYS = 90.0
+
 # Fused recall score = weighted sum of the four signals.
+# NOTE: `importance` deliberately influences recall through TWO paths — it lifts
+# `activation()` (so salient memories resist decay) AND contributes directly via
+# W_IMP. This double counting is intentional: importance should both slow
+# forgetting and act as a standalone relevance signal.
 W_SEM = 0.45               # semantic similarity (local embeddings)
 W_KW = 0.30                # keyword overlap (FTS5 / tokens)
 W_ACT = 0.15               # cognitive activation (decay/reinforcement)
 W_IMP = 0.10               # explicit importance
 
+# Gentle per-kind prior added to the fused score: stable kinds (preferences,
+# learned patterns) rank slightly higher than transient ones at equal evidence,
+# mirroring how durable knowledge stays more accessible than one-off episodes.
+KIND_RECALL_BOOST = {"preference": 0.05, "pattern": 0.02}
+
+# Absolute relevance floor: a candidate must clear this fused score to surface.
+# Keeps weak (esp. semantic-only) matches out of recall; keyword hits clear it
+# easily. The candidate gate already drops fully unrelated rows; this trims the
+# long tail of barely-relevant ones.
+RECALL_FLOOR = float(os.environ.get("RELIFE_RECALL_FLOOR", "0.12"))
+
+# Max characters of recalled context the auto-recall hook injects per prompt, so
+# memory never floods the agent's window. Sections are added highest-priority
+# first (memory → skills → workflow) until the budget is reached.
+RECALL_INJECT_BUDGET = int(os.environ.get("RELIFE_RECALL_INJECT_BUDGET", "2400"))
+# Two recalled blocks whose token Jaccard is at/above this are treated as saying
+# the same thing; the later (lower-priority) one is dropped.
+RECALL_DEDUP_JACCARD = 0.8
+
 # Stage-1 candidate generation (keeps recall cheap on large stores).
 CANDIDATE_TOPN = 50        # max candidates pulled before fuse-ranking
 SEM_CANDIDATE_THRESHOLD = 0.60  # a zero-keyword row is a candidate only above this
+
+# Semantic de-duplication thresholds (only used when embeddings are available).
+# Calibrated for the local bge-small model: near-identical rewordings score
+# ~0.95, genuinely distinct-but-related facts ~0.75, unrelated ~0.4 — so a
+# threshold in the high-0.8s/low-0.9s catches paraphrases without false merges.
+DEDUP_SIM = 0.90           # consolidation merges active memories above this cosine
+SAVE_DEDUP_SIM = 0.93      # save reinforces an existing near-duplicate above this
 
 # Embeddings — a LOCAL ONNX model (no API key, runs offline). Soft-optional:
 # if unavailable, recall degrades to keyword + activation.
 EMBED_MODEL = os.environ.get("RELIFE_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDINGS_ENABLED = os.environ.get("RELIFE_EMBEDDINGS", "auto")  # auto|on|off
 
+# Episodic capture: on Stop, record a deterministic episode (task intent + tool
+# approach) when a run did at least this many tool calls — so genuinely
+# multi-step tasks accrue episodic memory even when the agent never calls
+# memory_save itself. These feed the recurring-episode → pattern detector.
+EPISODE_MIN_EVENTS = int(os.environ.get("RELIFE_EPISODE_MIN_EVENTS", "3"))
+
 # Consolidation ("sleep" pass).
 RECUR_THRESHOLD = 3        # a signature must repeat this many times to be a pattern
 AUTO_CONSOLIDATE = os.environ.get("RELIFE_AUTO_CONSOLIDATE", "1") != "0"
 CONSOLIDATE_EVERY = 5      # auto-run after this many new episodes/events
+
+# REM ("dream") pass — the OPT-IN, LLM-driven deep review (`relife dream`). Unlike
+# the deterministic consolidation above, REM asks the model to act as an
+# adversarial critic over recent memories: it flags contradictions, safety/
+# alignment problems, hallucinated/garbage memories, and mis-weighted importance.
+# It is deliberately **never auto-run** (no AUTO flag) — it spends Max budget, so
+# the user triggers it when they know budget is comfortable. The model is an
+# ADVISOR only: its verdicts are applied deterministically, reversibly (archive,
+# never delete), confidence-gated, and capped, so a bad pass can't corrupt memory.
+REM_BATCH_MAX = 40         # max memories reviewed (the "replay buffer") per pass
+REM_REFERENCE_MAX = 30     # max established (pinned/pref/pattern) memories sent as context
+REM_MIN_CONFIDENCE = 0.7   # ignore any critic verdict below this confidence
+REM_MAX_PRUNE_FRACTION = 0.25  # never archive more than this share of the buffer in one pass
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

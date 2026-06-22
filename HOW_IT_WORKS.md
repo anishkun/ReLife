@@ -98,6 +98,9 @@ relife do "<task>"     # one shot: do this task to completion, then stop
 relife chat            # back-and-forth conversation in one workspace
 relife build "<spec>"  # BIG job: plan → split into milestones → build each
 relife build --resume  # continue a build that was interrupted
+relife consolidate     # run the cheap "sleep" pass now (fade/merge/learn) — no AI
+relife dream           # opt-in DEEP review: AI critiques & tidies memory (spends budget)
+relife memory stats    # peek at what's remembered and what has faded
 ```
 
 All of them take `--workspace PATH` (default `./workspace`) — **the only folder
@@ -280,11 +283,31 @@ mark it?* (importance).
   workflows automatically.** So ReLife literally learns "whenever I do X I tend to
   do Y then Z" and saves that plan for next time. (Deliberately kept AI-free so
   it's cheap and safe to run on its own.)
+- **`rem.py`** — ReLife's **"dream" pass** (`relife dream`), the brain-analogy
+  taken one step further. Sleep (above) is cheap, automatic, and mechanical. REM
+  is the **opt-in, AI-powered deep review** you run *on purpose* when you know you
+  have budget to spare — because, unlike everything else in the memory layer, this
+  one **calls the model.** It points Claude at your most recent memories as an
+  **adversarial critic** and asks: *do any of these contradict each other? is any
+  of this unsafe, hallucinated, or junk? is anything rated too important or not
+  important enough?* The crucial safety design: **the AI only advises — it never
+  has the keys.** Its suggestions are applied by plain, deterministic code, and:
+    - the worst it can do is **archive** a memory (reversible — never a hard delete);
+    - it **cannot edit the text** of a memory, only hide it or re-rank its importance;
+    - low-confidence suggestions are **ignored**, and there's a hard **cap** on how
+      much a single pass may archive — so even a bad review can't gut your memory;
+    - every action is **logged to `data/rem_journal.jsonl`** with the reason, so you
+      can see (and undo) exactly what it did.
+  In short: **diminishing-returns polish, not a miracle.** It catches the
+  qualitative problems the mechanical sleep pass can't — but it doesn't change how
+  recall ranks things, so it makes memory *cleaner and safer*, not magically
+  smarter. It's gated behind a manual command for **risk** reasons (an AI editing
+  its own memory unsupervised is dangerous) as much as cost.
 - **`server.py`** — wraps all of the above as the **MCP server** `relife_memory`,
   exposing the tools Claude calls: `memory_save` (with an `importance` dial),
   `memory_recall`, `memory_forget`, `skill_write`/`skill_find`,
-  `workflow_save`/`workflow_find`, and `memory_consolidate`. Names start with
-  `relife` → the permission policy auto-trusts them.
+  `workflow_save`/`workflow_find`, `memory_consolidate`, and `memory_dream` (the
+  REM pass). Names start with `relife` → the permission policy auto-trusts them.
 - **`_text.py`** — the shared tokenizer (lowercases, splits words, drops
   stop-words like "the"/"a") used by every keyword path.
 
@@ -408,8 +431,10 @@ D:\ReLife\
 │   ├─ skills/              saved skill files (one .md each)
 │   ├─ workflows/           learned multi-step workflows (one .md each)
 │   ├─ consolidate_state.json   bookkeeping for the auto "sleep" pass
+│   ├─ rem_state.json       bookkeeping for the "dream" pass (what's been reviewed)
+│   ├─ rem_journal.jsonl    audit log of every change the AI critic made (undoable)
 │   └─ builds/<id>/         one folder per `relife build` (ledger.json + plan.md)
-├─ tests/                   50 deterministic tests (no live AI — safe & fast)
+├─ tests/                   77 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
 └─ HOW_IT_WORKS.md          ← you are here (the friendly guide)
@@ -424,10 +449,17 @@ D:\ReLife\
   were set, ReLife would refuse to use it. Heavy runs (especially big builds) draw
   on the *same* usage budget as your interactive Claude Code — so a giant build
   can hit "you've hit your session limit." That's exactly what `--resume` is for.
-- **The tests never call the live model.** All 50 tests are deterministic — they
+- **The tests never call the live model.** All 77 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
-  the cognitive activation/decay math, workflow learning, ledger persistence), not
-  Claude. So you can run them freely without spending budget.
+  the cognitive activation/decay math, workflow learning, ledger persistence, and
+  the REM critic's *application* logic via a stubbed AI), not Claude. So you can
+  run them freely without spending budget.
+- **There are two kinds of "memory cleanup", and only one uses AI.** The automatic
+  **sleep** pass (`consolidate`) is mechanical and free — it runs itself. The
+  **dream** pass (`relife dream`) is the only thing in the whole memory layer that
+  calls the model, which is exactly why it's *opt-in* and never fires on its own.
+  When you read the code, that line — deterministic-and-automatic vs.
+  AI-and-manual — is the cleanest way to keep the two straight.
 - **The agent has two shells on Windows** (`Bash` and `PowerShell`) and the
   permission policy gates both identically.
 - **Memory fades and learns on its own.** Relevance rises with use and decays when
@@ -452,6 +484,9 @@ D:\ReLife\
    each prompt — and using a memory makes it **stronger** (unused ones **fade**).
 6. After a job it **saves facts/skills/workflows**, and a **"sleep" pass** forgets
    stale notes and **learns new workflows** from repeated actions — so it improves.
+   When you have budget to spare, an opt-in **"dream" pass** (`relife dream`) lets
+   the AI critique and tidy its own memory — but reversibly, capped, and logged, so
+   it can never corrupt itself.
 7. For **big** jobs, `relife build` **plans milestones → delegates each to a
    fresh builder → records everything in a ledger**, which makes it **resumable**.
 8. It runs on your **Max subscription**; deterministic **tests** verify the

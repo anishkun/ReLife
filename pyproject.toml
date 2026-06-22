@@ -16,6 +16,13 @@ dependencies = [
 embeddings = [
     "fastembed>=0.3",
 ]
+# Local ANN vector index for semantic recall at large scale (sqlite-vec is a
+# loadable SQLite extension; offline, no API key). Soft-optional: recall falls
+# back to the brute-force cosine scan when this isn't installed or can't load.
+#   pip install -e ".[vector]"
+vector = [
+    "sqlite-vec>=0.1",
+]
 
 [project.scripts]
 relife = "relife.cli:app"

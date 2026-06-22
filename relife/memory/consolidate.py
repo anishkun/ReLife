@@ -36,14 +36,16 @@ _STATE_PATH = config.DATA_DIR / "consolidate_state.json"
 @dataclass
 class ConsolidationReport:
     archived: int = 0
+    deleted: int = 0
     merged: int = 0
     patterns: list[str] = field(default_factory=list)
     workflows_created: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
-            f"archived {self.archived}, merged {self.merged}, "
-            f"patterns {len(self.patterns)}, workflows {len(self.workflows_created)}"
+            f"archived {self.archived}, deleted {self.deleted}, "
+            f"merged {self.merged}, patterns {len(self.patterns)}, "
+            f"workflows {len(self.workflows_created)}"
         )
 
 
@@ -75,6 +77,7 @@ def should_auto_run() -> bool:
 def _decay_and_archive(now: float, report: ConsolidationReport) -> None:
     from . import cognitive
 
+    # Tier 1: soft-archive faded active memories.
     for m in store.all_memories(include_archived=False):
         if cognitive.should_archive(
             use_count=m.use_count,
@@ -86,10 +89,38 @@ def _decay_and_archive(now: float, report: ConsolidationReport) -> None:
             store.archive(m.id)
             report.archived += 1
 
+    # Tier 2: hard-delete archived memories left idle far longer (bounded store).
+    active_ids = {m.id for m in store.all_memories(include_archived=False)}
+    for m in store.all_memories(include_archived=True):
+        if m.id in active_ids:
+            continue  # only already-archived rows are deletion candidates
+        if cognitive.should_hard_delete(
+            last_used_at=m.last_used_at or m.created_at,
+            importance=m.importance,
+            kind=m.kind,
+            now=now,
+        ):
+            store.delete(m.id)
+            report.deleted += 1
+
 
 def _dedupe(report: ConsolidationReport) -> None:
-    """Merge near-duplicate active memories (high keyword overlap)."""
+    """Merge near-duplicate active memories.
+
+    Two memories are duplicates if their token sets overlap heavily (keyword
+    Jaccard >= 0.9) OR — when embeddings are available — their meanings are very
+    close (cosine >= ``config.DEDUP_SIM``), which also catches paraphrases that
+    share few exact tokens. The survivor is reinforced; the duplicate is dropped.
+    """
+    from . import embeddings
+
     mems = [m for m in store.all_memories(include_archived=False)]
+    use_sem = embeddings.available()
+    vecs: dict[int, list[float] | None] = {}
+    if use_sem:
+        batch = embeddings.embed([m.text for m in mems]) or []
+        vecs = {m.id: v for m, v in zip(mems, batch)}
+
     seen: list[tuple[set[str], object]] = []
     for m in mems:
         toks = _tokens(m.text)
@@ -98,7 +129,13 @@ def _dedupe(report: ConsolidationReport) -> None:
         dup_of = None
         for toks2, keep in seen:
             union = toks | toks2
-            if union and len(toks & toks2) / len(union) >= 0.9:
+            kw_dup = bool(union) and len(toks & toks2) / len(union) >= 0.9
+            sem_dup = (
+                use_sem
+                and embeddings.cosine(vecs.get(m.id), vecs.get(keep.id))  # type: ignore[attr-defined]
+                >= config.DEDUP_SIM
+            )
+            if kw_dup or sem_dup:
                 dup_of = keep
                 break
         if dup_of is None:

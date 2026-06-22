@@ -120,14 +120,33 @@ def consolidate_cmd() -> None:
     """Run a memory consolidation ('sleep') pass now: fade unused memories, merge
     duplicates, detect recurring patterns, and synthesize workflows."""
     config.ensure_dirs()
-    from .memory import consolidate
+    from .memory.client import default_client
 
-    report = consolidate.run_consolidation()
+    report = default_client().consolidate()
     typer.secho(f"Consolidation: {report.summary()}", fg=typer.colors.GREEN)
     for name in report.workflows_created:
         typer.secho(f"  + workflow: {name}", fg=typer.colors.CYAN)
     for p in report.patterns[:10]:
         typer.secho(f"  · pattern: {p}", fg=typer.colors.BRIGHT_BLACK)
+
+
+@app.command("dream")
+def dream_cmd(
+    max_memories: Optional[int] = typer.Option(
+        None, "--max", help="Max memories to review this pass (default from config)."
+    ),
+) -> None:
+    """Run an opt-in REM ('dream') pass: the model reviews recent memories as an
+    adversarial critic and reversibly prunes/reweights them. Unlike `consolidate`
+    this uses the model (spends Max budget) — run it when budget is comfortable."""
+    config.ensure_dirs()
+    from .memory import rem
+
+    typer.secho("Dreaming (REM pass) — reviewing recent memories…", fg=typer.colors.BRIGHT_BLACK)
+    report = anyio.run(lambda: rem.run_rem(batch_max=max_memories))
+    typer.secho(f"REM pass: {report.summary()}", fg=typer.colors.GREEN)
+    for note in report.notes:
+        typer.secho(f"  · {note}", fg=typer.colors.BRIGHT_BLACK)
 
 
 memory_app = typer.Typer(help="Inspect long-term memory.")
@@ -138,9 +157,10 @@ app.add_typer(memory_app, name="memory")
 def memory_stats() -> None:
     """Show memory counts, activation, and what has faded."""
     config.ensure_dirs()
-    from .memory import events, skills, store, workflows
+    from .memory import events, skills, workflows
+    from .memory.client import default_client
 
-    mems = store.all_memories(include_archived=True)
+    mems = default_client().all_memories(include_archived=True)
     active = [m for m in mems if m.status == "active"]
     archived = [m for m in mems if m.status != "active"]
     by_kind: dict[str, int] = {}
