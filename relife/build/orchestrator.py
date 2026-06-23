@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import ClaudeSDKClient, ResultMessage
+from claude_agent_sdk import ClaudeSDKClient, ClaudeSDKError, ResultMessage
 
 from .. import config
 from ..agent import _render, build_options, console, preset_system_prompt
@@ -63,8 +63,12 @@ async def run_build(
                 "Start one with [bold]relife build \"<spec>\"[/]."
             )
             return
+        # Resume must run where the build actually lives (from the ledger), not
+        # the CLI's default workspace — otherwise the agent can't see its prior
+        # work and resume-by-id from any directory would build in the wrong place.
+        cwd = Path(ledger.workspace)
         prompt = _resume_prompt(ledger)
-        console.print(f"[dim]resuming build {ledger.build_id}[/]")
+        console.print(f"[dim]resuming build {ledger.build_id} in {cwd}[/]")
     else:
         ledger = BuildLedger.create(spec, cwd)  # type: ignore[arg-type]
         prompt = _initial_prompt(spec)  # type: ignore[arg-type]
@@ -73,24 +77,47 @@ async def run_build(
     mcp_servers = config.default_mcp_servers()
     mcp_servers["relife_build"] = build_server(ledger)
 
-    options = build_options(
-        cwd=cwd,
-        can_use_tool=can_use_tool,
-        mcp_servers=mcp_servers,
-        hooks=hooks,
-        system_prompt=preset_system_prompt(ORCHESTRATOR_PROMPT_FILE),
-        agents=build_agents(),
-        resume=ledger.session_id if resuming else None,
-        max_budget_usd=budget,
-    )
+    async def _connect(resume_session: str | None) -> ClaudeSDKClient:
+        options = build_options(
+            cwd=cwd,
+            can_use_tool=can_use_tool,
+            mcp_servers=mcp_servers,
+            hooks=hooks,
+            system_prompt=preset_system_prompt(ORCHESTRATOR_PROMPT_FILE),
+            agents=build_agents(),
+            resume=resume_session,
+            max_budget_usd=budget,
+        )
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        return client
 
-    async with ClaudeSDKClient(options=options) as client:
+    # Try to continue the same CLI conversation, but a persisted session_id can
+    # be gone (it expires across a session-limit reset) — in which case the
+    # `claude` subprocess fails to start. Fall back to a FRESH session: the
+    # resume prompt re-injects the full ledger, so no milestone progress is lost.
+    resume_session = ledger.session_id if resuming else None
+    try:
+        client = await _connect(resume_session)
+    except ClaudeSDKError as e:
+        if resume_session is None:
+            raise
+        console.print(
+            f"[yellow]previous session unavailable ({type(e).__name__}); "
+            "starting a fresh session and re-injecting the ledger.[/]"
+        )
+        ledger.set_session_id(None)  # drop the stale handle so we don't retry it
+        client = await _connect(None)
+
+    try:
         await client.query(prompt)
         async for msg in client.receive_response():
             _render(msg)
             if isinstance(msg, ResultMessage) and getattr(msg, "session_id", None):
                 # Persist the session handle so the next --resume can continue it.
                 ledger.set_session_id(msg.session_id)
+    finally:
+        await client.disconnect()
 
     if ledger.is_complete():
         console.print(f"[green]build {ledger.build_id} complete[/] — {len(ledger.done())} milestones")

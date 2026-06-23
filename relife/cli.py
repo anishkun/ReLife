@@ -73,18 +73,18 @@ def chat(
 @app.command("build")
 def build(
     spec: Optional[str] = typer.Argument(
-        None, help="What to build, in plain language. Omit when using --resume."
+        None,
+        help="What to build, in plain language. With --resume, optionally the "
+        "build id to resume (omit it to resume the most recent build).",
     ),
     workspace: Optional[Path] = typer.Option(
         None, "--workspace", "-w", help="Directory the agent builds in."
     ),
-    resume: Optional[str] = typer.Option(
-        None,
+    resume: bool = typer.Option(
+        False,
         "--resume",
-        help="Resume a build. Pass a build id, or use the flag with no value "
-        "to resume the most recent build for this workspace.",
-        is_flag=False,
-        flag_value="__latest__",
+        help="Resume a paused build. Optionally pass its build id as the "
+        "argument; otherwise resume the most recent build for this workspace.",
     ),
     budget: Optional[float] = typer.Option(
         None, "--budget", help="Optional max usage-equivalent budget (USD) for the run."
@@ -94,9 +94,12 @@ def build(
     ws = _resolve_workspace(workspace)
     typer.secho(f"workspace: {ws}", fg=typer.colors.BRIGHT_BLACK)
 
+    # `--resume` is a boolean flag (so it never swallows the next option like
+    # --workspace). The positional doubles as the optional build id on resume.
     resume_id: Optional[str] = None
-    if resume is not None:
-        resume_id = None if resume == "__latest__" else resume
+    if resume:
+        resume_id = spec  # may be None → resume most recent for this workspace
+        spec = None
     elif not spec:
         typer.secho("Provide a spec to build, or --resume a prior build.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
