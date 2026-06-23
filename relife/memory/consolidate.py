@@ -176,6 +176,72 @@ def _short_tool(tool: str) -> str:
     return name
 
 
+_SHELL_TOOLS = {"Bash", "PowerShell"}
+
+# Labels that carry no *procedural* meaning on their own — mechanical file edits
+# and task-tracking. A sequence made only of these is a real regularity but not a
+# reusable workflow (e.g. Write→Edit), so it is not promoted.
+_LOW_SIGNAL_LABELS = {
+    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead",
+    "Glob", "Grep", "LS", "TodoWrite", "TaskCreate", "TaskUpdate",
+    "BashOutput", "KillShell", "KillBash", "shell",
+}
+
+
+def _action_label(tool: str, brief: str = "") -> str:
+    """Coarse *action* a tool call performed — the unit recurring-sequence
+    detection should work over.
+
+    Raw tool names are too coarse for shell tools: three distinct Bash commands
+    (git clone, mvn test, git push) would all read as "Bash" and collapse into a
+    single node, hiding the real workflow while leaving trivial editor motions as
+    the only visible n-grams. So for shell tools we derive the action from the
+    command (``brief``); other tools keep their short name.
+    """
+    name = tool.split("__")[-1] if "__" in tool else tool
+    if name not in _SHELL_TOOLS:
+        return name
+    cmd = (brief or "").strip().lower()
+    if not cmd:
+        return "shell"
+    if "git clone" in cmd:
+        return "git-clone"
+    if "git push" in cmd:
+        return "git-push"
+    if "git commit" in cmd:
+        return "git-commit"
+    if "git checkout -b" in cmd or "git switch -c" in cmd or "git branch" in cmd:
+        return "git-branch"
+    if cmd.startswith("git "):
+        return "git"
+    if cmd.startswith("gh "):
+        return "gh"
+    if "docker" in cmd:
+        return "docker"
+    if (
+        "pytest" in cmd or "go test" in cmd or "npm test" in cmd
+        or "gradle test" in cmd or "jest" in cmd
+        or ("mvn" in cmd and ("test" in cmd or "verify" in cmd))
+    ):
+        return "test"
+    if (
+        ("mvn" in cmd and ("package" in cmd or "install" in cmd or "compile" in cmd))
+        or "npm run build" in cmd or "gradle build" in cmd or "go build" in cmd
+        or cmd.startswith("make")
+    ):
+        return "build"
+    if "pip install" in cmd or "npm install" in cmd or "npm ci" in cmd or "poetry install" in cmd:
+        return "install"
+    return "shell"
+
+
+def _is_meaningful_seq(seq: tuple[str, ...]) -> bool:
+    """A recurring sequence is workflow-worthy only if it crosses beyond
+    mechanical editing/task-tracking — i.e. contains at least one distinctive
+    action (git/test/build/docker, an MCP tool, browsing, …)."""
+    return any(label not in _LOW_SIGNAL_LABELS for label in seq)
+
+
 def _contains(longer: tuple, sub: tuple) -> bool:
     """Whether ``sub`` is a contiguous subsequence of ``longer``."""
     if len(sub) >= len(longer):
@@ -184,15 +250,18 @@ def _contains(longer: tuple, sub: tuple) -> bool:
 
 
 def _tool_ngrams(sizes=(2, 3, 4)) -> Counter:
-    """Count recurring tool sequences across tasks (consecutive dups collapsed)."""
+    """Count recurring *action* sequences across tasks (consecutive dups
+    collapsed). Works over action labels, not raw tool names, so e.g.
+    git-clone→test→git-push is visible instead of collapsing into one "Bash"."""
     counts: Counter = Counter()
     for task_id, evs in events.events_by_task().items():
         if not task_id:
             continue  # only sequences that belong to a known task
         seq: list[str] = []
         for e in evs:
-            if not seq or seq[-1] != e.tool:
-                seq.append(e.tool)
+            label = _action_label(e.tool, e.brief)
+            if not seq or seq[-1] != label:
+                seq.append(label)
         for n in sizes:
             for i in range(len(seq) - n + 1):
                 counts[tuple(seq[i : i + n])] += 1
@@ -219,6 +288,11 @@ def _detect_patterns(report: ConsolidationReport) -> None:
     # Longest first so a full sequence wins over its sub-sequences.
     for seq, n in sorted(ngrams.items(), key=lambda x: (-len(x[0]), -x[1])):
         if n < config.RECUR_THRESHOLD:
+            continue
+        # Only promote sequences that represent a real procedure — pure
+        # editor/task-tracking motions (Write→Edit) are skipped, not turned into
+        # noise workflows.
+        if not _is_meaningful_seq(seq):
             continue
         # Skip a sequence already contained in a longer accepted one (noise).
         if any(_contains(longer, seq) for longer in accepted):

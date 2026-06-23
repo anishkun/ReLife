@@ -49,20 +49,42 @@ def test_dedupe_merges_duplicates(tmp_path):
     assert report.merged >= 1
 
 
-def test_recurring_tool_sequence_becomes_workflow(tmp_path):
+def test_recurring_meaningful_sequence_becomes_workflow(tmp_path):
     _isolate(tmp_path)
-    # The same Read → Edit → Bash sequence across several tasks.
+    # The same git-clone → test → git-push procedure across several tasks. The
+    # action is derived from the Bash command (brief), not the bare tool name.
     for t in ("task1", "task2", "task3"):
-        for tool in ("Read", "Edit", "Bash"):
-            events.log_event(tool, task_id=t)
+        events.log_event("Bash", "git clone https://github.com/x/y", task_id=t)
+        events.log_event("Bash", "mvn test", task_id=t)
+        events.log_event("Bash", "git push origin feat/x", task_id=t)
 
     report = consolidate.run_consolidation()
 
     assert report.workflows_created, "expected a synthesized workflow"
     assert workflows.count() >= 1
-    # A pattern memory was recorded for it.
+    # The pattern/workflow is named by action, not by "Bash".
     patterns = [m for m in store.all_memories() if m.kind == "pattern"]
-    assert any("Read" in m.text for m in patterns)
+    assert any("git-clone" in m.text or "git-push" in m.text for m in patterns)
+    assert any("git" in name for name in report.workflows_created)
+
+
+def test_trivial_tool_sequence_is_ignored(tmp_path):
+    _isolate(tmp_path)
+    # Pure editor motion (Write → Edit) repeated many times: a real regularity,
+    # but NOT a reusable procedure — it must not become a workflow or a pattern.
+    for t in ("task1", "task2", "task3", "task4"):
+        events.log_event("Write", task_id=t)
+        events.log_event("Edit", task_id=t)
+
+    report = consolidate.run_consolidation()
+
+    assert not report.workflows_created, "trivial editor motion must not synthesize a workflow"
+    assert workflows.count() == 0
+    seq_patterns = [
+        m for m in store.all_memories()
+        if m.kind == "pattern" and "→" in m.text
+    ]
+    assert not seq_patterns, "trivial sequence must not record a tool-sequence pattern"
 
 
 def test_recurring_episodes_become_pattern(tmp_path):
