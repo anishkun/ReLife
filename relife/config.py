@@ -13,8 +13,8 @@ from pathlib import Path
 # --- Model -----------------------------------------------------------------
 # Runs on the Claude Code Max subscription (the logged-in `claude` CLI), NOT a
 # metered API key. See memory: auth-via-max-subscription.
-MODEL = "claude-opus-4-8"
-EFFORT = "high"  # low | medium | high | xhigh | max  — agentic work wants high+
+MODEL = os.environ.get("RELIFE_MODEL", "claude-opus-4-8")  # override to run on another model, e.g. claude-fable-5
+EFFORT = os.environ.get("RELIFE_EFFORT", "high")  # low | medium | high | xhigh | max  — agentic work wants high+
 
 # --- Paths -----------------------------------------------------------------
 PACKAGE_DIR = Path(__file__).resolve().parent
