@@ -107,6 +107,11 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Wait briefly instead of erroring instantly on SQLITE_BUSY, so a local
+        # write that races the memory daemon (a command run without
+        # RELIFE_MEMORY_URL) retries rather than failing. Sole-writer discipline
+        # still holds; this just removes the sharp edge.
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     @staticmethod

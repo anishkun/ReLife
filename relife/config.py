@@ -129,6 +129,21 @@ REM_REFERENCE_MAX = 30     # max established (pinned/pref/pattern) memories sent
 REM_MIN_CONFIDENCE = 0.7   # ignore any critic verdict below this confidence
 REM_MAX_PRUNE_FRACTION = 0.25  # never archive more than this share of the buffer in one pass
 
+# --- Memory daemon (Phase 2 out-of-process split) --------------------------
+# Opt-in: when RELIFE_MEMORY_URL is set, `default_client()` returns an
+# HttpMemoryClient talking to a standalone `relife memory serve` daemon; unset,
+# memory stays fully in-process (the default — no daemon required, no
+# regressions). MEMORY_HOST/MEMORY_PORT are the daemon's bind address; the
+# optional token gates access (loopback-only today, ready for remote in phase 3).
+MEMORY_URL = os.environ.get("RELIFE_MEMORY_URL") or None
+MEMORY_TOKEN = os.environ.get("RELIFE_MEMORY_TOKEN") or None
+MEMORY_HOST = os.environ.get("RELIFE_MEMORY_HOST", "127.0.0.1")
+MEMORY_PORT = int(os.environ.get("RELIFE_MEMORY_PORT", "8787"))
+# Sidecar file the running daemon drops next to relife.db so an accidental
+# in-process write (a local command run without RELIFE_MEMORY_URL) can warn.
+MEMORY_DB_PATH = DATA_DIR / "relife.db"
+MEMORY_SIDECAR_PATH = DATA_DIR / "relife.db.daemon"
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 

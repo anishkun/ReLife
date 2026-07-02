@@ -143,10 +143,24 @@ def dream_cmd(
     adversarial critic and reversibly prunes/reweights them. Unlike `consolidate`
     this uses the model (spends Max budget) — run it when budget is comfortable."""
     config.ensure_dirs()
-    from .memory import rem
 
     typer.secho("Dreaming (REM pass) — reviewing recent memories…", fg=typer.colors.BRIGHT_BLACK)
-    report = anyio.run(lambda: rem.run_rem(batch_max=max_memories))
+    if config.MEMORY_URL:
+        # A daemon owns the DB (sole writer) — run REM there. `--max` has no
+        # wire field, so the daemon uses its config default; warn if it was set.
+        if max_memories is not None:
+            typer.secho(
+                "  (note: --max is ignored when RELIFE_MEMORY_URL is set; "
+                "the daemon uses its configured batch size)",
+                fg=typer.colors.YELLOW,
+            )
+        from .memory.client import default_client
+
+        report = anyio.run(lambda: default_client().dream())
+    else:
+        from .memory import rem
+
+        report = anyio.run(lambda: rem.run_rem(batch_max=max_memories))
     typer.secho(f"REM pass: {report.summary()}", fg=typer.colors.GREEN)
     for note in report.notes:
         typer.secho(f"  · {note}", fg=typer.colors.BRIGHT_BLACK)
@@ -182,6 +196,46 @@ def memory_stats() -> None:
         for m in top:
             snippet = m.text if len(m.text) <= 60 else m.text[:57] + "..."
             typer.echo(f"    [{m.activation():.2f}] {snippet}")
+
+
+@memory_app.command("serve")
+def memory_serve(
+    host: Optional[str] = typer.Option(None, "--host", help="Bind address (default 127.0.0.1)."),
+    port: Optional[int] = typer.Option(None, "--port", help="Bind port (default 8787)."),
+) -> None:
+    """Run the long-lived memory daemon. Point clients at it with
+    RELIFE_MEMORY_URL=http://<host>:<port>. Keeps the embedding model + DB warm
+    across invocations. Requires the optional extra: pip install -e ".[daemon]"."""
+    config.ensure_dirs()
+    try:
+        from .memory.remote import daemon
+    except ImportError as e:  # noqa: BLE001
+        typer.secho(
+            f'Daemon deps missing ({e}). Install with: pip install -e ".[daemon]"',
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    h = host or config.MEMORY_HOST
+    p = port or config.MEMORY_PORT
+    typer.secho(f"Memory daemon on http://{h}:{p}  (Ctrl-C to stop)", fg=typer.colors.GREEN)
+    daemon.serve(config.MEMORY_DB_PATH, host=h, port=p, token=config.MEMORY_TOKEN)
+
+
+@memory_app.command("ping")
+def memory_ping() -> None:
+    """Check that the memory daemon is reachable (GET /health)."""
+    import httpx
+
+    base = (config.MEMORY_URL or f"http://{config.MEMORY_HOST}:{config.MEMORY_PORT}").rstrip("/")
+    headers = {"Authorization": f"Bearer {config.MEMORY_TOKEN}"} if config.MEMORY_TOKEN else {}
+    try:
+        r = httpx.get(f"{base}/health", headers=headers, timeout=5.0)
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        typer.secho(f"unreachable at {base}: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    typer.secho(f"ok — {base} {r.json()}", fg=typer.colors.GREEN)
 
 
 if __name__ == "__main__":
