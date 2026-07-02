@@ -23,6 +23,15 @@ embeddings = [
 vector = [
     "sqlite-vec>=0.1",
 ]
+# Out-of-process memory daemon (Phase 2): a standalone `relife memory serve` over
+# loopback HTTP, with `HttpMemoryClient` talking to it (opt-in via
+# RELIFE_MEMORY_URL). Soft-optional: unset, memory stays fully in-process.
+#   pip install -e ".[daemon]"
+daemon = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+]
 
 [project.scripts]
 relife = "relife.cli:app"

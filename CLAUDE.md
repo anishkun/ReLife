@@ -11,7 +11,8 @@ ReLife is a personal agent built on the **Claude Agent SDK** (Python) that acts 
 ```sh
 pip install -e .                  # install (editable); creates the `relife` entry point
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
-python -m pytest tests/           # run all tests (81: 77 deterministic + 4 semantic)
+pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
+python -m pytest tests/           # run all tests (93: 89 deterministic + 4 semantic)
 python -m pytest tests/test_permissions.py::test_name -v   # single test
 python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memories)
 
@@ -22,7 +23,10 @@ relife build --resume [ID]        # continue a build (most recent for the worksp
 relife consolidate                # run a memory "sleep" pass now (decay/dedupe/learn workflows)
 relife dream [--max N]            # opt-in LLM "REM" pass: adversarial critic prunes/reweights memory
 relife memory stats               # counts, strongest memories, what has faded
+relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra)
+relife memory ping                # check the daemon is reachable (GET /health)
 # do/chat/build accept --workspace/-w PATH (default ./workspace) — the dir the agent works in
+# set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 ```
 
 Prereqs to actually *run* the agent (not needed for tests): Python ≥3.11, Node.js (`npx` for the browser MCP), a logged-in `claude` CLI on Max, and authenticated `gh`.
@@ -43,7 +47,8 @@ Memory behaves like a brain: each item's relevance **rises when used** and **fad
 - `store.py` — the store is an injectable **`MemoryStore(db_path)`** class; module-level `save`/`recall`/… are back-compat shims over a default instance bound to `_DB_PATH` (still a reassignable global tests rely on — the default is rebuilt when it changes). SQLite at `data/relife.db`; schema version tracked via **`PRAGMA user_version`** with ordered migrations (`_migrate_to_v2`, `_apply_migrations`). **Two-stage recall**: Stage 1 pulls bounded candidates from **FTS5** (+ the vector index when embeddings are on), Stage 2 fuse-ranks only those, then drops anything under `RECALL_FLOOR`. `save()` reinforces exact duplicates and (embeddings on) near-duplicate paraphrases; default importance is kind-based.
 - `vector_index.py` — the **scalability seam** for semantic candidate search behind a `VectorIndex` protocol. `BruteForceIndex` (column scan, always correct, default) and a **soft-optional** `SqliteVecIndex` (`sqlite-vec` `vec0` table; `pip install -e ".[vector]"`). `get_index()` only returns the ANN backend after a runtime **self-test** passes — so an unavailable/misbehaving extension can never break recall.
 - `embeddings.py` — **soft-optional** local semantic vectors via `fastembed` (ONNX, offline, **no API key**). `available()/embed()/cosine()`; everything degrades to keyword+activation if absent. Never a hard dependency; tests force it OFF (see `tests/conftest.py`).
-- `service.py` / `client.py` — the **memory-only service seam**. `MemoryService` is the in-process facade (save/recall/forget/consolidate/stats) over `MemoryStore`; `MemoryClient` is the consumer interface, with `LocalMemoryClient` (direct in-process calls) as today's default transport. The MCP tools, recall/episode hooks, and CLI all go through `default_client()`, so a later out-of-process split (e.g. `HttpMemoryClient`) changes only the transport, not consumers. Scope is long-term memory only; skills/workflows/events stay in-process.
+- `service.py` / `client.py` — the **memory-only service seam**. `MemoryService` is the in-process facade (save/recall/forget/consolidate/stats) over `MemoryStore`; `MemoryClient` is the consumer interface. `default_client()` picks the transport **by environment**: `RELIFE_MEMORY_URL` set → `HttpMemoryClient` against the standalone daemon; unset → `LocalMemoryClient` (direct in-process calls, the default — no daemon required). The MCP tools, recall/episode hooks, and CLI all go through `default_client()`, so the split changes only the transport, not consumers. Scope is long-term memory only; skills/workflows/events stay in-process.
+- `remote/` — the **out-of-process transport** (Phase 2, optional `[daemon]` extra). `wire.py` is the dependency-free (de)serialization shared by both sides (`Memory`/report ⇄ dict — the single source of truth). `daemon.py` is a FastAPI service core (`create_app`/`serve`) over the same `MemoryService`; **it binds the module-level `store._DB_PATH` and `events._DB_PATH`** (not an injected store) because `consolidate()`/`dream()` mine the module default — so all ops, upkeep included, hit one DB. Handlers are `async def` calling the sync service, serializing DB access on the loop (no lock contention). `http_client.py` is `HttpMemoryClient` over a pooled keep-alive `httpx.Client`; it rebuilds real `Memory`/report objects so consumers see identical types. `dream` runs server-side (the `ask_model` callable can't cross the wire) with `timeout=None`, dispatched via `anyio.to_thread` since it's the one async method. A `relife.db.daemon` sidecar lets a stray in-process client **warn** (advisory, never refuse — a crash can orphan it).
 - `skills.py` — single reusable procedures (Markdown+frontmatter under `data/skills/`).
 - `workflows.py` — **multi-step** procedures (ordered chains of skills/actions) under `data/workflows/`, same file format as skills + a `trigger` field.
 - `events.py` — tool-event log as an injectable **`EventLog(db_path)`** (own table in `relife.db`) with module-level shims; `_DB_PATH` reassignable for tests.

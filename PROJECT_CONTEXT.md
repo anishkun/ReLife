@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 81 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 93 passing (`python -m pytest tests/`). Covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -114,7 +114,8 @@ relife/
     store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay
     vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested)
     service.py              # MemoryService — in-process facade over MemoryStore
-    client.py               # MemoryClient seam; LocalMemoryClient (default transport) + default_client()
+    client.py               # MemoryClient seam; default_client() picks Local (default) or Http by RELIFE_MEMORY_URL
+    remote/                 # opt-in out-of-process daemon ([daemon] extra): wire.py, daemon.py (FastAPI), http_client.py
     embeddings.py           # soft-optional LOCAL semantic vectors (fastembed; no API key)
     skills.py               # single reusable procedures (Markdown files)
     workflows.py            # multi-step procedures (ordered skill/action chains)
@@ -131,7 +132,7 @@ relife/
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 81 tests (77 deterministic + 4 semantic, embeddings forced off)
+tests/                      # 93 tests (89 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
@@ -199,10 +200,25 @@ relife chat
   diminishing returns — it does not change recall ranking, so it is not "exponentially" more
   accurate; budget is gated for *risk* reasons, not just cost. Live `relife dream` smoke deferred
   to a comfortable-budget window.
-- **Phase 2/3 (next):** flip `LocalMemoryClient` → an `HttpMemoryClient` against a standalone
-  long-lived memory **daemon** (the seam now makes this a drop-in); always-on agent + UI; outward
-  capabilities (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host
-  (hosted memory stores, MCP vaults, GitHub mounting, scheduled deployments).
+- **Phase 2 — memory daemon split — ✅ DONE.** `default_client()` now returns an
+  `HttpMemoryClient` against a standalone long-lived daemon (`relife memory serve`) **iff
+  `RELIFE_MEMORY_URL` is set**; unset, memory stays fully in-process (default, no regressions).
+  Opt-in, **zero consumer changes** — the `MemoryClient` seam made it a drop-in. New
+  `relife/memory/remote/` (`wire`/`daemon`/`http_client`), optional `[daemon]` extra
+  (fastapi/uvicorn/httpx), `relife memory serve`/`ping`, `RELIFE_MEMORY_URL`/`_TOKEN`/`_HOST`/
+  `_PORT`. Transport = loopback HTTP/REST (behind the protocol, so swappable; remote-ready in
+  phase 3). **Key invariant — do not "fix" this:** the daemon binds the *module-level*
+  `store._DB_PATH` **and** `events._DB_PATH` and uses the **default** `MemoryService()`, NOT an
+  injected store — because `consolidate()`/`dream()` mine the module default; injecting a store
+  would silently split save/recall from upkeep onto different DBs. 93 tests green (was 81):
+  wire round-trip + a parametrized Local-vs-Http conformance suite (Http driven by FastAPI
+  `TestClient`, no real socket). See `.claude/plans/so-http-is-the-snoopy-pinwheel.md`.
+- **Phase 3 (next):** always-on agent + UI; move skills+workflows server-side (they're still
+  local-filesystem, fine on localhost but a remote daemon needs them relocated); async
+  `MemoryClient` variants (today the sync recall/save briefly block an async caller's loop —
+  acceptable at loopback, only `dream` is offloaded); outward capabilities
+  (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
+  stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember
 
