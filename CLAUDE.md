@@ -11,7 +11,7 @@ ReLife is a personal agent built on the **Claude Agent SDK** (Python) that acts 
 ```sh
 pip install -e .                  # install (editable); creates the `relife` entry point
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
-python -m pytest tests/           # run all tests (67: 63 deterministic + 4 semantic)
+python -m pytest tests/           # run all tests (81: 77 deterministic + 4 semantic)
 python -m pytest tests/test_permissions.py::test_name -v   # single test
 python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memories)
 
@@ -59,7 +59,7 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - `ledger.py` — `BuildLedger`: durable plan + progress at `data/builds/<id>/ledger.json` (+ a `plan.md` mirror). Source of truth for resume. Pure/deterministic.
 - `server.py` — in-process MCP server `relife_build` (tools `build_plan_set`/`build_milestone_update`/`build_status`), bound to one ledger per run via closure. Surfaces as `mcp__relife_build__*` → already auto-allowed by the trusted `mcp__relife` prefix (no permission change).
 - `agents.py` — the `builder` `AgentDefinition` the orchestrator delegates each milestone to via the **Task** tool, so each milestone runs in a *fresh context* (the orchestrator stays small). Parallel milestones are deliberately deferred.
-- `orchestrator.py` — `run_build()`: wires ledger + server + builder + the `prompts/orchestrator.md` persona, streams the run, and persists `ResultMessage.session_id` so `--resume` continues the same session. Resume also re-injects the ledger state, so it's robust even if the CLI session is gone.
+- `orchestrator.py` — `run_build()`: wires ledger + server + builder + the `prompts/orchestrator.md` persona, streams the run, and persists `ResultMessage.session_id` so `--resume` continues the same session. Resume runs in the **ledger's own workspace** (not the CLI's default cwd) and re-injects the ledger state, so it's robust even if the CLI session is gone; a persisted `session_id` that **expired** across a Max session-limit reset falls back to a fresh session without losing milestone progress. In `cli.py`, `--resume` is a **boolean flag** (the positional arg doubles as the optional build id), so it no longer swallows the following option.
 - `build_options` (agent.py) gained `system_prompt`/`agents`/`resume`/`max_budget_usd` params to support this; `do`/`chat` are unchanged.
 
 ## Non-obvious constraints

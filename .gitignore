@@ -3,8 +3,8 @@
 *.db
 *.sqlite3
 
-# Local, machine-specific Claude Code settings (permission allowlists etc.)
-.claude/settings.local.json
+# Machine-local Claude Code config (permission allowlists, local skills, etc.)
+/.claude/
 
 # Python
 __pycache__/

@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-06-22.
+> Last updated: 2026-06-23.
 
 ## 1. Vision
 
@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 50 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 81 passing (`python -m pytest tests/`). Covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -131,7 +131,7 @@ relife/
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 67 tests (63 deterministic + 4 semantic, embeddings forced off)
+tests/                      # 81 tests (77 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
