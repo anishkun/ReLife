@@ -13,7 +13,6 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from . import skills, workflows
 from .client import default_client
 
 
@@ -101,7 +100,7 @@ async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        slug = skills.write_skill(args["name"], args.get("when_to_use", ""), args["steps"])
+        slug = default_client().skill_write(args["name"], args.get("when_to_use", ""), args["steps"])
     except Exception as e:  # noqa: BLE001
         return {"content": [{"type": "text", "text": f"Error writing skill: {e}"}], "is_error": True}
     return {"content": [{"type": "text", "text": f"Saved skill '{slug}'."}]}
@@ -122,7 +121,7 @@ async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = skills.find_skills(args["query"], k=int(args.get("k", 3)))
+    hits = default_client().skill_find(args["query"], k=int(args.get("k", 3)))
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching skills yet)"}]}
     blocks = [f"## {s.name}\nWhen to use: {s.when_to_use}\n\n{s.body}" for s in hits]
@@ -169,7 +168,7 @@ async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        slug = workflows.write_workflow(
+        slug = default_client().workflow_write(
             args["name"], args.get("when_to_use", ""), args["steps"], args.get("trigger", "")
         )
     except Exception as e:  # noqa: BLE001
@@ -191,7 +190,7 @@ async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = workflows.find_workflows(args["query"], k=int(args.get("k", 3)))
+    hits = default_client().workflow_find(args["query"], k=int(args.get("k", 3)))
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching workflows yet)"}]}
     blocks = [

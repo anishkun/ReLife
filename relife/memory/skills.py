@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from .. import config
 from ._text import tokenize as _tokens
 
-_SKILLS_DIR = config.DATA_DIR / "skills"
+_SKILLS_DIR = config.SKILLS_DIR
 _SLUG_OK = re.compile(r"[^a-z0-9]+")
 
 

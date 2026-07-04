@@ -19,7 +19,9 @@ from typing import Any
 
 from ..consolidate import ConsolidationReport
 from ..rem import RemReport
+from ..skills import Skill
 from ..store import Memory
+from ..workflows import Workflow
 
 # --- Memory <-> dict --------------------------------------------------------
 _MEMORY_FIELDS = (
@@ -57,6 +59,45 @@ def memories_to_list(ms: list[Memory]) -> list[dict[str, Any]]:
 
 def memories_from_list(items: list[dict[str, Any]]) -> list[Memory]:
     return [memory_from_dict(d) for d in items]
+
+
+# --- Skill / Workflow <-> dict ----------------------------------------------
+# Every field is a string, so JSON (UTF-8) round-trips them losslessly,
+# including non-ASCII bodies. Slugs are ASCII-only by construction.
+_SKILL_FIELDS = ("name", "when_to_use", "body", "slug")
+_WORKFLOW_FIELDS = ("name", "when_to_use", "trigger", "body", "slug")
+
+
+def skill_to_dict(s: Skill) -> dict[str, Any]:
+    return {f: getattr(s, f) for f in _SKILL_FIELDS}
+
+
+def skill_from_dict(d: dict[str, Any]) -> Skill:
+    return Skill(**{f: d[f] for f in _SKILL_FIELDS})
+
+
+def skills_to_list(ss: list[Skill]) -> list[dict[str, Any]]:
+    return [skill_to_dict(s) for s in ss]
+
+
+def skills_from_list(items: list[dict[str, Any]]) -> list[Skill]:
+    return [skill_from_dict(d) for d in items]
+
+
+def workflow_to_dict(w: Workflow) -> dict[str, Any]:
+    return {f: getattr(w, f) for f in _WORKFLOW_FIELDS}
+
+
+def workflow_from_dict(d: dict[str, Any]) -> Workflow:
+    return Workflow(**{f: d[f] for f in _WORKFLOW_FIELDS})
+
+
+def workflows_to_list(ws: list[Workflow]) -> list[dict[str, Any]]:
+    return [workflow_to_dict(w) for w in ws]
+
+
+def workflows_from_list(items: list[dict[str, Any]]) -> list[Workflow]:
+    return [workflow_from_dict(d) for d in items]
 
 
 # --- ConsolidationReport <-> dict -------------------------------------------

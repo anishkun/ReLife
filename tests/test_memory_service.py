@@ -1,7 +1,9 @@
 """Tests for the memory service seam and the preserved MCP tool contract."""
 
 from relife.memory import server
-from relife.memory.client import LocalMemoryClient
+from relife.memory import skills as sk
+from relife.memory import workflows as wf
+from relife.memory.client import LocalMemoryClient, MemoryClient
 from relife.memory.service import MemoryService
 from relife.memory.store import MemoryStore
 
@@ -44,6 +46,27 @@ def test_service_consolidate_returns_report(tmp_path):
     store_mod.init_db()
     report = MemoryService().consolidate()
     assert hasattr(report, "summary") and isinstance(report.summary(), str)
+
+
+def test_client_skill_workflow_methods(tmp_path, monkeypatch):
+    # The procedural-memory methods delegate to the module functions at call
+    # time, so pointing the dir globals at tmp_path isolates them.
+    monkeypatch.setattr(sk, "_SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(wf, "_WORKFLOWS_DIR", tmp_path / "workflows")
+    c = LocalMemoryClient()
+
+    assert c.skill_write("push-repo", "Pushing a new repo.", "1. gh repo create") == "push-repo"
+    assert c.skill_count() == 1
+    found = c.skill_find("push new repo")
+    assert found and found[0].slug == "push-repo"
+
+    assert c.workflow_write("ship", "Ship it.", "1. build\n2. push", trigger="build,push") == "ship"
+    assert c.workflow_count() == 1
+    wfound = c.workflow_find("ship build push")
+    assert wfound and wfound[0].trigger == "build,push"
+
+    # Both client classes structurally satisfy the widened protocol.
+    assert isinstance(c, MemoryClient)
 
 
 # --- contract: the agent-facing tool names must not drift ------------------

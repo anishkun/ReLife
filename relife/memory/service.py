@@ -6,8 +6,9 @@ forget, consolidate, and read-only stats. Today it calls the in-process
 standalone daemon later) becomes the only thing that changes — consumers depend
 on a ``MemoryClient`` (see ``client.py``), never on the store internals.
 
-Scope is deliberately **long-term memory only**. Skills, workflows, and the
-event log stay in-process and are not part of this seam yet (consolidation is
+Scope covers long-term memory **plus procedural memory** (skills/workflows) —
+both route through this facade and the ``MemoryClient`` seam, so the daemon can
+serve them too. Only the **event log** stays in-process for now (consolidation is
 included because it is memory upkeep, even though it currently also mines events
 into workflows).
 
@@ -19,8 +20,12 @@ explicit ``MemoryStore`` to bind a service to a specific database.
 from __future__ import annotations
 
 from . import consolidate as _consolidate
+from . import skills as _skills
 from . import store as _store_mod
+from . import workflows as _workflows
+from .skills import Skill
 from .store import Memory, MemoryStore
+from .workflows import Workflow
 
 
 class MemoryService:
@@ -71,6 +76,32 @@ class MemoryService:
 
     def count(self, include_archived: bool = True) -> int:
         return self._resolved().count(include_archived=include_archived)
+
+    # --- procedural memory (skills / workflows) -----------------------------
+    # These delegate to the module functions at call time, so they honour
+    # reassignment of ``skills._SKILLS_DIR`` / ``workflows._WORKFLOWS_DIR`` (the
+    # test-isolation mechanism) and the daemon's dir binding, exactly like the
+    # store methods honour ``store._DB_PATH``. There is no injected-store variant
+    # because skills/workflows are filesystem-backed, not a ``MemoryStore``.
+    def skill_write(self, name: str, when_to_use: str, steps: str) -> str:
+        return _skills.write_skill(name, when_to_use, steps)
+
+    def skill_find(self, query: str, k: int = 3) -> list[Skill]:
+        return _skills.find_skills(query, k=k)
+
+    def skill_count(self) -> int:
+        return _skills.count()
+
+    def workflow_write(
+        self, name: str, when_to_use: str, steps: str, trigger: str = ""
+    ) -> str:
+        return _workflows.write_workflow(name, when_to_use, steps, trigger=trigger)
+
+    def workflow_find(self, query: str, k: int = 3) -> list[Workflow]:
+        return _workflows.find_workflows(query, k=k)
+
+    def workflow_count(self) -> int:
+        return _workflows.count()
 
     # --- maintenance --------------------------------------------------------
     def consolidate(self) -> _consolidate.ConsolidationReport:

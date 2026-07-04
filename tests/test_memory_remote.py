@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import pytest
 
+from relife.memory import consolidate as consol
 from relife.memory import events as ev
+from relife.memory import skills as sk
 from relife.memory import store as store_mod
-from relife.memory.client import LocalMemoryClient
+from relife.memory import workflows as wf
+from relife.memory.client import LocalMemoryClient, MemoryClient
 from relife.memory.remote import wire
+from relife.memory.skills import Skill
 from relife.memory.store import Memory
+from relife.memory.workflows import Workflow
 
 
 # --- wire round-trip (no extra needed) -------------------------------------
@@ -59,20 +64,51 @@ def test_wire_reports_roundtrip():
     assert rr2 == rr
 
 
+def test_wire_skill_workflow_roundtrip():
+    s = Skill(
+        name="scaffold-python-cli",
+        when_to_use="Setting up a new Python CLI.",
+        body="1. init\n2. add typer",
+        slug="scaffold-python-cli",
+    )
+    assert wire.skill_from_dict(wire.skill_to_dict(s)) == s
+
+    w = Workflow(
+        name="ship-new-service",
+        when_to_use="Standing up a new service.",
+        trigger="scaffold,test,push",
+        body="1. scaffold\n2. test\n3. push",
+        slug="ship-new-service",
+    )
+    assert wire.workflow_from_dict(wire.workflow_to_dict(w)) == w
+
+
 # --- parametrized conformance: Local vs Http -------------------------------
 def _bind_default_store(tmp_path, monkeypatch):
-    """Point the module-level store + event log at an isolated DB (restored on
-    teardown) so consolidate/dream — which use the module default — are isolated."""
+    """Point the module-level store + event log + consolidate state at isolated
+    paths (restored on teardown) so consolidate/dream — which use the module
+    default — are isolated."""
     db = tmp_path / "relife.db"
     monkeypatch.setattr(store_mod, "_DB_PATH", db)
     monkeypatch.setattr(ev, "_DB_PATH", db)
+    monkeypatch.setattr(consol, "_STATE_PATH", tmp_path / "consolidate_state.json")
     store_mod.init_db()
+    ev.init_db()
     return db
 
 
 @pytest.fixture(params=["local", "http"])
 def client(request, tmp_path, monkeypatch):
     _bind_default_store(tmp_path, monkeypatch)
+    # Isolate procedural memory the same way as the store: point the module
+    # globals at tmp dirs. The http branch passes the *same* dirs into create_app
+    # so the daemon binds them too — otherwise daemon-side consolidate would write
+    # workflows the client never sees (the split this phase closes).
+    skills_dir = tmp_path / "skills"
+    workflows_dir = tmp_path / "workflows"
+    monkeypatch.setattr(sk, "_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(wf, "_WORKFLOWS_DIR", workflows_dir)
+
     if request.param == "local":
         yield LocalMemoryClient()
         return
@@ -84,7 +120,11 @@ def client(request, tmp_path, monkeypatch):
     from relife.memory.remote.daemon import create_app
     from relife.memory.remote.http_client import HttpMemoryClient
 
-    app = create_app(tmp_path / "relife.db")  # binds the same _DB_PATH
+    app = create_app(  # binds the same _DB_PATH + skills/workflows dirs
+        tmp_path / "relife.db",
+        skills_dir=skills_dir,
+        workflows_dir=workflows_dir,
+    )
     tc = TestClient(app)  # httpx.Client subclass; drives the ASGI app in-process
     yield HttpMemoryClient("http://testserver", client=tc)
     tc.close()
@@ -122,6 +162,72 @@ def test_conformance_consolidate(client):
     assert hasattr(report, "summary") and isinstance(report.summary(), str)
 
 
+# --- procedural memory conformance (skills / workflows) --------------------
+def test_conformance_skill_roundtrip(client):
+    slug = client.skill_write(
+        "scaffold-python-cli", "Setting up a new Python CLI.", "1. init\n2. add typer"
+    )
+    assert slug == "scaffold-python-cli"
+    hits = client.skill_find("python cli scaffold")
+    assert hits and isinstance(hits[0], Skill)
+    assert hits[0].slug == "scaffold-python-cli"
+    assert "typer" in hits[0].body
+    assert client.skill_count() == 1
+    assert client.skill_find("totally unrelated quantum chromodynamics") == []
+
+
+def test_conformance_workflow_roundtrip(client):
+    slug = client.workflow_write(
+        "ship-new-service",
+        "Standing up a new service.",
+        "1. scaffold\n2. test\n3. push",
+        trigger="scaffold,test,push",
+    )
+    assert slug == "ship-new-service"
+    hits = client.workflow_find("ship service scaffold")
+    assert hits and isinstance(hits[0], Workflow)
+    assert hits[0].slug == "ship-new-service"
+    assert hits[0].trigger == "scaffold,test,push"  # trigger survives the wire
+    assert client.workflow_count() == 1
+    assert client.workflow_find("totally unrelated quantum chromodynamics") == []
+
+
+def test_conformance_write_validation(client):
+    # Blank name or steps raise ValueError on BOTH transports (the daemon maps
+    # its 400 back to ValueError so consumers fail identically).
+    with pytest.raises(ValueError):
+        client.skill_write("", "when", "steps")
+    with pytest.raises(ValueError):
+        client.skill_write("name", "when", "")
+    with pytest.raises(ValueError):
+        client.workflow_write("", "when", "steps")
+
+
+def test_conformance_unicode_content(client):
+    # Non-ASCII body must survive the JSON/UTF-8 round-trip byte-identical. The
+    # tokenizer is ASCII-only, so match on ASCII words in when_to_use.
+    body = "Deploy notes: café ☕ → naïve fix ✓ — déjà vu"
+    client.skill_write("deploy-notes", "Deployment checklist reference.", body)
+    hits = client.skill_find("deployment checklist reference")
+    assert hits and hits[0].body == body
+
+
+def test_conformance_consolidate_workflow_visible(client):
+    # Headline regression: a recurring git-clone → test → push procedure across
+    # tasks. Consolidation (server-side under the daemon) must synthesize a
+    # workflow that the SAME client can then find — proving daemon-written
+    # workflows land where clients read.
+    for t in ("task1", "task2", "task3"):
+        ev.log_event("Bash", "git clone https://github.com/x/y", task_id=t)
+        ev.log_event("Bash", "mvn test", task_id=t)
+        ev.log_event("Bash", "git push origin feat/x", task_id=t)
+
+    report = client.consolidate()
+    assert report.workflows_created, "expected a synthesized workflow"
+    assert client.workflow_count() >= 1
+    assert client.workflow_find("git clone test push")
+
+
 # --- daemon-specific: health + token auth ----------------------------------
 def test_daemon_health_and_token(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
@@ -130,11 +236,22 @@ def test_daemon_health_and_token(tmp_path, monkeypatch):
     from relife.memory.remote.daemon import create_app
 
     _bind_default_store(tmp_path, monkeypatch)
-    app = create_app(tmp_path / "relife.db", token="s3cret")
+    monkeypatch.setattr(sk, "_SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(wf, "_WORKFLOWS_DIR", tmp_path / "workflows")
+    app = create_app(
+        tmp_path / "relife.db",
+        token="s3cret",
+        skills_dir=tmp_path / "skills",
+        workflows_dir=tmp_path / "workflows",
+    )
     tc = TestClient(app)
 
     assert tc.get("/health").status_code == 200        # health needs no token
     assert tc.get("/count").status_code == 401          # missing token → rejected
+    assert tc.get("/skills/count").status_code == 401   # new routes gated too
     ok = tc.get("/count", headers={"Authorization": "Bearer s3cret"})
     assert ok.status_code == 200 and ok.json()["count"] == 0
+    # Health reports procedural-memory counts so a remote check is one call.
+    health = tc.get("/health").json()
+    assert health["skills"] == 0 and health["workflows"] == 0
     tc.close()

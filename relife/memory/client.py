@@ -19,7 +19,9 @@ from typing import Protocol, runtime_checkable
 
 from .. import config
 from .service import MemoryService
+from .skills import Skill
 from .store import Memory
+from .workflows import Workflow
 
 
 @runtime_checkable
@@ -31,6 +33,13 @@ class MemoryClient(Protocol):
     def count(self, include_archived: bool = ...) -> int: ...
     def consolidate(self): ...
     async def dream(self, ask_model=...): ...
+    # Procedural memory (skills / workflows).
+    def skill_write(self, name: str, when_to_use: str, steps: str) -> str: ...
+    def skill_find(self, query: str, k: int = ...) -> list[Skill]: ...
+    def skill_count(self) -> int: ...
+    def workflow_write(self, name: str, when_to_use: str, steps: str, trigger: str = ...) -> str: ...
+    def workflow_find(self, query: str, k: int = ...) -> list[Workflow]: ...
+    def workflow_count(self) -> int: ...
 
 
 class LocalMemoryClient:
@@ -61,6 +70,24 @@ class LocalMemoryClient:
 
     async def dream(self, ask_model=None):
         return await self._svc.dream(ask_model)
+
+    def skill_write(self, name, when_to_use, steps) -> str:
+        return self._svc.skill_write(name, when_to_use, steps)
+
+    def skill_find(self, query, k=3) -> list[Skill]:
+        return self._svc.skill_find(query, k=k)
+
+    def skill_count(self) -> int:
+        return self._svc.skill_count()
+
+    def workflow_write(self, name, when_to_use, steps, trigger="") -> str:
+        return self._svc.workflow_write(name, when_to_use, steps, trigger=trigger)
+
+    def workflow_find(self, query, k=3) -> list[Workflow]:
+        return self._svc.workflow_find(query, k=k)
+
+    def workflow_count(self) -> int:
+        return self._svc.workflow_count()
 
 
 _default: MemoryClient | None = None

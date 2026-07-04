@@ -23,7 +23,7 @@ from typing import Any
 from claude_agent_sdk import HookMatcher
 
 from . import config
-from .memory import events, skills, workflows
+from .memory import events
 from .memory._text import tokenize as _tokens
 from .memory.client import default_client
 
@@ -50,12 +50,13 @@ async def _recall_hook(input_data: dict[str, Any], tool_use_id: str | None, cont
     # Gather candidate blocks in priority order: memory, then skills, then a
     # workflow. Each carries the key text used for cross-section de-duplication.
     candidates: list[tuple[str, str, str]] = []  # (section_label, key_text, rendered)
-    for m in default_client().recall(prompt, k=5, reinforce=True):
+    client = default_client()
+    for m in client.recall(prompt, k=5, reinforce=True):
         rendered = f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "")
         candidates.append(("memory", m.text + " " + m.tags, rendered))
-    for s in skills.find_skills(prompt, k=2):
+    for s in client.skill_find(prompt, k=2):
         candidates.append(("skill", s.name + " " + s.when_to_use, f"### {s.name} — {s.when_to_use}\n{s.body}"))
-    for w in workflows.find_workflows(prompt, k=1):
+    for w in client.workflow_find(prompt, k=1):
         candidates.append(("workflow", w.name + " " + w.when_to_use, f"### {w.name} — {w.when_to_use}\n{w.body}"))
 
     # De-duplicate across sections and stay within the injection budget.

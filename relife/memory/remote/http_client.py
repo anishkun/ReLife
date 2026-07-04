@@ -27,7 +27,9 @@ from typing import Any
 import anyio
 import httpx
 
+from ..skills import Skill
 from ..store import Memory
+from ..workflows import Workflow
 from . import wire
 
 # Long enough that a warm recall (embedding + DB) never trips it, short enough to
@@ -65,6 +67,18 @@ class HttpMemoryClient:
         r = self._client.get(path, params=params or {})
         r.raise_for_status()
         return r.json()
+
+    def _post_write(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        """POST a write, translating the daemon's 400 (invalid input) back into
+        the ``ValueError`` the in-process path raises, so both transports fail
+        identically for consumers (and the conformance suite stays parametrizable)."""
+        try:
+            return self._post(path, json)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                detail = e.response.json().get("detail", str(e))
+                raise ValueError(detail) from None
+            raise
 
     # --- MemoryClient protocol ---------------------------------------------
     def save(self, text, kind="fact", tags="", importance=None) -> int:
@@ -109,6 +123,40 @@ class HttpMemoryClient:
             lambda: self._post("/dream", timeout=None)
         )
         return wire.rem_from_dict(data)
+
+    # --- procedural memory (skills / workflows) -----------------------------
+    def skill_write(self, name, when_to_use, steps) -> str:
+        data = self._post_write(
+            "/skills/write",
+            {"name": name, "when_to_use": when_to_use, "steps": steps},
+        )
+        return str(data["slug"])
+
+    def skill_find(self, query, k=3) -> list[Skill]:
+        data = self._post("/skills/find", {"query": query, "k": k})
+        return wire.skills_from_list(data["skills"])
+
+    def skill_count(self) -> int:
+        return int(self._get("/skills/count")["count"])
+
+    def workflow_write(self, name, when_to_use, steps, trigger="") -> str:
+        data = self._post_write(
+            "/workflows/write",
+            {
+                "name": name,
+                "when_to_use": when_to_use,
+                "steps": steps,
+                "trigger": trigger,
+            },
+        )
+        return str(data["slug"])
+
+    def workflow_find(self, query, k=3) -> list[Workflow]:
+        data = self._post("/workflows/find", {"query": query, "k": k})
+        return wire.workflows_from_list(data["workflows"])
+
+    def workflow_count(self) -> int:
+        return int(self._get("/workflows/count")["count"])
 
     def close(self) -> None:
         self._client.close()
