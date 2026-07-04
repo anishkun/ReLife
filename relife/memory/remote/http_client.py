@@ -27,6 +27,7 @@ from typing import Any
 import anyio
 import httpx
 
+from ..events import Event
 from ..skills import Skill
 from ..store import Memory
 from ..workflows import Workflow
@@ -157,6 +158,20 @@ class HttpMemoryClient:
 
     def workflow_count(self) -> int:
         return int(self._get("/workflows/count")["count"])
+
+    # --- tool-event log -----------------------------------------------------
+    def log_event(self, tool, brief="", task_id="") -> int:
+        data = self._post(
+            "/events/log", {"tool": tool, "brief": brief, "task_id": task_id}
+        )
+        return int(data["id"])
+
+    def events_for_task(self, task_id, limit=500) -> list[Event]:
+        data = self._get("/events/by-task", {"task_id": task_id, "limit": limit})
+        return wire.events_from_list(data["events"])
+
+    def event_count(self) -> int:
+        return int(self._get("/events/count")["count"])
 
     def close(self) -> None:
         self._client.close()

@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-06-23.
+> Last updated: 2026-07-04.
 
 ## 1. Vision
 
@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 93 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 109 passing (`python -m pytest tests/`). Covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -132,7 +132,7 @@ relife/
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 93 tests (89 deterministic + 4 semantic, embeddings forced off)
+tests/                      # 109 tests (105 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
@@ -213,10 +213,40 @@ relife chat
   would silently split save/recall from upkeep onto different DBs. 93 tests green (was 81):
   wire round-trip + a parametrized Local-vs-Http conformance suite (Http driven by FastAPI
   `TestClient`, no real socket). See `.claude/plans/so-http-is-the-snoopy-pinwheel.md`.
-- **Phase 3 (next):** always-on agent + UI; move skills+workflows server-side (they're still
-  local-filesystem, fine on localhost but a remote daemon needs them relocated); async
-  `MemoryClient` variants (today the sync recall/save briefly block an async caller's loop —
-  acceptable at loopback, only `dream` is offloaded); outward capabilities
+- **Phase 3 — skills+workflows server-side — ✅ DONE (this phase).** Skills and workflows now
+  route through the `MemoryClient` seam just like long-term memory: `MemoryService` gained
+  `skill_write/find/count` + `workflow_write/find/count`, the daemon gained `/skills/*` +
+  `/workflows/*` routes, and `HttpMemoryClient` implements them (with 400→`ValueError` mapping so
+  both transports fail identically). Consumers (recall hook, MCP `skill_*`/`workflow_*` tools,
+  `memory stats`) now call `default_client()`; **MCP tool names/schemas unchanged**. **Key
+  invariant — do not "fix":** `consolidate.py` still calls `workflows.write_workflow` *directly*
+  (module function), never the client — it always runs where the data lives (in-process locally,
+  *inside* the daemon under `POST /consolidate`); routing it through the client would make the
+  daemon's `async` handler issue a blocking HTTP call back into its own event loop → deadlock.
+  Instead `create_app` binds `skills._SKILLS_DIR`/`workflows._WORKFLOWS_DIR` daemon-side (mirroring
+  the `_DB_PATH` binding), which is what closes the "daemon synthesizes workflows nobody sees"
+  split. 105 tests green (was 93): wire round-trip for Skill/Workflow, parametrized Local-vs-Http
+  conformance (incl. a regression proving daemon-side consolidate output is client-visible, unicode
+  round-trip, and shared write-validation). See `.claude/plans/composed-twirling-shore.md`.
+  Upgrade daemon and client **together** (an old daemon 404s the new routes → the hooks fail).
+- **Phase 3 — event log server-side — DONE (this phase).** Closed the last in-process split: the
+  PostToolUse hook now writes via `client.log_event` and the Stop hook reads one task's events via
+  `client.events_for_task` (both were direct `events.*` calls), so in http mode client-logged tool
+  events reach the daemon and daemon-side consolidation actually mines them — instead of relying on
+  the agent and daemon *coincidentally* resolving the same `data/relife.db` path (which broke the
+  moment the daemon lived elsewhere). `MemoryService`/`MemoryClient` gained
+  `log_event`/`events_for_task`/`event_count`; daemon routes `POST /events/log`, `GET
+  /events/by-task`, `GET /events/count` (events share the DB, so `_bind_db` already covered them —
+  no dir binding); `wire.py` gained `Event` helpers; `/health` now reports the event count.
+  **`consolidate.py` still reads the log directly** (module-level) — it always runs where the data
+  lives (daemon-side under `POST /consolidate`), same invariant as workflows. 109 tests green (was
+  105): `Event` wire round-trip, event-log conformance across both transports, and the consolidate
+  regression now logs *through the client* end-to-end. The recall/event/episode hooks pass
+  **unedited** (they resolve the module defaults at call time via `LocalMemoryClient`).
+- **Phase 3 (next):** always-on agent + UI; async
+  `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
+  acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call
+  in http mode); outward capabilities
   (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 

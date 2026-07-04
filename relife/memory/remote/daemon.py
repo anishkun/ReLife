@@ -106,6 +106,7 @@ def create_app(
             "count": svc.count(include_archived=True),
             "skills": svc.skill_count(),
             "workflows": svc.workflow_count(),
+            "events": svc.event_count(),
         }
 
     @app.post("/save", dependencies=auth)
@@ -196,6 +197,23 @@ def create_app(
     @app.get("/workflows/count", dependencies=auth)
     async def workflow_count() -> dict[str, Any]:
         return {"count": svc.workflow_count()}
+
+    # --- tool-event log -----------------------------------------------------
+    @app.post("/events/log", dependencies=auth)
+    async def event_log(body: dict[str, Any]) -> dict[str, Any]:
+        mid = svc.log_event(
+            body["tool"], body.get("brief", ""), body.get("task_id", "")
+        )
+        return {"id": mid}
+
+    @app.get("/events/by-task", dependencies=auth)
+    async def events_by_task(task_id: str, limit: int = 500) -> dict[str, Any]:
+        evs = svc.events_for_task(task_id, limit=limit)
+        return {"events": wire.events_to_list(evs)}
+
+    @app.get("/events/count", dependencies=auth)
+    async def event_count() -> dict[str, Any]:
+        return {"count": svc.event_count()}
 
     return app
 

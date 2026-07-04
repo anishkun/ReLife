@@ -18,6 +18,7 @@ import warnings
 from typing import Protocol, runtime_checkable
 
 from .. import config
+from .events import Event
 from .service import MemoryService
 from .skills import Skill
 from .store import Memory
@@ -40,6 +41,10 @@ class MemoryClient(Protocol):
     def workflow_write(self, name: str, when_to_use: str, steps: str, trigger: str = ...) -> str: ...
     def workflow_find(self, query: str, k: int = ...) -> list[Workflow]: ...
     def workflow_count(self) -> int: ...
+    # Tool-event log.
+    def log_event(self, tool: str, brief: str = ..., task_id: str = ...) -> int: ...
+    def events_for_task(self, task_id: str, limit: int = ...) -> list[Event]: ...
+    def event_count(self) -> int: ...
 
 
 class LocalMemoryClient:
@@ -88,6 +93,15 @@ class LocalMemoryClient:
 
     def workflow_count(self) -> int:
         return self._svc.workflow_count()
+
+    def log_event(self, tool, brief="", task_id="") -> int:
+        return self._svc.log_event(tool, brief=brief, task_id=task_id)
+
+    def events_for_task(self, task_id, limit=500) -> list[Event]:
+        return self._svc.events_for_task(task_id, limit=limit)
+
+    def event_count(self) -> int:
+        return self._svc.event_count()
 
 
 _default: MemoryClient | None = None

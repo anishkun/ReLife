@@ -562,10 +562,15 @@ distance-metric quirks (`vector_index.py:78`).
 Two layers of indirection sit between consumers and the store, both forward-looking:
 
 - **`MemoryService`** (`service.py:26`) — the in-process *facade* for long-term
-  memory: `save`/`recall`/`forget`/`consolidate`/`dream`/stats. It resolves the
-  default store on each call so it honors `_DB_PATH` reassignment. Scope is
-  *deliberately long-term memory only* — skills, workflows, and events stay
-  in-process and aren't part of this seam.
+  memory (`save`/`recall`/`forget`/`consolidate`/`dream`/stats) **and procedural
+  memory** (`skill_write`/`skill_find`/`skill_count`, `workflow_write`/`workflow_find`/
+  `workflow_count`). It resolves the default store on each call so it honors
+  `_DB_PATH` reassignment; the skill/workflow/event methods delegate to the module
+  functions at call time so they honor `_SKILLS_DIR`/`_WORKFLOWS_DIR`/`events._DB_PATH`
+  reassignment and the daemon's binding. The whole consumer-facing surface — long-term
+  memory, skills, workflows, and the tool-event log — routes through this seam; only
+  `consolidate`/`dream` stay module-level (they *mine* the defaults, so the daemon binds
+  them).
 - **`MemoryClient`** (`client.py:24`) — the *consumer-facing* protocol. The MCP tools,
   the recall/episode hooks, and the CLI all go through `default_client()`
   (`client.py:67`), today a `LocalMemoryClient` making direct in-process calls.
@@ -1082,7 +1087,7 @@ consolidation:
 | `memory/store.py` | `MemoryStore`: schema/migrations, two-stage `recall`, reinforce-on-`save`, candidate gate. |
 | `memory/vector_index.py` | `VectorIndex` protocol, `BruteForceIndex`, `SqliteVecIndex`, `get_index` self-test. |
 | `memory/embeddings.py` | Soft-optional local ONNX embeddings; `available`/`embed`/`cosine`. |
-| `memory/service.py` | `MemoryService` facade (long-term memory only): save/recall/forget/consolidate/dream/stats. |
+| `memory/service.py` | `MemoryService` facade (long-term + procedural memory + event log): save/recall/forget/consolidate/dream/stats + skill_/workflow_ write/find/count + log_event/events_for_task/event_count. |
 | `memory/client.py` | `MemoryClient` protocol + `LocalMemoryClient` + `default_client()` (transport seam). |
 | `memory/skills.py` | Single procedures as Markdown; weighted keyword `find_skills`. |
 | `memory/workflows.py` | Multi-step procedures as Markdown (+`trigger`); weighted keyword `find_workflows`. |

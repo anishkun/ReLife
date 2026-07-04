@@ -174,7 +174,6 @@ app.add_typer(memory_app, name="memory")
 def memory_stats() -> None:
     """Show memory counts, activation, and what has faded."""
     config.ensure_dirs()
-    from .memory import events
     from .memory.client import default_client
 
     client = default_client()
@@ -189,9 +188,9 @@ def memory_stats() -> None:
     typer.echo(f"  active: {len(active)}   archived (faded): {len(archived)}")
     for kind, n in sorted(by_kind.items()):
         typer.echo(f"    {kind}: {n}")
-    # skills/workflows follow the client (daemon-side when RELIFE_MEMORY_URL is
-    # set); the event log is still local, so its count reflects this process.
-    typer.echo(f"  skills: {client.skill_count()}   workflows: {client.workflow_count()}   events: {events.count()}")
+    # skills/workflows/events all follow the client (daemon-side when
+    # RELIFE_MEMORY_URL is set, in-process otherwise).
+    typer.echo(f"  skills: {client.skill_count()}   workflows: {client.workflow_count()}   events: {client.event_count()}")
 
     top = sorted(active, key=lambda m: m.activation(), reverse=True)[:5]
     if top:

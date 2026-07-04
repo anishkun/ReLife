@@ -22,6 +22,7 @@ from relife.memory import store as store_mod
 from relife.memory import workflows as wf
 from relife.memory.client import LocalMemoryClient, MemoryClient
 from relife.memory.remote import wire
+from relife.memory.events import Event
 from relife.memory.skills import Skill
 from relife.memory.store import Memory
 from relife.memory.workflows import Workflow
@@ -81,6 +82,11 @@ def test_wire_skill_workflow_roundtrip():
         slug="ship-new-service",
     )
     assert wire.workflow_from_dict(wire.workflow_to_dict(w)) == w
+
+
+def test_wire_event_roundtrip():
+    e = Event(id=7, task_id="sess-1", tool="Bash", brief="git push", created_at=1_700_000_000.0)
+    assert wire.event_from_dict(wire.event_to_dict(e)) == e
 
 
 # --- parametrized conformance: Local vs Http -------------------------------
@@ -212,15 +218,30 @@ def test_conformance_unicode_content(client):
     assert hits and hits[0].body == body
 
 
+def test_conformance_event_log_and_count(client):
+    assert client.event_count() == 0
+    assert client.log_event("Read", "store.py", task_id="t1") > 0
+    client.log_event("Edit", "store.py", task_id="t1")
+    client.log_event("Bash", "pytest", task_id="t2")
+    assert client.event_count() == 3
+
+    t1 = client.events_for_task("t1")
+    assert [e.tool for e in t1] == ["Read", "Edit"]        # chronological, one task
+    assert isinstance(t1[0], Event) and t1[0].brief == "store.py"
+    assert [e.tool for e in client.events_for_task("t2")] == ["Bash"]
+    assert client.events_for_task("nonexistent") == []
+
+
 def test_conformance_consolidate_workflow_visible(client):
     # Headline regression: a recurring git-clone → test → push procedure across
-    # tasks. Consolidation (server-side under the daemon) must synthesize a
-    # workflow that the SAME client can then find — proving daemon-written
-    # workflows land where clients read.
+    # tasks, logged THROUGH THE CLIENT (so in http mode the events reach the
+    # daemon). Consolidation runs server-side under the daemon and must synthesize
+    # a workflow that the SAME client can then find — proving the full round trip:
+    # client-logged events → daemon consolidation → client-visible workflow.
     for t in ("task1", "task2", "task3"):
-        ev.log_event("Bash", "git clone https://github.com/x/y", task_id=t)
-        ev.log_event("Bash", "mvn test", task_id=t)
-        ev.log_event("Bash", "git push origin feat/x", task_id=t)
+        client.log_event("Bash", "git clone https://github.com/x/y", task_id=t)
+        client.log_event("Bash", "mvn test", task_id=t)
+        client.log_event("Bash", "git push origin feat/x", task_id=t)
 
     report = client.consolidate()
     assert report.workflows_created, "expected a synthesized workflow"
@@ -249,9 +270,10 @@ def test_daemon_health_and_token(tmp_path, monkeypatch):
     assert tc.get("/health").status_code == 200        # health needs no token
     assert tc.get("/count").status_code == 401          # missing token → rejected
     assert tc.get("/skills/count").status_code == 401   # new routes gated too
+    assert tc.get("/events/count").status_code == 401
     ok = tc.get("/count", headers={"Authorization": "Bearer s3cret"})
     assert ok.status_code == 200 and ok.json()["count"] == 0
-    # Health reports procedural-memory counts so a remote check is one call.
+    # Health reports procedural-memory + event counts so a remote check is one call.
     health = tc.get("/health").json()
-    assert health["skills"] == 0 and health["workflows"] == 0
+    assert health["skills"] == 0 and health["workflows"] == 0 and health["events"] == 0
     tc.close()

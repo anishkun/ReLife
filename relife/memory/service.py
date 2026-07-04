@@ -6,11 +6,11 @@ forget, consolidate, and read-only stats. Today it calls the in-process
 standalone daemon later) becomes the only thing that changes — consumers depend
 on a ``MemoryClient`` (see ``client.py``), never on the store internals.
 
-Scope covers long-term memory **plus procedural memory** (skills/workflows) —
-both route through this facade and the ``MemoryClient`` seam, so the daemon can
-serve them too. Only the **event log** stays in-process for now (consolidation is
-included because it is memory upkeep, even though it currently also mines events
-into workflows).
+Scope covers long-term memory, **procedural memory** (skills/workflows), **and
+the tool-event log** — all route through this facade and the ``MemoryClient``
+seam, so the daemon serves every consumer-facing operation. (Consolidation/dream
+still mine the *module-level* defaults directly, which is exactly why the daemon
+binds those globals rather than injecting a store.)
 
 The default service resolves the module-level default store on each call, so it
 honours ``store._DB_PATH`` reassignment (the test-isolation mechanism). Pass an
@@ -20,9 +20,11 @@ explicit ``MemoryStore`` to bind a service to a specific database.
 from __future__ import annotations
 
 from . import consolidate as _consolidate
+from . import events as _events
 from . import skills as _skills
 from . import store as _store_mod
 from . import workflows as _workflows
+from .events import Event
 from .skills import Skill
 from .store import Memory, MemoryStore
 from .workflows import Workflow
@@ -102,6 +104,21 @@ class MemoryService:
 
     def workflow_count(self) -> int:
         return _workflows.count()
+
+    # --- tool-event log -----------------------------------------------------
+    # Same call-time delegation as skills/workflows: honours ``events._DB_PATH``
+    # reassignment and the daemon's ``_bind_db``. Consolidate mines the log
+    # directly (module-level), so it is *not* routed through the client — but the
+    # hooks that WRITE events and read one task's events do go through here, so a
+    # daemon deployment sees them.
+    def log_event(self, tool: str, brief: str = "", task_id: str = "") -> int:
+        return _events.log_event(tool, brief=brief, task_id=task_id)
+
+    def events_for_task(self, task_id: str, limit: int = 500) -> list[Event]:
+        return _events.events_by_task(limit).get(task_id, [])
+
+    def event_count(self) -> int:
+        return _events.count()
 
     # --- maintenance --------------------------------------------------------
     def consolidate(self) -> _consolidate.ConsolidationReport:

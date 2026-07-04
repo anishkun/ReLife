@@ -23,7 +23,6 @@ from typing import Any
 from claude_agent_sdk import HookMatcher
 
 from . import config
-from .memory import events
 from .memory._text import tokenize as _tokens
 from .memory.client import default_client
 
@@ -105,7 +104,13 @@ async def _event_hook(input_data: dict[str, Any], tool_use_id: str | None, conte
     if tool:
         task_id = input_data.get("session_id", "") or ""
         try:
-            events.log_event(tool, _brief(input_data.get("tool_input", {})), task_id=task_id)
+            # Routes through the client, so events reach the daemon when
+            # RELIFE_MEMORY_URL is set (one loopback POST per tool call — fine at
+            # localhost; in-process by default). Consolidate reads them back
+            # daemon-side.
+            default_client().log_event(
+                tool, _brief(input_data.get("tool_input", {})), task_id=task_id
+            )
         except Exception:
             pass  # journaling must never break a run
     return {}
@@ -130,7 +135,8 @@ async def _episode_hook(input_data: dict[str, Any], tool_use_id: str | None, con
     prompt = _last_prompt.pop(sid, "")
     if not prompt:
         return {}
-    evs = events.events_by_task().get(sid, [])
+    client = default_client()
+    evs = client.events_for_task(sid)
     if len(evs) < config.EPISODE_MIN_EVENTS:
         return {}  # too little happened to be worth remembering
     seq: list[str] = []
@@ -139,7 +145,7 @@ async def _episode_hook(input_data: dict[str, Any], tool_use_id: str | None, con
         if not seq or seq[-1] != short:
             seq.append(short)
     try:
-        default_client().save(_episode_text(prompt, seq), kind="episode")
+        client.save(_episode_text(prompt, seq), kind="episode")
     except Exception:
         pass  # episodic capture must never break a run
     return {}

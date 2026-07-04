@@ -69,6 +69,21 @@ def test_client_skill_workflow_methods(tmp_path, monkeypatch):
     assert isinstance(c, MemoryClient)
 
 
+def test_client_event_methods(tmp_path, monkeypatch):
+    from relife.memory import events as ev
+
+    monkeypatch.setattr(ev, "_DB_PATH", tmp_path / "relife.db")
+    c = LocalMemoryClient()
+
+    assert c.event_count() == 0
+    assert c.log_event("Read", "store.py", task_id="t1") > 0
+    c.log_event("Edit", task_id="t1")
+    c.log_event("Bash", task_id="t2")
+    assert c.event_count() == 3
+    assert [e.tool for e in c.events_for_task("t1")] == ["Read", "Edit"]
+    assert c.events_for_task("missing") == []
+
+
 # --- contract: the agent-facing tool names must not drift ------------------
 def test_mcp_tool_names_unchanged():
     cfg = server.memory_server()

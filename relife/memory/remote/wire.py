@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..consolidate import ConsolidationReport
+from ..events import Event
 from ..rem import RemReport
 from ..skills import Skill
 from ..store import Memory
@@ -98,6 +99,26 @@ def workflows_to_list(ws: list[Workflow]) -> list[dict[str, Any]]:
 
 def workflows_from_list(items: list[dict[str, Any]]) -> list[Workflow]:
     return [workflow_from_dict(d) for d in items]
+
+
+# --- Event <-> dict ---------------------------------------------------------
+_EVENT_FIELDS = ("id", "task_id", "tool", "brief", "created_at")
+
+
+def event_to_dict(e: Event) -> dict[str, Any]:
+    return {f: getattr(e, f) for f in _EVENT_FIELDS}
+
+
+def event_from_dict(d: dict[str, Any]) -> Event:
+    return Event(**{f: d[f] for f in _EVENT_FIELDS})
+
+
+def events_to_list(es: list[Event]) -> list[dict[str, Any]]:
+    return [event_to_dict(e) for e in es]
+
+
+def events_from_list(items: list[dict[str, Any]]) -> list[Event]:
+    return [event_from_dict(d) for d in items]
 
 
 # --- ConsolidationReport <-> dict -------------------------------------------
