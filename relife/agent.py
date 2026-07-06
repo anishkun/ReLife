@@ -166,13 +166,17 @@ def _maybe_consolidate() -> None:
     completed task.
     """
     try:
-        from .memory import consolidate
         from .memory.client import default_client
 
-        if not consolidate.should_auto_run():
-            return
-        report = default_client().consolidate()
-        if report.archived or report.deleted or report.merged or report.workflows_created:
+        # The throttle + run are decided together on the memory side (server-side
+        # under a daemon), so the "enough events accrued?" gate reads the same
+        # event log the consolidation runs against. Gating here in the agent
+        # process would read this process's local event log while the work runs
+        # on the daemon — so it would never fire against a remote daemon.
+        report = default_client().maybe_consolidate()
+        if report and (
+            report.archived or report.deleted or report.merged or report.workflows_created
+        ):
             console.print(f"[dim]· memory consolidated: {report.summary()}[/]")
     except Exception:
         pass

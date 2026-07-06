@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pytest
 
+from relife import config
 from relife.memory import consolidate as consol
 from relife.memory import events as ev
 from relife.memory import skills as sk
@@ -166,6 +167,17 @@ def test_conformance_consolidate(client):
     client.save("Something to keep around.")
     report = client.consolidate()
     assert hasattr(report, "summary") and isinstance(report.summary(), str)
+
+
+def test_conformance_maybe_consolidate(client):
+    # The throttle is decided where the events live (server-side under the
+    # daemon), not in the caller. Below threshold → no run; once enough events
+    # accrue it runs once, then the watermark advances and it's throttled again.
+    assert client.maybe_consolidate() is None                 # 0 events
+    for i in range(config.CONSOLIDATE_EVERY):
+        client.log_event("Bash", f"cmd{i}", task_id="t")
+    assert client.maybe_consolidate() is not None             # crossed threshold
+    assert client.maybe_consolidate() is None                 # watermark advanced
 
 
 # --- procedural memory conformance (skills / workflows) --------------------

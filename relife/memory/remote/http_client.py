@@ -116,6 +116,10 @@ class HttpMemoryClient:
     def consolidate(self):
         return wire.consolidation_from_dict(self._post("/consolidate"))
 
+    def maybe_consolidate(self):
+        data = self._post("/consolidate/maybe")
+        return wire.consolidation_from_dict(data) if data is not None else None
+
     async def dream(self, ask_model=None):
         # ask_model can't be serialized — the daemon uses its own default. REM
         # runs for minutes (timeout=None) and dream is async, so dispatch the

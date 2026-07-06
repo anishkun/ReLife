@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 109 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 111 passing (`python -m pytest tests/`). Covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -132,7 +132,7 @@ relife/
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 109 tests (105 deterministic + 4 semantic, embeddings forced off)
+tests/                      # 111 tests (107 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
@@ -243,6 +243,16 @@ relife chat
   105): `Event` wire round-trip, event-log conformance across both transports, and the consolidate
   regression now logs *through the client* end-to-end. The recall/event/episode hooks pass
   **unedited** (they resolve the module defaults at call time via `LocalMemoryClient`).
+- **Auto-consolidate throttle fix — ✅ DONE (this phase).** A scan for the *same* bug class turned up
+  one more: `agent._maybe_consolidate` gated on `consolidate.should_auto_run()` (a **local** read of
+  the event count + watermark) but then ran `default_client().consolidate()` **remotely** — so under
+  a real remote daemon the gate reads the agent's empty local event log and auto-consolidation never
+  fires (it "worked" on localhost only by the same `data/relife.db` path coincidence). Fixed by
+  moving the gate to where the data lives: new `MemoryService.maybe_consolidate()` (checks
+  `should_auto_run()` **and** runs, together), exposed on the client + `POST /consolidate/maybe`; the
+  agent now calls `client.maybe_consolidate()`. 111 tests green (was 109): a both-transports test
+  proving the throttle runs/skips server-side and advances its watermark. The rule is now a CLAUDE.md
+  gotcha: a "has enough accrued?" decision about server-side work must live server-side.
 - **Phase 3 (next):** always-on agent + UI; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call

@@ -125,6 +125,18 @@ class MemoryService:
         """Run the deterministic consolidation ('sleep') pass."""
         return _consolidate.run_consolidation()
 
+    def maybe_consolidate(self) -> _consolidate.ConsolidationReport | None:
+        """Run consolidation only if enough events have accrued since last time.
+
+        The throttle (``should_auto_run``) and the run are decided **together,
+        here**, so both read the same event log + watermark. This must not be
+        split into a client-side gate + a remote run: under a daemon the gate
+        would read the caller's (empty) local event log while the work executes
+        server-side, so auto-consolidation would silently never fire."""
+        if not _consolidate.should_auto_run():
+            return None
+        return _consolidate.run_consolidation()
+
     async def dream(self, ask_model=None):
         """Run the opt-in, LLM-driven REM ('dream') pass — an adversarial critic
         over recent memory. Like ``consolidate``, it operates on the module-level

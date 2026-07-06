@@ -147,6 +147,13 @@ def create_app(
     async def consolidate() -> dict[str, Any]:
         return wire.consolidation_to_dict(svc.consolidate())
 
+    @app.post("/consolidate/maybe", dependencies=auth)
+    async def consolidate_maybe() -> dict[str, Any] | None:
+        # The throttle decision runs here, server-side, against the daemon's own
+        # event log + watermark — never split to a client-side gate.
+        report = svc.maybe_consolidate()
+        return None if report is None else wire.consolidation_to_dict(report)
+
     @app.post("/dream", dependencies=auth)
     async def dream() -> dict[str, Any]:
         # Runs the REM pass server-side using the daemon's default ask_model
