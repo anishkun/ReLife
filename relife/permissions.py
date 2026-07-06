@@ -147,3 +147,34 @@ def make_permission_callback(
         return PermissionResultDeny(message="User declined this action.")
 
     return can_use_tool
+
+
+def make_approval_callback(
+    workspace: Path,
+    broker: Any,
+    *,
+    timeout: float,
+) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
+    """Build a ``can_use_tool`` that routes ask-cases to a UI approval broker.
+
+    Same policy as the terminal path — the pure ``classify()`` decides — but
+    instead of prompting a TTY, ask-cases are pushed to ``broker`` (which surfaces
+    them in the web UI) and the run blocks awaiting the browser's decision. If no
+    decision arrives within ``timeout`` seconds the broker returns ``False`` and
+    the action is denied (safe default, matching the non-interactive TTY path).
+
+    ``broker`` must expose an async ``request(tool_name, tool_input, reason, *,
+    timeout) -> bool``.
+    """
+
+    async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):
+        decision, reason = classify(tool_name, tool_input, workspace)
+        if decision == "allow":
+            return PermissionResultAllow()
+
+        approved = await broker.request(tool_name, tool_input, reason, timeout=timeout)
+        if approved:
+            return PermissionResultAllow()
+        return PermissionResultDeny(message=f"Denied via UI: {reason}")
+
+    return can_use_tool

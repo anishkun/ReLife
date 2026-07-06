@@ -166,6 +166,32 @@ def dream_cmd(
         typer.secho(f"  · {note}", fg=typer.colors.BRIGHT_BLACK)
 
 
+@app.command("serve")
+def serve(
+    host: Optional[str] = typer.Option(None, "--host", help="Bind address (default 127.0.0.1)."),
+    port: Optional[int] = typer.Option(None, "--port", help="Bind port (default 8600)."),
+) -> None:
+    """Run the always-on agent server + web UI.
+
+    Opens a long-lived process hosting persistent agent sessions and serves the
+    web console. Outward actions are routed to the browser for approval. Requires
+    the optional extra: pip install -e ".[server]"."""
+    config.ensure_dirs()
+    try:
+        from .server import app as server_app
+    except ImportError as e:  # noqa: BLE001
+        typer.secho(
+            f'Server deps missing ({e}). Install with: pip install -e ".[server]"',
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    h = host or config.AGENT_HOST
+    p = port or config.AGENT_PORT
+    typer.secho(f"ReLife agent console on http://{h}:{p}  (Ctrl-C to stop)", fg=typer.colors.GREEN)
+    server_app.serve(host=h, port=p, token=config.AGENT_TOKEN)
+
+
 memory_app = typer.Typer(help="Inspect long-term memory.")
 app.add_typer(memory_app, name="memory")
 

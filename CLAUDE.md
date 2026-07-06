@@ -12,7 +12,8 @@ ReLife is a personal agent built on the **Claude Agent SDK** (Python) that acts 
 pip install -e .                  # install (editable); creates the `relife` entry point
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
 pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
-python -m pytest tests/           # run all tests (111: 107 deterministic + 4 semantic)
+pip install -e ".[server]"        # + optional always-on agent server + web UI (fastapi/uvicorn)
+python -m pytest tests/           # run all tests (131: 127 deterministic + 4 semantic)
 python -m pytest tests/test_permissions.py::test_name -v   # single test
 python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memories)
 
@@ -25,6 +26,7 @@ relife dream [--max N]            # opt-in LLM "REM" pass: adversarial critic pr
 relife memory stats               # counts, strongest memories, what has faded
 relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra)
 relife memory ping                # check the daemon is reachable (GET /health)
+relife serve [--host --port]      # always-on agent server + web UI (needs [server] extra; default :8600)
 # do/chat/build accept --workspace/-w PATH (default ./workspace) — the dir the agent works in
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 ```
@@ -66,6 +68,15 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - `agents.py` — the `builder` `AgentDefinition` the orchestrator delegates each milestone to via the **Task** tool, so each milestone runs in a *fresh context* (the orchestrator stays small). Parallel milestones are deliberately deferred.
 - `orchestrator.py` — `run_build()`: wires ledger + server + builder + the `prompts/orchestrator.md` persona, streams the run, and persists `ResultMessage.session_id` so `--resume` continues the same session. Resume runs in the **ledger's own workspace** (not the CLI's default cwd) and re-injects the ledger state, so it's robust even if the CLI session is gone; a persisted `session_id` that **expired** across a Max session-limit reset falls back to a fresh session without losing milestone progress. In `cli.py`, `--resume` is a **boolean flag** (the positional arg doubles as the optional build id), so it no longer swallows the following option.
 - `build_options` (agent.py) gained `system_prompt`/`agents`/`resume`/`max_budget_usd` params to support this; `do`/`chat` are unchanged.
+
+### Always-on agent server + web UI (`relife/server/`)
+`relife serve` (optional `[server]` extra: fastapi/uvicorn) turns the cold, one-shot `do`/`chat` loop into a **long-lived process** hosting persistent agent sessions, streaming their work to a **self-contained web UI** and routing outward-action approvals to the browser. Mirrors the memory daemon's patterns: a side-effect-free `create_app()` factory (ASGI-testable) + a `serve()` with lazy `uvicorn`, bearer-token auth (`/health` and `GET /` open), env vars in `config.py` (`RELIFE_AGENT_HOST`/`_PORT`/`_TOKEN`/`_APPROVAL_TIMEOUT`, default `:8600`).
+- `agent.py` gained a pure **`to_event(msg) -> list[dict]`** — the single source of the streaming-message taxonomy (text / thinking / tool_use / **tool_result** / result), consumed by *both* the terminal `_render` and the server's SSE stream. `_render` now delegates to it (no CLI behavior change).
+- `session.py` — `AgentSession` owns one long-lived `ClaudeSDKClient` per session (kept open across turns, exactly as `run_chat` proves works); a worker task drains an inbound queue → `client.query` → `receive_response()` → `to_event` → publishes to SSE subscribers (with a bounded **ring buffer** for reconnect/replay by `Last-Event-ID`). `ApprovalBroker` routes each `classify()=="ask"` case to the UI (emits an `approval_request` event) and **blocks the run on an `asyncio.Future` until the browser decides or `AGENT_APPROVAL_TIMEOUT` elapses → deny** (same safe default as the non-interactive TTY path). `SessionManager` keys sessions by uuid. `_maybe_consolidate()` runs after each turn.
+- `app.py` — `create_app(*, token, session_factory)`; routes `GET /` (UI), `GET /health`, `POST /sessions`, `POST /sessions/{id}/messages`, `GET /sessions/{id}/events` (SSE via `StreamingResponse`, no `sse-starlette` dep), `POST /sessions/{id}/approvals/{approval_id}`. `session_factory` is **injected in tests** with a scripted/recording fake so the whole HTTP+SSE+approval flow is exercised with **zero model calls** (same discipline as `rem.ask_model`).
+- `permissions.py` gained **`make_approval_callback(workspace, broker, *, timeout)`** — reuses the pure `classify()` verbatim (single policy source); the TTY `make_permission_callback` is untouched.
+- UI is a **single self-contained `relife/web/index.html`** (vanilla JS + `EventSource`, theme-aware, no external assets) — ships in the wheel like `prompts/system.md`. **Concurrency model = the daemon's:** everything on one event loop; the suspended approval future and the resolving request interleave cleanly. **Scheduler/autonomous triggers are deferred** — this first cut is single-user and interactive.
+- **Local-only for now (by design):** binds loopback and the browser UI runs **tokenless**. `RELIFE_AGENT_TOKEN` gates the API via a bearer header, but browser `EventSource` can't send custom headers — so token auth is for programmatic clients, not the web UI. Non-loopback exposure (a cookie/query-token scheme for SSE + TLS + multi-user) is a **deliberate future step**; don't assume the current auth is safe to expose beyond `127.0.0.1`.
 
 ## Non-obvious constraints
 

@@ -25,6 +25,7 @@ SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
 WORKFLOWS_DIR = DATA_DIR / "workflows"    # one Markdown file per learned workflow
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
+WEB_DIR = PACKAGE_DIR / "web"              # self-contained web UI served by `relife serve`
 
 
 # --- Cognitive memory model ------------------------------------------------
@@ -143,6 +144,16 @@ MEMORY_PORT = int(os.environ.get("RELIFE_MEMORY_PORT", "8787"))
 # in-process write (a local command run without RELIFE_MEMORY_URL) can warn.
 MEMORY_DB_PATH = DATA_DIR / "relife.db"
 MEMORY_SIDECAR_PATH = DATA_DIR / "relife.db.daemon"
+
+# --- Agent server (always-on agent + web UI) -------------------------------
+# `relife serve` runs a long-lived FastAPI process hosting persistent agent
+# sessions and serves the self-contained web UI. Outward-action approvals are
+# routed to the browser; if no decision arrives within AGENT_APPROVAL_TIMEOUT
+# seconds the action is denied (safe default). Mirrors the memory-daemon block.
+AGENT_HOST = os.environ.get("RELIFE_AGENT_HOST", "127.0.0.1")
+AGENT_PORT = int(os.environ.get("RELIFE_AGENT_PORT", "8600"))
+AGENT_TOKEN = os.environ.get("RELIFE_AGENT_TOKEN") or None
+AGENT_APPROVAL_TIMEOUT = float(os.environ.get("RELIFE_AGENT_APPROVAL_TIMEOUT", "300"))
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

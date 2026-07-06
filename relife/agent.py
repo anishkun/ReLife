@@ -137,24 +137,51 @@ async def ask_model_oneshot(
     return "".join(chunks), cost
 
 
-def _render(msg: Any) -> None:
-    """Pretty-print a streamed SDK message."""
+def to_event(msg: Any) -> list[dict[str, Any]]:
+    """Map one streamed SDK message to zero-or-more structured events.
+
+    Pure and JSON-serializable — the single source of the streaming message
+    taxonomy, consumed by both the terminal renderer (``_render``) and the
+    web server's SSE stream. ``SystemMessage`` (init/status frames) yields
+    nothing, as it's dropped in the terminal too.
+    """
+    events: list[dict[str, Any]] = []
     if isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, TextBlock):
                 if block.text.strip():
-                    console.print(block.text)
+                    events.append({"type": "text", "text": block.text})
             elif isinstance(block, ThinkingBlock):
-                console.print(f"[dim italic]…thinking[/]")
+                events.append({"type": "thinking"})
             elif isinstance(block, ToolUseBlock):
-                console.print(f"[cyan]→ {block.name}[/] [dim]{_tool_brief(block.input)}[/]")
+                events.append(
+                    {"type": "tool_use", "name": block.name, "brief": _tool_brief(block.input)}
+                )
+            elif isinstance(block, ToolResultBlock):
+                events.append({"type": "tool_result", "brief": _tool_result_brief(block)})
     elif isinstance(msg, ResultMessage):
-        cost = getattr(msg, "total_cost_usd", None)
-        note = f"  [dim](usage-equiv ${cost:.4f})[/]" if cost else ""
-        console.print(f"[green]✓ done[/]{note}")
-    elif isinstance(msg, SystemMessage):
-        # init / status frames — keep quiet unless debugging
-        pass
+        events.append({"type": "result", "cost_usd": getattr(msg, "total_cost_usd", None)})
+    return events
+
+
+def _render(msg: Any) -> None:
+    """Pretty-print a streamed SDK message (via the shared ``to_event`` taxonomy)."""
+    for ev in to_event(msg):
+        kind = ev["type"]
+        if kind == "text":
+            console.print(ev["text"])
+        elif kind == "thinking":
+            console.print("[dim italic]…thinking[/]")
+        elif kind == "tool_use":
+            console.print(f"[cyan]→ {ev['name']}[/] [dim]{ev['brief']}[/]")
+        elif kind == "tool_result":
+            # Tool results were historically not printed in the terminal; keep it
+            # quiet there to avoid noise, but they still stream to the UI.
+            pass
+        elif kind == "result":
+            cost = ev.get("cost_usd")
+            note = f"  [dim](usage-equiv ${cost:.4f})[/]" if cost else ""
+            console.print(f"[green]✓ done[/]{note}")
 
 
 def _maybe_consolidate() -> None:
@@ -191,6 +218,30 @@ def _tool_brief(inp: dict[str, Any]) -> str:
             val = str(inp[key])
             return val if len(val) <= 80 else val[:77] + "..."
     return ""
+
+
+def _tool_result_brief(block: Any) -> str:
+    """One-line summary of a tool result for the UI stream.
+
+    Tool result content is either a string or a list of content parts; collapse
+    it to a short single line and mark errors.
+    """
+    content = getattr(block, "content", None)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text", "")))
+            else:
+                parts.append(str(getattr(part, "text", part)))
+        text = " ".join(p for p in parts if p)
+    else:
+        text = str(content or "")
+    text = " ".join(text.split())  # collapse whitespace/newlines
+    if len(text) > 80:
+        text = text[:77] + "..."
+    prefix = "error: " if getattr(block, "is_error", False) else ""
+    return f"{prefix}{text}"
 
 
 async def run_task(

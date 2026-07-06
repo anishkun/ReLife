@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 111 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 131 passing (`python -m pytest tests/`). Covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -253,7 +253,27 @@ relife chat
   agent now calls `client.maybe_consolidate()`. 111 tests green (was 109): a both-transports test
   proving the throttle runs/skips server-side and advances its watermark. The rule is now a CLAUDE.md
   gotcha: a "has enough accrued?" decision about server-side work must live server-side.
-- **Phase 3 (next):** always-on agent + UI; async
+- **Always-on agent + web UI (first cut) — ✅ DONE (this phase).** `relife serve` (optional
+  `[server]` extra) turns the cold one-shot loop into a **long-lived process** hosting persistent
+  agent sessions, streaming their work to a **self-contained web UI** over SSE, with outward-action
+  approvals **routed to the browser** (approve/deny, timeout→deny) — closing the "non-interactive =
+  silent deny" gap for a human-at-the-UI. Mirrors the memory-daemon patterns: side-effect-free
+  `create_app()` + lazy-uvicorn `serve()` + bearer auth. New `relife/server/` (`session.py`:
+  `AgentSession`/`ApprovalBroker`/`SessionManager`; `app.py`: `create_app`/`serve`), `relife/web/index.html`
+  (vanilla JS, no build step), a pure `agent.to_event()` shared by the terminal renderer and the SSE
+  stream, `permissions.make_approval_callback` (reuses `classify()` verbatim), and `RELIFE_AGENT_*`
+  config (default `:8600`). 131 tests green (was 111): `to_event` unit tests + a model-free HTTP/SSE/
+  approval suite driven by an **injected fake session factory** (no `ClaudeSDKClient` opened in any
+  test — same discipline as `rem.ask_model`). Live smoke: server boots over a real socket, serves the
+  UI + `/health`, and `POST /sessions` connects a real client — no turn run (Max budget preserved).
+  **Local-only for now (by design):** the server binds loopback (`127.0.0.1:8600`) and the browser UI
+  runs **tokenless** — `RELIFE_AGENT_TOKEN` gates the API (bearer header) but browser `EventSource`
+  can't send custom headers, so token auth is for programmatic clients, not the web UI. That's fine for
+  single-user local use; **exposing it beyond localhost is a deliberate future step** (needs a
+  cookie/query-token scheme for the SSE stream, TLS, and multi-user auth — revisit then).
+  **Deferred to a later phase:** scheduler / autonomous triggers, pre-authorized outward allowlist,
+  non-loopback exposure + browser-compatible auth, multi-user, React SPA.
+- **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call
   in http mode); outward capabilities

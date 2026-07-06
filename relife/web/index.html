@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ReLife · agent console</title>
+<style>
+  :root {
+    --bg: #0d1017; --surface: #141a22; --surface-2: #1a212b; --line: #232b37;
+    --text: #dfe4ec; --muted: #8b95a6; --faint: #5b6473;
+    --accent: #6cb6ff; --accent-dim: rgba(108,182,255,.13);
+    --amber: #eaa64d; --amber-dim: rgba(234,166,77,.12);
+    --green: #6cc38a; --red: #e77b82;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --radius: 10px;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f5f2; --surface: #ffffff; --surface-2: #f0eee8; --line: #e3ded4;
+    --text: #1b1f26; --muted: #6b7280; --faint: #99a0ac;
+    --accent: #2563c9; --accent-dim: rgba(37,99,201,.09);
+    --amber: #b9791f; --amber-dim: rgba(185,121,31,.10);
+    --green: #2f9e5b; --red: #c0454d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  .label { font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); }
+
+  /* Header */
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .brand { font-weight: 700; letter-spacing: -.01em; }
+  .brand b { color: var(--accent); }
+  header .sep { color: var(--faint); }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .status[data-state="open"] .dot { background: var(--green); box-shadow: 0 0 0 0 var(--green); animation: pulse 2.4s infinite; }
+  .status[data-state="connecting"] .dot { background: var(--amber); }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(108,195,138,.5);} 70%{box-shadow:0 0 0 6px rgba(108,195,138,0);} 100%{box-shadow:0 0 0 0 rgba(108,195,138,0);} }
+
+  /* Transcript */
+  main { flex: 1; overflow-y: auto; }
+  .stream {
+    max-width: 860px; margin: 0 auto; padding: 26px 20px 40px;
+    border-left: 1px solid var(--line);
+  }
+  @media (min-width: 900px) { .stream { border-left: none; } }
+
+  .empty { color: var(--muted); padding: 60px 8px; }
+  .empty h1 { font-size: 22px; color: var(--text); margin: 0 0 8px; letter-spacing: -.02em; }
+  .empty p { margin: 0; max-width: 46ch; }
+
+  .row { display: grid; grid-template-columns: 18px 1fr; gap: 12px;
+    padding: 3px 0; position: relative; }
+  .row .tick { color: var(--faint); font-family: var(--mono); font-size: 13px;
+    text-align: center; user-select: none; line-height: 1.7; }
+
+  .turn { margin-top: 22px; }
+  .turn:first-child { margin-top: 0; }
+  .user .body { font-weight: 600; }
+  .user .tick { color: var(--accent); }
+
+  .text .body { white-space: pre-wrap; }
+  .thinking .body { color: var(--faint); font-style: italic; }
+  .tool .body { font-family: var(--mono); font-size: 13px; }
+  .tool .name { color: var(--accent); }
+  .tool .brief { color: var(--muted); }
+  .tool .tick { color: var(--accent); }
+  .result .body { font-family: var(--mono); font-size: 13px; color: var(--faint);
+    padding-left: 4px; }
+  .done .body { color: var(--green); font-family: var(--mono); font-size: 13px; }
+  .done .tick { color: var(--green); }
+  .error .body { color: var(--red); font-family: var(--mono); font-size: 13px; }
+  .error .tick { color: var(--red); }
+
+  /* Approval card — the signature moment */
+  .approval {
+    margin: 14px 0 6px 30px; border: 1px solid var(--amber);
+    border-left-width: 3px; border-radius: var(--radius);
+    background: var(--amber-dim); padding: 14px 16px;
+    animation: slidein .28s ease both;
+  }
+  @keyframes slidein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .approval .head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .approval .head .label { color: var(--amber); }
+  .approval .tool { font-family: var(--mono); font-weight: 600; }
+  .approval .reason { color: var(--muted); font-size: 14px; }
+  .approval .cmd { font-family: var(--mono); font-size: 12.5px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 10px; margin: 8px 0 12px; overflow-x: auto; white-space: pre; }
+  .approval .actions { display: flex; gap: 10px; }
+  .approval button { font: inherit; font-size: 13px; font-weight: 600;
+    padding: 7px 16px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--text); cursor: pointer; }
+  .approval button.approve { background: var(--amber); border-color: var(--amber); color: #17130b; }
+  .approval button:hover { filter: brightness(1.06); }
+  .approval button:disabled { opacity: .5; cursor: default; filter: none; }
+  .approval .outcome { font-family: var(--mono); font-size: 12px; margin-top: 4px; }
+  .approval.settled { border-color: var(--line); background: transparent; }
+
+  /* Composer */
+  footer { border-top: 1px solid var(--line); background: var(--surface); padding: 14px 20px; }
+  .composer { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; font: inherit; color: var(--text);
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 11px 14px; max-height: 160px; min-height: 46px;
+  }
+  textarea::placeholder { color: var(--faint); }
+  textarea:focus, button:focus-visible, .approval button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  .send { font: inherit; font-weight: 600; padding: 11px 20px; border-radius: var(--radius);
+    border: 1px solid var(--accent); background: var(--accent); color: #06121f; cursor: pointer; }
+  .send:disabled { opacity: .45; cursor: default; }
+  .hint { max-width: 860px; margin: 8px auto 0; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style>
+</head>
+<body>
+  <header>
+    <span class="brand">Re<b>Life</b></span>
+    <span class="sep">/</span>
+    <span class="label">agent console</span>
+    <span class="status" id="status" data-state="connecting">
+      <span class="dot"></span><span id="statusText">connecting</span>
+    </span>
+  </header>
+
+  <main id="main">
+    <div class="stream" id="stream">
+      <div class="empty" id="empty">
+        <h1>Your agent is standing by.</h1>
+        <p>Give it a task below. It works autonomously on code, files, and git — and
+           will ask you here before anything leaves the machine.</p>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <form class="composer" id="composer">
+      <textarea id="input" rows="1" placeholder="Ask the agent to do something… (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+      <button class="send" id="send" type="submit">Send</button>
+    </form>
+    <div class="hint" id="hint">not connected</div>
+  </footer>
+
+<script>
+(() => {
+  "use strict";
+  const stream = document.getElementById("stream");
+  const empty = document.getElementById("empty");
+  const statusEl = document.getElementById("status");
+  const statusText = document.getElementById("statusText");
+  const hint = document.getElementById("hint");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  const composer = document.getElementById("composer");
+
+  let sessionId = null;
+  let source = null;
+  let lastTextRow = null;   // merge consecutive text deltas into one paragraph
+  const esc = (s) => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+  function setStatus(state, text) {
+    statusEl.dataset.state = state; statusText.textContent = text;
+  }
+  function atBottom() {
+    const m = document.getElementById("main");
+    return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+  }
+  function scroll() {
+    const m = document.getElementById("main");
+    m.scrollTop = m.scrollHeight;
+  }
+  function row(cls, tick, htmlBody, opts = {}) {
+    if (empty.parentNode) empty.remove();
+    const stick = atBottom();
+    const el = document.createElement("div");
+    el.className = "row " + cls + (opts.turn ? " turn" : "");
+    el.innerHTML = `<div class="tick">${tick}</div><div class="body">${htmlBody}</div>`;
+    stream.appendChild(el);
+    if (stick) scroll();
+    return el;
+  }
+
+  function handle(ev) {
+    if (ev.type !== "text") lastTextRow = null;
+    switch (ev.type) {
+      case "user":
+        row("user", "›", esc(ev.text), { turn: true });
+        break;
+      case "text":
+        if (lastTextRow) {
+          lastTextRow.querySelector(".body").textContent += ev.text;
+          if (atBottom()) scroll();
+        } else {
+          lastTextRow = row("text", "", esc(ev.text));
+        }
+        break;
+      case "thinking":
+        row("thinking", "", "thinking…");
+        break;
+      case "tool_use": {
+        const brief = ev.brief ? ` <span class="brief">${esc(ev.brief)}</span>` : "";
+        row("tool", "→", `<span class="name">${esc(ev.name)}</span>${brief}`);
+        break;
+      }
+      case "tool_result":
+        if (ev.brief) row("result", "", esc(ev.brief));
+        break;
+      case "approval_request":
+        renderApproval(ev);
+        break;
+      case "approval_resolved":
+        settleApproval(ev.approval_id, ev.approved);
+        break;
+      case "result": {
+        const cost = ev.cost_usd ? `  ·  usage-equiv $${Number(ev.cost_usd).toFixed(4)}` : "";
+        row("done", "✓", `done${esc(cost)}`);
+        break;
+      }
+      case "error":
+        row("error", "!", esc(ev.message));
+        break;
+    }
+  }
+
+  function renderApproval(ev) {
+    if (empty.parentNode) empty.remove();
+    const stick = atBottom();
+    const card = document.createElement("div");
+    card.className = "approval";
+    card.dataset.approvalId = ev.approval_id;
+    const cmd = ev.brief ? `<div class="cmd">${esc(ev.brief)}</div>` : "";
+    card.innerHTML = `
+      <div class="head">
+        <span class="label">approval required</span>
+        <span class="tool">${esc(ev.tool)}</span>
+      </div>
+      <div class="reason">${esc(ev.reason)}</div>
+      ${cmd}
+      <div class="actions">
+        <button class="approve" type="button">Approve</button>
+        <button class="deny" type="button">Deny</button>
+      </div>
+      <div class="outcome" hidden></div>`;
+    stream.appendChild(card);
+    card.querySelector(".approve").onclick = () => resolve(ev.approval_id, "allow", card);
+    card.querySelector(".deny").onclick = () => resolve(ev.approval_id, "deny", card);
+    if (stick) scroll();
+  }
+
+  async function resolve(approvalId, decision, card) {
+    card.querySelectorAll("button").forEach(b => b.disabled = true);
+    try {
+      await fetch(`/sessions/${sessionId}/approvals/${approvalId}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+    } catch (e) {
+      card.querySelectorAll("button").forEach(b => b.disabled = false);
+    }
+  }
+
+  function settleApproval(approvalId, approved) {
+    const card = stream.querySelector(`.approval[data-approval-id="${approvalId}"]`);
+    if (!card || card.classList.contains("settled")) return;
+    card.classList.add("settled");
+    card.querySelectorAll("button").forEach(b => b.disabled = true);
+    const out = card.querySelector(".outcome");
+    out.hidden = false;
+    out.style.color = approved ? "var(--green)" : "var(--red)";
+    out.textContent = approved ? "✓ approved" : "✕ denied";
+  }
+
+  function connect() {
+    source = new EventSource(`/sessions/${sessionId}/events`);
+    source.onopen = () => { setStatus("open", "connected"); hint.textContent = `session ${sessionId.slice(0,8)}`; };
+    source.onerror = () => setStatus("connecting", "reconnecting");
+    source.onmessage = (e) => {
+      try { handle(JSON.parse(e.data)); } catch (_) {}
+    };
+  }
+
+  async function init() {
+    try {
+      const r = await fetch("/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      if (!r.ok) throw new Error(await r.text());
+      sessionId = (await r.json()).session_id;
+      connect();
+    } catch (e) {
+      setStatus("connecting", "no server");
+      hint.textContent = "could not start a session — is `relife serve` running?";
+    }
+  }
+
+  async function send(text) {
+    if (!sessionId || !text.trim()) return;
+    sendBtn.disabled = true;
+    try {
+      await fetch(`/sessions/${sessionId}/messages`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      input.value = ""; autosize();
+    } finally {
+      sendBtn.disabled = false; input.focus();
+    }
+  }
+
+  function autosize() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+  input.addEventListener("input", autosize);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); composer.requestSubmit(); }
+  });
+  composer.addEventListener("submit", (e) => { e.preventDefault(); send(input.value); });
+
+  init();
+})();
+</script>
+</body>
+</html>
