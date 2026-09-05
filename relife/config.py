@@ -155,8 +155,37 @@ AGENT_PORT = int(os.environ.get("RELIFE_AGENT_PORT", "8600"))
 AGENT_TOKEN = os.environ.get("RELIFE_AGENT_TOKEN") or None
 AGENT_APPROVAL_TIMEOUT = float(os.environ.get("RELIFE_AGENT_APPROVAL_TIMEOUT", "300"))
 
+# Browser auth: the UI can't set an Authorization header on an EventSource, so a
+# successful POST /auth mints this cookie and every route accepts *either* the
+# bearer header (programmatic clients) or the cookie (the UI). Strict SameSite +
+# an Origin check on mutating routes is the CSRF story.
+AGENT_COOKIE = "relife_agent_token"
+AGENT_COOKIE_MAX_AGE = int(os.environ.get("RELIFE_AGENT_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
+# Failed POST /auth attempts allowed per client address per window (token guess
+# throttle; the server is single-user, so this can be tight).
+AGENT_AUTH_MAX_ATTEMPTS = int(os.environ.get("RELIFE_AGENT_AUTH_MAX_ATTEMPTS", "10"))
+AGENT_AUTH_WINDOW = float(os.environ.get("RELIFE_AGENT_AUTH_WINDOW", "60"))
+
+# Resource ceilings. Each session owns a `ClaudeSDKClient` (a subprocess), so an
+# unbounded POST /sessions is a resource-exhaustion lever even on loopback.
+AGENT_MAX_SESSIONS = int(os.environ.get("RELIFE_AGENT_MAX_SESSIONS", "8"))
+AGENT_SESSION_IDLE_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SESSION_IDLE_TIMEOUT", "3600"))
+AGENT_REAP_INTERVAL = float(os.environ.get("RELIFE_AGENT_REAP_INTERVAL", "60"))
+AGENT_MAX_MESSAGE_CHARS = int(os.environ.get("RELIFE_AGENT_MAX_MESSAGE_CHARS", "16000"))
+AGENT_MAX_QUEUED_TURNS = int(os.environ.get("RELIFE_AGENT_MAX_QUEUED_TURNS", "8"))
+AGENT_MAX_SUBSCRIBERS = int(os.environ.get("RELIFE_AGENT_MAX_SUBSCRIBERS", "8"))
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
+
+# Containment root for server-created sessions. A `POST /sessions` body may name
+# a workspace, but only *inside* this root — the permission policy auto-allows
+# writes within a session's workspace, so an unconstrained path in the request
+# body would let the caller choose the auto-allow blast radius. The CLI
+# (`--workspace`) is unaffected: that is the local user speaking directly.
+AGENT_WORKSPACE_ROOT = Path(
+    os.environ.get("RELIFE_AGENT_WORKSPACE_ROOT", str(DEFAULT_WORKSPACE))
+).expanduser()
 
 
 def ensure_dirs() -> None:

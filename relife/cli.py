@@ -188,7 +188,23 @@ def serve(
 
     h = host or config.AGENT_HOST
     p = port or config.AGENT_PORT
+    from .server.security import guard_bind
+
+    try:
+        guard_bind(h, config.AGENT_TOKEN)
+    except ValueError as e:
+        typer.secho(str(e), fg=typer.colors.RED)
+        raise typer.Exit(2)
+
     typer.secho(f"ReLife agent console on http://{h}:{p}  (Ctrl-C to stop)", fg=typer.colors.GREEN)
+    if config.AGENT_TOKEN:
+        typer.secho(
+            "auth: on — the console will ask for RELIFE_AGENT_TOKEN once, then use a cookie.",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+    typer.secho(
+        f"workspaces confined to {config.AGENT_WORKSPACE_ROOT}", fg=typer.colors.BRIGHT_BLACK
+    )
     server_app.serve(host=h, port=p, token=config.AGENT_TOKEN)
 
 

@@ -126,6 +126,22 @@
   .hint { max-width: 860px; margin: 8px auto 0; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
 
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+
+  /* Auth gate */
+  .gate { position: fixed; inset: 0; background: var(--bg); display: flex;
+    align-items: center; justify-content: center; z-index: 50; }
+  .gate[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
+  .gate form { background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 26px; width: min(420px, calc(100% - 40px)); }
+  .gate h2 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.01em; }
+  .gate p { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+  .gate input { width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+    font-family: var(--mono); font-size: 13px; }
+  .gate .err { color: var(--red); font-size: 12px; margin-top: 10px; min-height: 16px; }
+  .gate button { margin-top: 14px; width: 100%; padding: 10px 12px; border: none;
+    border-radius: 8px; background: var(--accent); color: #06101d; font-weight: 650;
+    font-size: 14px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -148,6 +164,18 @@
     </div>
   </main>
 
+  <div class="gate" id="gate" hidden>
+    <form id="gateForm" autocomplete="off">
+      <h2>This console is locked</h2>
+      <p>Enter the token this server was started with (<code>RELIFE_AGENT_TOKEN</code>).
+         It is exchanged for a session cookie, which is what authenticates the
+         event stream.</p>
+      <input id="gateToken" type="password" placeholder="token" autocomplete="off" />
+      <div class="err" id="gateErr"></div>
+      <button type="submit">Unlock</button>
+    </form>
+  </div>
+
   <footer>
     <form class="composer" id="composer">
       <textarea id="input" rows="1" placeholder="Ask the agent to do something… (Enter to send, Shift+Enter for newline)" autofocus></textarea>
@@ -167,6 +195,10 @@
   const input = document.getElementById("input");
   const sendBtn = document.getElementById("send");
   const composer = document.getElementById("composer");
+  const gate = document.getElementById("gate");
+  const gateForm = document.getElementById("gateForm");
+  const gateToken = document.getElementById("gateToken");
+  const gateErr = document.getElementById("gateErr");
 
   let sessionId = null;
   let source = null;
@@ -294,9 +326,53 @@
     };
   }
 
-  async function init() {
+  // --- auth ---------------------------------------------------------------
+  // The server may require a token. A browser EventSource cannot send an
+  // Authorization header, so the token is exchanged once for an HttpOnly,
+  // SameSite=Strict cookie; every later request (including the SSE stream)
+  // rides that cookie. The token itself is never stored in the page.
+  function showGate(message) {
+    gate.hidden = false;
+    gateErr.textContent = message || "";
+    gateToken.focus();
+  }
+
+  async function authStatus() {
+    try {
+      const r = await fetch("/auth/status");
+      if (!r.ok) return { auth_required: false, authenticated: true };
+      return await r.json();
+    } catch (e) {
+      return null;   // server unreachable
+    }
+  }
+
+  gateForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    gateErr.textContent = "";
+    try {
+      const r = await fetch("/auth", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: gateToken.value }),
+      });
+      if (!r.ok) {
+        gateErr.textContent = r.status === 429
+          ? "too many attempts — wait a minute"
+          : "that token was not accepted";
+        return;
+      }
+      gateToken.value = "";
+      gate.hidden = true;
+      startSession();
+    } catch (err) {
+      gateErr.textContent = "could not reach the server";
+    }
+  });
+
+  async function startSession() {
     try {
       const r = await fetch("/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      if (r.status === 401) { showGate("session expired — enter the token again"); return; }
       if (!r.ok) throw new Error(await r.text());
       sessionId = (await r.json()).session_id;
       connect();
@@ -306,14 +382,28 @@
     }
   }
 
+  async function init() {
+    const status = await authStatus();
+    if (status === null) {
+      setStatus("connecting", "no server");
+      hint.textContent = "could not reach the server — is `relife serve` running?";
+      return;
+    }
+    if (status.auth_required && !status.authenticated) { showGate(); return; }
+    startSession();
+  }
+
   async function send(text) {
     if (!sessionId || !text.trim()) return;
     sendBtn.disabled = true;
     try {
-      await fetch(`/sessions/${sessionId}/messages`, {
+      const r = await fetch(`/sessions/${sessionId}/messages`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ text }),
       });
+      if (r.status === 401) { showGate("session expired — enter the token again"); return; }
+      if (r.status === 404) { hint.textContent = "session closed (idle) — reload to start a new one"; return; }
+      if (!r.ok) { hint.textContent = `not sent: ${await r.text()}`; return; }
       input.value = ""; autosize();
     } finally {
       sendBtn.disabled = false; input.focus();

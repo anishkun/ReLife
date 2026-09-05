@@ -273,6 +273,37 @@ relife chat
   cookie/query-token scheme for the SSE stream, TLS, and multi-user auth — revisit then).
   **Deferred to a later phase:** scheduler / autonomous triggers, pre-authorized outward allowlist,
   non-loopback exposure + browser-compatible auth, multi-user, React SPA.
+- **Agent-server hardening — ✅ DONE (this phase).** The first cut shipped with a caveat
+  ("local-only, the UI runs tokenless"); a read of the code found that caveat was hiding a
+  real privilege hole, so this phase closed it before anything autonomous is built on top.
+  (1) **The UI can authenticate now.** A browser `EventSource` can't set an `Authorization`
+  header, so `GET /sessions/{id}/events` — the route carrying the whole transcript *and the
+  approval prompts* — was effectively unauthenticatable. `POST /auth` now exchanges the token
+  for an **HttpOnly, SameSite=Strict** cookie; every route accepts bearer **or** cookie
+  (constant-time compare), the UI prompts once (`GET /auth/status`), and mutating routes also
+  require a same-origin `Origin` (CSRF), with failed `/auth` attempts throttled per client.
+  (2) **Workspace confinement.** `POST /sessions` took an *arbitrary* path while
+  `permissions.classify()` auto-allows writes **inside the session workspace** — i.e. the
+  request body chose the auto-allow blast radius. Server-created workspaces are now confined
+  to `AGENT_WORKSPACE_ROOT` (resolve-then-check, so `..`/symlink escapes 400). The CLI's
+  `--workspace` is deliberately untouched (that's the local user speaking directly).
+  (3) **Fail-closed bind.** `serve()` now *refuses* a non-loopback bind with no token instead
+  of warning — this process runs shell commands and edits files.
+  (4) **Ceilings + lifecycle** for a long-lived process where every session owns a
+  `ClaudeSDKClient` subprocess: `AGENT_MAX_SESSIONS` (429), an idle reaper under the app
+  **lifespan** that spares sessions with a live SSE stream (the heartbeat touches them),
+  bounded turn queue (429), message size (413), subscriber count (429), drop-oldest on a
+  lagging subscriber, `DELETE /sessions/{id}`, and `manager.aclose()` on shutdown — previously
+  a server stop orphaned every agent subprocess.
+  All policy lives in a new pure `relife/server/security.py` (no I/O, no framework — the
+  `cognitive.py` discipline), so `app.py` only wires it to routes. **154 tests green** (was
+  131): policy unit tests, resource-ceiling tests against the real session machinery, and an
+  HTTP suite covering cookie auth, the throttle, CSRF, confinement and the 4xx/429 mapping —
+  still **zero model calls**. Live socket smoke: guard refuses `0.0.0.0`, UI + `/health` +
+  `/auth/status` serve, wrong token 401 → right token sets the cookie → SSE authenticates,
+  escaping workspace 400s, clean lifespan shutdown.
+  **Still not a public server:** no TLS, no multi-user. Beyond `127.0.0.1` needs a token *and*
+  a reverse proxy; that remains a deliberate future step.
 - **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call
