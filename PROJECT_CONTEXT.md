@@ -304,6 +304,35 @@ relife chat
   escaping workspace 400s, clean lifespan shutdown.
   **Still not a public server:** no TLS, no multi-user. Beyond `127.0.0.1` needs a token *and*
   a reverse proxy; that remains a deliberate future step.
+- **MVP pass 1 — permission holes + a mute, leaky console — ✅ DONE (this phase).** An audit
+  ahead of the MVP work found the two headline promises were not actually held.
+  (1) **The permission policy stopped at the shell.** `classify()` gated `Bash`/`PowerShell`
+  with a *Bash-flavoured* denylist, so on the platform ReLife runs on, `Send-MailMessage`,
+  `Invoke-RestMethod -Method POST`, `Invoke-WebRequest -OutFile` and `Start-Process -Verb
+  RunAs` were all **auto-allowed** — and because containment applied only to `Write`/`Edit`,
+  so were `echo pwned > ~/.bashrc`, `cp secrets.env /etc/app.env` and `rm -rf ~/Documents`.
+  Fixed by (a) `_OUTWARD_SHELL`, which covers both shells (PowerShell outward verbs, remote
+  sessions, publish, elevation, `mkfs`/`dd of=/dev/`/`Format-Volume`, and a download piped
+  into an interpreter), and (b) a **containment rule for the shell**:
+  `_write_targets`/`_delete_targets` extract redirect/copy/delete destinations and `_escapes`
+  asks unless every one is provably inside the workspace. `_under()` now `expanduser()`s, or
+  `~/Documents` reads as a *relative* path inside the workspace. The extraction is knowingly
+  heuristic and tuned to err toward asking; for deletes, an unevaluable target (`rm -rf
+  "$DIR"`) counts as outside. Verified no new friction on ordinary work (`pytest -q > out.txt
+  2>&1`, `rm -rf node_modules`, `git push`, loopback GETs all still auto-allow).
+  (2) **The web console never showed a tool result.** `to_event` walked only
+  `AssistantMessage`, but the CLI delivers results on a `user` frame — so the UI streamed
+  every tool call and no output. The existing test built the shape the runtime never emits,
+  which is why it was green; it now asserts the real carrier.
+  (3) **Every page reload forked a new agent.** The UI unconditionally `POST`ed `/sessions`,
+  so a refresh spawned a second `ClaudeSDKClient` subprocess, orphaned the first for an hour
+  (the idle reaper), threw away the transcript, and wedged at 429 after `AGENT_MAX_SESSIONS`
+  reloads with no way to clear it. The page now remembers its session in `localStorage` and
+  reattaches via a new `GET /sessions/{id}`, replaying the ring with `?last_id=0`; a header
+  **"new session"** button `DELETE`s the old one; a 404 mid-send self-heals. **167 tests
+  green** (was 154), still zero model calls. Real-socket smoke (fake session, no model):
+  create → stream → probe 200 → reconnect with `last_id=0` replays the full transcript
+  *including* `tool_result` → DELETE → 404, sessions back to 0.
 - **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call

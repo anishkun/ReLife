@@ -26,6 +26,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from rich.console import Console
 
@@ -144,9 +145,22 @@ def to_event(msg: Any) -> list[dict[str, Any]]:
     taxonomy, consumed by both the terminal renderer (``_render``) and the
     web server's SSE stream. ``SystemMessage`` (init/status frames) yields
     nothing, as it's dropped in the terminal too.
+
+    **Tool results arrive on a ``UserMessage``**, not the assistant one: the CLI
+    reports each result as a ``user``-type frame carrying ``ToolResultBlock``s
+    (see the SDK's ``message_parser``). Walking only ``AssistantMessage`` meant
+    the UI streamed every tool *call* and never a single result. Text on a
+    ``UserMessage`` is the caller's own turn echoed back, so it's dropped —
+    the server already publishes that itself when the turn is submitted.
     """
     events: list[dict[str, Any]] = []
-    if isinstance(msg, AssistantMessage):
+    if isinstance(msg, UserMessage):
+        content = msg.content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, ToolResultBlock):
+                    events.append({"type": "tool_result", "brief": _tool_result_brief(block)})
+    elif isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, TextBlock):
                 if block.text.strip():

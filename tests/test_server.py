@@ -150,9 +150,13 @@ class RecordingSession:
         self.submitted: list[str] = []
         self.resolved: list[tuple[str, bool]] = []
         self.resolve_return = True
+        self.closed = False
 
     async def start(self) -> None:
         pass
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     async def submit(self, text: str) -> None:
         self.submitted.append(text)
@@ -220,6 +224,30 @@ def test_unknown_session_is_404(http):
     tc, _ = http()
     assert tc.post("/sessions/nope/messages", json={"text": "hi"}).status_code == 404
     assert tc.get("/sessions/nope/events").status_code == 404
+    assert tc.get("/sessions/nope").status_code == 404
+
+
+def test_get_session_lets_a_reloading_ui_reattach(http):
+    """Without this probe the UI cannot tell a live session from a dead one, so
+    every reload created a second agent and orphaned the first."""
+    tc, created = http()
+    sid = tc.post("/sessions", json={}).json()["session_id"]
+
+    r = tc.get(f"/sessions/{sid}")
+    assert r.status_code == 200 and r.json()["session_id"] == sid
+    assert len(created) == 1  # probing must not spawn anything
+
+    tc.delete(f"/sessions/{sid}")
+    assert tc.get(f"/sessions/{sid}").status_code == 404
+
+
+def test_get_session_requires_auth(http):
+    tc, _ = http(token="secret")
+    tc.post("/auth", json={"token": "secret"})
+    sid = tc.post("/sessions", json={}).json()["session_id"]
+    tc.post("/auth/logout")
+    tc.cookies.clear()
+    assert tc.get(f"/sessions/{sid}").status_code == 401
 
 
 def test_approval_endpoint_routes_decision(http):

@@ -26,6 +26,7 @@ Endpoints:
   POST   /auth                                → exchange a token for a cookie
   POST   /auth/logout                         → clear the cookie
   POST   /sessions                            → create a session → {session_id}
+  GET    /sessions/{id}                       → is this session still live?
   DELETE /sessions/{id}                       → close a session
   POST   /sessions/{id}/messages              → submit a turn
   GET    /sessions/{id}/events                → SSE stream of agent events
@@ -195,6 +196,16 @@ def create_app(
         except SessionLimitReached as e:
             raise HTTPException(status_code=429, detail=str(e)) from e
         return {"session_id": session.id, "workspace": str(ws)}
+
+    @app.get("/sessions/{session_id}", dependencies=auth)
+    async def get_session(session_id: str) -> dict[str, Any]:
+        """Does this session still exist? Lets a reloading UI reattach to its
+        own agent instead of spawning a second one and orphaning the first."""
+        session = _session_or_404(session_id)
+        return {
+            "session_id": session.id,
+            "workspace": str(getattr(session, "workspace", "")),
+        }
 
     @app.delete("/sessions/{session_id}", dependencies=mutate)
     async def close_session(session_id: str) -> dict[str, Any]:

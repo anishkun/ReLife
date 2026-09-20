@@ -47,6 +47,10 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
   .status[data-state="open"] .dot { background: var(--green); box-shadow: 0 0 0 0 var(--green); animation: pulse 2.4s infinite; }
   .status[data-state="connecting"] .dot { background: var(--amber); }
+  .newsession { font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    color: var(--muted); background: transparent; border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  .newsession:hover { color: var(--text); border-color: var(--faint); }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(108,195,138,.5);} 70%{box-shadow:0 0 0 6px rgba(108,195,138,0);} 100%{box-shadow:0 0 0 0 rgba(108,195,138,0);} }
 
   /* Transcript */
@@ -152,6 +156,7 @@
     <span class="status" id="status" data-state="connecting">
       <span class="dot"></span><span id="statusText">connecting</span>
     </span>
+    <button class="newsession" id="newSession" type="button" title="Close this agent and start a fresh one" hidden>new session</button>
   </header>
 
   <main id="main">
@@ -200,8 +205,22 @@
   const gateToken = document.getElementById("gateToken");
   const gateErr = document.getElementById("gateErr");
 
+  const newSessionBtn = document.getElementById("newSession");
+
   let sessionId = null;
   let source = null;
+
+  // Which agent this browser is attached to. Without it, every reload created a
+  // *new* session — a second ClaudeSDKClient subprocess — and orphaned the old
+  // one until the idle reaper ran (an hour by default), losing the transcript
+  // and eventually hitting AGENT_MAX_SESSIONS. Storage is best-effort: a
+  // private window or blocked site data just means we start fresh.
+  const STORE_KEY = "relife.session";
+  const remembered = {
+    get() { try { return localStorage.getItem(STORE_KEY); } catch (_) { return null; } },
+    set(id) { try { localStorage.setItem(STORE_KEY, id); } catch (_) {} },
+    clear() { try { localStorage.removeItem(STORE_KEY); } catch (_) {} },
+  };
   let lastTextRow = null;   // merge consecutive text deltas into one paragraph
   const esc = (s) => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
@@ -317,13 +336,31 @@
     out.textContent = approved ? "✓ approved" : "✕ denied";
   }
 
-  function connect() {
-    source = new EventSource(`/sessions/${sessionId}/events`);
-    source.onopen = () => { setStatus("open", "connected"); hint.textContent = `session ${sessionId.slice(0,8)}`; };
+  function connect({ replay = false } = {}) {
+    // `last_id=0` asks for the whole retained backlog, which is how a reload
+    // gets its transcript back. On an automatic EventSource reconnect the
+    // browser sends Last-Event-ID, and the server prefers that header — so
+    // reconnects resume where they left off instead of replaying everything.
+    source = new EventSource(`/sessions/${sessionId}/events${replay ? "?last_id=0" : ""}`);
+    source.onopen = () => {
+      setStatus("open", "connected");
+      hint.textContent = `session ${sessionId.slice(0,8)}`;
+      newSessionBtn.hidden = false;
+    };
     source.onerror = () => setStatus("connecting", "reconnecting");
     source.onmessage = (e) => {
       try { handle(JSON.parse(e.data)); } catch (_) {}
     };
+  }
+
+  function disconnect() {
+    if (source) { source.close(); source = null; }
+  }
+
+  function clearStream() {
+    stream.innerHTML = "";
+    stream.appendChild(empty);
+    lastTextRow = null;
   }
 
   // --- auth ---------------------------------------------------------------
@@ -363,23 +400,63 @@
       }
       gateToken.value = "";
       gate.hidden = true;
-      startSession();
+      if (!(await reattach())) startSession();
     } catch (err) {
       gateErr.textContent = "could not reach the server";
     }
   });
 
+  async function reattach() {
+    /* Reattach to the agent this browser was already talking to, if it's alive. */
+    const id = remembered.get();
+    if (!id) return false;
+    try {
+      const r = await fetch(`/sessions/${encodeURIComponent(id)}`);
+      if (!r.ok) { remembered.clear(); return false; }
+      sessionId = id;
+      connect({ replay: true });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function startSession() {
     try {
       const r = await fetch("/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
       if (r.status === 401) { showGate("session expired — enter the token again"); return; }
+      if (r.status === 429) {
+        setStatus("connecting", "at capacity");
+        hint.textContent = `${await r.text()} — close one from another tab, or restart the server`;
+        return;
+      }
       if (!r.ok) throw new Error(await r.text());
       sessionId = (await r.json()).session_id;
+      remembered.set(sessionId);
       connect();
     } catch (e) {
       setStatus("connecting", "no server");
       hint.textContent = "could not start a session — is `relife serve` running?";
     }
+  }
+
+  async function newSession() {
+    /* Explicitly end this agent and start another — the only way to free a
+       session slot from the UI, and what to do when one goes stale. */
+    newSessionBtn.disabled = true;
+    const old = sessionId;
+    disconnect();
+    sessionId = null;
+    remembered.clear();
+    if (old) {
+      try {
+        await fetch(`/sessions/${encodeURIComponent(old)}`, { method: "DELETE" });
+      } catch (_) {}
+    }
+    clearStream();
+    setStatus("connecting", "connecting");
+    await startSession();
+    newSessionBtn.disabled = false;
   }
 
   async function init() {
@@ -390,6 +467,7 @@
       return;
     }
     if (status.auth_required && !status.authenticated) { showGate(); return; }
+    if (await reattach()) return;
     startSession();
   }
 
@@ -402,7 +480,13 @@
         body: JSON.stringify({ text }),
       });
       if (r.status === 401) { showGate("session expired — enter the token again"); return; }
-      if (r.status === 404) { hint.textContent = "session closed (idle) — reload to start a new one"; return; }
+      if (r.status === 404) {
+        // The agent was reaped (idle) out from under us — start a fresh one
+        // rather than leaving the console wedged.
+        hint.textContent = "session had closed (idle) — started a new one; send again";
+        await newSession();
+        return;
+      }
       if (!r.ok) { hint.textContent = `not sent: ${await r.text()}`; return; }
       input.value = ""; autosize();
     } finally {
@@ -419,6 +503,7 @@
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); composer.requestSubmit(); }
   });
   composer.addEventListener("submit", (e) => { e.preventDefault(); send(input.value); });
+  newSessionBtn.addEventListener("click", newSession);
 
   init();
 })();

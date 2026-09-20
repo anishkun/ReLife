@@ -280,10 +280,21 @@ The classification order (`permissions.py:84`):
 
 This is the architectural insight worth grilling yourself on.
 
-For **shell commands**, the policy uses a **denylist** (`_OUTWARD_BASH`,
-`permissions.py:51`): allow by default, ask only for a *finite, enumerable set of
-dangerous patterns* (email senders, `gh pr|issue|release|api|gist`, uploading curl/
-wget, scp/sftp/rsync/ssh, package publish, `sudo`, root `rm -rf`).
+For **shell commands**, the policy uses a **denylist** (`_OUTWARD_SHELL`): allow by
+default, ask only for a *finite, enumerable set of dangerous patterns* (email
+senders, `gh pr|issue|release|api|gist`, uploading curl/wget, scp/sftp/rsync/ssh,
+package publish, `sudo`, root `rm -rf`) — **in both shells**, POSIX and PowerShell
+alike (`Send-MailMessage`, `Invoke-RestMethod -Method POST`, `Enter-PSSession`,
+`-Verb RunAs`, `Format-Volume`). A Bash-only pattern set was a hole, not a
+simplification: on Windows, PowerShell is the shell the agent actually reaches for.
+
+The denylist is joined by a **containment rule for the shell**
+(`_write_targets`/`_delete_targets`/`_escapes`): what a command redirects to,
+copies to, or deletes must be inside the workspace, or it asks. Without it the
+workspace boundary applied only to `Write`/`Edit`, and `echo x > ~/.bashrc` was a
+one-character way around it. This extraction is explicitly heuristic — shell
+grammar is not parseable with a regex — so it is tuned to err toward asking, and
+for deletes an unevaluable target (`rm -rf "$DIR"`) counts as outside.
 
 Why denylist here and not an allowlist? Because **the set of safe shell commands is
 effectively infinite** (every build invocation, every test runner, every git
@@ -1080,7 +1091,7 @@ consolidation:
 |---|---|
 | `cli.py` | Typer CLI: `do`/`chat`/`build`/`consolidate`/`dream`/`memory stats`; wires permissions + MCP + hooks. |
 | `agent.py` | `build_options`, `run_task`/`run_chat`, streaming loop, `ask_model_oneshot`, `_maybe_consolidate`, Windows UTF-8 fix. |
-| `permissions.py` | `classify()` pure policy, `_OUTWARD_BASH` denylist, `_under()` containment, `make_permission_callback`. |
+| `permissions.py` | `classify()` pure policy, `_OUTWARD_SHELL` denylist (both shells), `_under()` + `_write_targets`/`_delete_targets` containment, `make_permission_callback`. |
 | `config.py` | All paths, model id (`claude-opus-4-8`), every cognitive/recall/REM tunable, MCP server defs, `agent_env`. |
 | `hooks.py` | `_recall_hook` (inject+reinforce), `_event_hook` (journal), `_episode_hook` (capture), `memory_hooks()`. |
 | `memory/cognitive.py` | Pure ACT-R math: `activation`, `sigmoid`, `fused_score`, `should_archive`, `should_hard_delete`. |

@@ -15,6 +15,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from relife.agent import to_event
@@ -22,6 +23,11 @@ from relife.agent import to_event
 
 def _assistant(*blocks) -> AssistantMessage:
     return AssistantMessage(content=list(blocks), model="claude-opus-4-8")
+
+
+def _user(*blocks) -> UserMessage:
+    """How tool results really arrive: a ``user``-type frame from the CLI."""
+    return UserMessage(content=list(blocks))
 
 
 def test_text_block_emits_text():
@@ -46,7 +52,7 @@ def test_tool_use_carries_name_and_brief():
 
 def test_tool_result_string_content():
     block = ToolResultBlock(tool_use_id="t1", content="all tests passed")
-    evs = to_event(_assistant(block))
+    evs = to_event(_user(block))
     assert evs == [{"type": "tool_result", "brief": "all tests passed"}]
 
 
@@ -56,8 +62,22 @@ def test_tool_result_list_content_and_error_prefix():
         content=[{"type": "text", "text": "boom\nstack trace"}],
         is_error=True,
     )
-    evs = to_event(_assistant(block))
+    evs = to_event(_user(block))
     assert evs == [{"type": "tool_result", "brief": "error: boom stack trace"}]
+
+
+def test_tool_result_on_assistant_message_still_handled():
+    """The parser can place a tool_result on either carrier; both must map to
+    the same event."""
+    block = ToolResultBlock(tool_use_id="t1", content="ok")
+    assert to_event(_assistant(block)) == [{"type": "tool_result", "brief": "ok"}]
+
+
+def test_user_text_is_not_echoed_as_an_event():
+    """A UserMessage carrying the caller's own turn yields nothing — the server
+    publishes that itself on submit, so emitting it here would double it."""
+    assert to_event(UserMessage(content="build me a thing")) == []
+    assert to_event(_user(TextBlock(text="build me a thing"))) == []
 
 
 def test_multiple_blocks_in_order():

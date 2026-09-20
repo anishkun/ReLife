@@ -200,16 +200,24 @@ Read/Glob/Grep/WebFetch/Task ...........→ ALLOW   (read-only / planning)
 Write/Edit a file INSIDE the workspace ..→ ALLOW
 Write/Edit a file OUTSIDE the workspace .→ ASK
 Bash/PowerShell command .................→ ALLOW, unless it matches the
-                                           "outward/destructive" regex →  ASK
+                                           "outward/destructive" regex, or it
+                                           writes/deletes OUTSIDE the workspace
+                                                                        →  ASK
 mcp__relife* / mcp__browser* ............→ ALLOW   (ReLife's own trusted tools)
 anything else (unknown tool) ............→ ASK     (fail closed — safe default)
 ```
 
-The "outward/destructive" regex (`_OUTWARD_BASH`) is the safety net: it catches
-email senders, `gh pr/issue/release/api/gist`, file uploads via curl/wget,
+The "outward/destructive" regex (`_OUTWARD_SHELL`) is the first safety net: it
+catches email senders, `gh pr/issue/release/api/gist`, file uploads via curl/wget,
 `scp/ssh/rsync`, package publishing (`npm publish`, `twine upload`…), `sudo`, and
-`rm -rf /`. **Note git is deliberately NOT in it** — you authorized git including
-`git push`, so commits and pushes run without asking.
+`rm -rf /` — **and their PowerShell equivalents** (`Send-MailMessage`,
+`Invoke-RestMethod -Method POST`, `Enter-PSSession`, `Start-Process -Verb RunAs`,
+`Format-Volume`), which matters because PowerShell is the shell the agent reaches
+for on Windows. The second net is containment: a shell command that *writes to* or
+*deletes* something outside the workspace asks too, so a redirect
+(`echo x > ~/.bashrc`) can't route around the file-write rule. **Note git is
+deliberately NOT in either** — you authorized git including `git push`, so commits
+and pushes run without asking.
 
 `make_permission_callback()` wraps `classify` for real use: on "ask" it prints a
 yellow prompt and waits for `y/N`. In a **non-interactive** run (no real
