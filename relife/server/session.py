@@ -80,7 +80,9 @@ class ApprovalBroker:
                 "approval_id": approval_id,
                 "tool": tool_name,
                 "reason": reason,
-                "brief": _tool_brief(tool_input),
+                # Roomier than the transcript hint: the card is where the user
+                # decides whether an email/event/etc. leaves the machine.
+                "brief": _tool_brief(tool_input, limit=400),
             }
         )
         try:

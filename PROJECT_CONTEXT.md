@@ -106,7 +106,8 @@ relife/
   cli.py                    # Typer: `relife do`, `relife chat`, `relife build` (--workspace)
   agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming)
   config.py                 # MODEL, EFFORT, paths, agent_env() (gh PATH), default_mcp_servers()
-  permissions.py            # classify() + make_permission_callback() (can_use_tool)
+  permissions.py            # classify() + make_permission_callback() (can_use_tool); connector verb policy
+  doctor.py                 # `relife doctor`: pure run_checks() over injected Probes
   hooks.py                  # UserPromptSubmit recall hook (memory + skills)
   prompts/system.md         # persona + safety + memory/skill instructions
   memory/                   # cognitive memory: relevance rises w/ use, fades when idle
@@ -333,6 +334,33 @@ relife chat
   green** (was 154), still zero model calls. Real-socket smoke (fake session, no model):
   create → stream → probe 200 → reconnect with `last_id=0` replays the full transcript
   *including* `tool_result` → DELETE → 404, sessions back to 0.
+- **MVP pass 2 — a real outward capability + `relife doctor` — ✅ DONE (this phase).**
+  (1) **Gmail (and Calendar/Drive) via the claude.ai connectors.** A one-turn live probe
+  confirmed the connectors are attached to every ReLife session by the CLI (`mcp_servers`
+  at init: `claude.ai Gmail`, `claude.ai Google Calendar`, `claude.ai Google Drive`,
+  alongside `browser` and `relife_memory`) — `setting_sources=None` doesn't exclude them,
+  they come from the account (OAuth scope `user:mcp_servers`), so there are no keys and no
+  local server to run. Until now they fell into the "unrecognized tool → ask" default, so
+  even a search prompted. `permissions.classify()` now has a **verb-based, fail-closed
+  connector policy** for `mcp__claude_ai_*`: read verbs auto-allow, write verbs ask,
+  neither asks, write beats read — deliberately independent of the exact tool names Google
+  ships (which only appear after the user links their Google account in-session via the
+  connector's `authenticate` tool). The TTY prompt and the UI approval card now show the
+  call's leading fields (`_tool_brief` fallback), so what the user approves is a concrete
+  `to=… subject=…`, not a blank line. `prompts/system.md` tells the agent the rules: show
+  recipient/subject/body before sending, a denial is final, never route mail elsewhere.
+  (2) **`relife doctor`.** Every first-run dependency failed late and cryptically inside a
+  subprocess. `doctor.py` is a pure `run_checks(Probes)` (the `security.py`/`cognitive.py`
+  discipline — no subprocess/fs/network of its own; `default_probes()` is the one real-machine
+  seam), checking: Python ≥3.11; the CLI the SDK will actually run (bundled first, PATH
+  second, same order as the SDK) and `claude auth status` (parsed JSON → who/subscription);
+  `ANTHROPIC_API_KEY` *unset* (warn if set — it would bill metered usage); node/npx (fail —
+  the browser MCP needs it); `gh` incl. the winget dir `agent_env()` prepends (warn only);
+  SQLite FTS5 (warn — recall degrades); data dir writable; each optional extra with its
+  `pip install -e ".[x]"` hint; the memory daemon's `/health` only when `RELIFE_MEMORY_URL`
+  is set; and the three connectors via `claude mcp list`. Exit 1 on a blocker. 17 scripted
+  tests; the real run on this machine is all-green (note: this account is a **pro**
+  subscription per `auth status`, not Max — same auth path either way).
 - **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call

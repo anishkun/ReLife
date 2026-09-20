@@ -17,6 +17,10 @@ v1 working end-to-end:
   (incl. push); ask before outward/destructive actions. Fails closed when unattended.
 - **MCP** — Playwright **browser** server (navigate/read/click) + an in-process
   **memory/skills** server. GitHub via `gh` (build → commit → create repo → push).
+- **Email / calendar / files** — the claude.ai **Gmail, Google Calendar and Google Drive**
+  connectors ride the subscription (no keys, no setup beyond enabling them at claude.ai).
+  Reads run on their own; anything that sends or changes something asks you first, in the
+  terminal or the web console. `relife doctor` shows whether they're enabled.
 - **Memory that grows (like a brain)** — facts/skills/workflows recalled automatically
   before each task; relevance **rises with use and fades when ignored**; an automatic
   LLM-free **"sleep" pass** forgets stale notes, merges duplicates, and learns workflows
@@ -42,6 +46,7 @@ pip install -e .
 relife do "scaffold a Python CLI that prints the weather for a city"
 relife chat
 relife build "<spec>"      # large, multi-milestone builds (resumable: --resume)
+relife doctor              # check the environment first (CLI login, node, gh, connectors…)
 relife consolidate         # run the LLM-free memory "sleep" pass now
 relife dream               # opt-in AI deep review of memory (spends Max budget)
 relife memory stats        # what's remembered and what has faded

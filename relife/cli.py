@@ -118,6 +118,34 @@ def build(
     )
 
 
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check the environment: Claude CLI + login, Node, gh, SQLite FTS5, optional
+    extras, the memory daemon, and the claude.ai connectors (Gmail etc.). Says what
+    to fix. Exits 1 if anything would stop a run."""
+    from .doctor import default_probes, run_checks, worst
+
+    glyph = {"ok": ("✓", typer.colors.GREEN), "warn": ("!", typer.colors.YELLOW),
+             "fail": ("✗", typer.colors.RED), "skip": ("·", typer.colors.BRIGHT_BLACK)}
+    checks = run_checks(default_probes())
+    width = max(len(c.name) for c in checks)
+    for c in checks:
+        mark, color = glyph[c.status]
+        typer.secho(f" {mark} ", fg=color, nl=False)
+        typer.secho(f"{c.name.ljust(width)}  ", bold=True, nl=False)
+        typer.echo(c.detail)
+        if c.fix and c.status in {"warn", "fail"}:
+            typer.secho(f"   {' ' * width}  → {c.fix}", fg=typer.colors.BRIGHT_BLACK)
+    overall = worst(checks)
+    if overall == "fail":
+        typer.secho("\nSomething above will stop a run.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    if overall == "warn":
+        typer.secho("\nRuns will work; the warnings limit what the agent can do.", fg=typer.colors.YELLOW)
+    else:
+        typer.secho("\nAll good.", fg=typer.colors.GREEN)
+
+
 @app.command("consolidate")
 def consolidate_cmd() -> None:
     """Run a memory consolidation ('sleep') pass now: fade unused memories, merge

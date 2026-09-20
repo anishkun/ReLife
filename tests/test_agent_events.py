@@ -100,3 +100,18 @@ def test_result_message_carries_cost():
 
 def test_system_message_yields_nothing():
     assert to_event(SystemMessage(subtype="init", data={})) == []
+
+
+def test_brief_falls_back_to_leading_fields_for_connector_calls():
+    """A connector call has no `command`/`path`; the approval card must still
+    show what is about to leave the machine."""
+    from relife.agent import _tool_brief
+
+    brief = _tool_brief(
+        {"to": "boss@corp.com", "subject": "Q3 numbers", "body": "hi\n\nsee attached", "cc": ""},
+        limit=400,
+    )
+    assert brief == "to=boss@corp.com  subject=Q3 numbers  body=hi see attached"
+    assert _tool_brief({"command": "pytest -q"}) == "pytest -q"
+    assert _tool_brief({}) == ""
+    assert len(_tool_brief({"body": "x" * 500}, limit=80)) <= 80

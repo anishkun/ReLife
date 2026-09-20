@@ -223,15 +223,29 @@ def _maybe_consolidate() -> None:
         pass
 
 
-def _tool_brief(inp: dict[str, Any]) -> str:
-    """One-line hint of what a tool call is doing."""
+def _tool_brief(inp: dict[str, Any], limit: int = 80) -> str:
+    """One-line hint of what a tool call is doing.
+
+    Built-in tools have one obvious key; a connector call (send an email, create
+    an event) has none, so fall back to the leading scalar fields — the approval
+    card must show *what* is about to leave the machine, not a blank line.
+    """
     if not isinstance(inp, dict):
         return ""
     for key in ("command", "file_path", "path", "pattern", "url", "query"):
         if key in inp:
-            val = str(inp[key])
-            return val if len(val) <= 80 else val[:77] + "..."
-    return ""
+            return _clip(str(inp[key]), limit)
+    pairs = []
+    for key, val in inp.items():
+        if isinstance(val, (str, int, float, bool)) and str(val).strip():
+            pairs.append(f"{key}={_clip(' '.join(str(val).split()), 60)}")
+        if len(pairs) == 4:
+            break
+    return _clip("  ".join(pairs), limit)
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _tool_result_brief(block: Any) -> str:

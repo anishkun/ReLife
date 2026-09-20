@@ -46,6 +46,31 @@ _FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 #                  capability the user wants the agent to use freely.
 _TRUSTED_MCP_PREFIXES = ("mcp__relife", "mcp__browser")
 
+# claude.ai connectors (Gmail, Google Calendar, Google Drive). They ride the
+# logged-in subscription — no keys, no local server — and surface as
+# ``mcp__claude_ai_<Service>__<tool>``. These are the first *real* outward
+# capability, so the policy is verb-based and fail-closed: a tool whose name
+# says it only reads (search/list/get/…) runs autonomously, a tool whose name
+# says it changes the outside world (send/create/delete/…) always asks, and a
+# name that says neither asks too. The write check wins over the read check.
+_CONNECTOR_PREFIX = "mcp__claude_ai_"
+_CONNECTOR_READ = re.compile(
+    r"(?:^|_)(?:search|list|get|read|fetch|find|query|lookup|show|view|count|"
+    r"authenticate|complete_authentication)(?:_|$)",
+    re.IGNORECASE,
+)
+_CONNECTOR_WRITE = re.compile(
+    r"(?:^|_)(?:send|create|delete|trash|untrash|modify|update|patch|move|archive|"
+    r"reply|forward|draft|label|mark|insert|batch|write|remove|upload|share|"
+    r"add|set|edit|rename|copy|import|export|accept|decline|rsvp|invite)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def _connector_tool(tool_name: str) -> str:
+    """``mcp__claude_ai_Gmail__gmail_send_message`` → ``gmail_send_message``."""
+    return tool_name[len(_CONNECTOR_PREFIX):].split("__", 1)[-1]
+
 # Shell commands that reach off the machine, escalate privilege, or are
 # unrecoverable → always ask. Covers BOTH shells the agent is given: POSIX tools
 # and their PowerShell equivalents. On Windows PowerShell is the shell the agent
@@ -270,6 +295,14 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
     if tool_name.startswith(_TRUSTED_MCP_PREFIXES):
         return "allow", "ReLife-owned MCP tool"
 
+    if tool_name.startswith(_CONNECTOR_PREFIX):
+        op = _connector_tool(tool_name)
+        if _CONNECTOR_WRITE.search(op):
+            return "ask", f"connector action changes the outside world: {op}"
+        if _CONNECTOR_READ.search(op):
+            return "allow", f"connector read: {op}"
+        return "ask", f"connector tool with unrecognized effect: {op}"
+
     # Unknown MCP tools and anything else: ask (safe default; allowlist grows
     # as concrete git/browser tool names are wired in later stages).
     return "ask", "unrecognized tool — approval required by default"
@@ -294,13 +327,17 @@ def make_permission_callback(
         if decision == "allow":
             return PermissionResultAllow()
 
-        # ask path
-        detail = tool_input.get("command") or tool_input.get("file_path") or ""
+        # ask path — show what is about to happen. A shell command or a path
+        # for the built-ins; for a connector call (an email about to be sent)
+        # the leading fields, so the user approves something concrete.
+        from .agent import _tool_brief  # lazy: agent.py sets up the console
+
+        detail = _tool_brief(tool_input, limit=400)
         console.print(
             f"\n[yellow]⚠ approval needed[/] [bold]{tool_name}[/] — {reason}"
         )
         if detail:
-            console.print(f"  [dim]{str(detail)[:200]}[/]")
+            console.print(f"  [dim]{detail}[/]")
 
         if not interactive:
             console.print("  [red]denied[/] [dim](non-interactive run)[/]")

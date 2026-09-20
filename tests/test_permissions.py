@@ -130,3 +130,44 @@ def test_trusted_mcp_allows():
 def test_unknown_mcp_asks():
     assert d("mcp__gmail__send_email", {"to": "a@b.com"}) == "ask"
     assert d("SomethingNew", {}) == "ask"
+
+
+def test_connector_reads_allow():
+    """claude.ai connector tools whose names say they only read run on their own."""
+    assert d("mcp__claude_ai_Gmail__gmail_search_messages", {"q": "from:x"}) == "allow"
+    assert d("mcp__claude_ai_Gmail__get_message", {"id": "1"}) == "allow"
+    assert d("mcp__claude_ai_Gmail__list_labels", {}) == "allow"
+    assert d("mcp__claude_ai_Google_Calendar__list_events", {}) == "allow"
+    assert d("mcp__claude_ai_Google_Drive__search_files", {"q": "x"}) == "allow"
+    # Linking the account is a read-side handshake, not an outward action.
+    assert d("mcp__claude_ai_Gmail__authenticate", {}) == "allow"
+    assert d("mcp__claude_ai_Gmail__complete_authentication", {"code": "x"}) == "allow"
+
+
+def test_connector_writes_ask():
+    """Anything that changes the outside world goes to the user, whatever the
+    exact tool name turns out to be."""
+    assert d("mcp__claude_ai_Gmail__gmail_send_message", {"to": "a@b.com"}) == "ask"
+    assert d("mcp__claude_ai_Gmail__send_email", {"to": "a@b.com"}) == "ask"
+    assert d("mcp__claude_ai_Gmail__create_draft", {}) == "ask"
+    assert d("mcp__claude_ai_Gmail__reply_to_message", {}) == "ask"
+    assert d("mcp__claude_ai_Gmail__trash_message", {"id": "1"}) == "ask"
+    assert d("mcp__claude_ai_Gmail__modify_labels", {"id": "1"}) == "ask"
+    assert d("mcp__claude_ai_Google_Calendar__create_event", {}) == "ask"
+    assert d("mcp__claude_ai_Google_Drive__share_file", {}) == "ask"
+
+
+def test_connector_write_verb_beats_read_verb():
+    """A name with both a read and a write verb is a write (fail closed)."""
+    assert d("mcp__claude_ai_Gmail__get_and_send", {}) == "ask"
+    assert d("mcp__claude_ai_Gmail__list_and_delete", {}) == "ask"
+
+
+def test_connector_unknown_verb_asks():
+    assert d("mcp__claude_ai_Gmail__frobnicate", {}) == "ask"
+    assert d("mcp__claude_ai_Gmail__", {}) == "ask"
+
+
+def test_connector_reason_names_the_operation():
+    _, reason = classify("mcp__claude_ai_Gmail__gmail_send_message", {}, WS)
+    assert "gmail_send_message" in reason
