@@ -138,6 +138,120 @@ def test_backlog_replay_by_last_id():
     anyio.run(flow)
 
 
+class _OneTurnClient:
+    """Stands in for ClaudeSDKClient: query() is a no-op and the response is a
+    single frame `to_event` ignores, so the real worker reaches the post-turn
+    upkeep immediately."""
+
+    async def query(self, text: str) -> None:
+        pass
+
+    async def receive_response(self):
+        yield object()
+
+
+def test_consolidation_runs_off_the_event_loop(monkeypatch):
+    """The pass can take seconds on a big store; inline on the server's single
+    loop it froze every session's stream and every pending approval. It must
+    run on a worker thread and the loop must keep turning meanwhile."""
+    import threading
+    import time
+
+    from relife import agent as agent_mod
+    from relife.memory.consolidate import ConsolidationReport
+
+    async def flow():
+        loop_thread = threading.get_ident()
+        seen: dict[str, int] = {}
+
+        def slow_pass():
+            seen["thread"] = threading.get_ident()
+            time.sleep(0.3)  # a slow sweep
+            return ConsolidationReport(archived=2, merged=1)
+
+        monkeypatch.setattr(agent_mod, "maybe_consolidate", slow_pass)
+
+        ticks = {"n": 0}
+
+        async def ticker():
+            while True:
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        s = AgentSession(Path("."))
+        s._client = _OneTurnClient()  # type: ignore[assignment]
+        s._worker = asyncio.create_task(s._run())
+        q, _ = s.subscribe()
+        t = asyncio.create_task(ticker())
+        try:
+            await s.submit("hello")
+            await _collect_until(q, "user")
+            at_start = ticks["n"]
+            got = await _collect_until(q, "note")
+            assert got[-1]["text"] == "memory consolidated: " + ConsolidationReport(archived=2, merged=1).summary()
+            # Ran on a thread, not the loop …
+            assert seen["thread"] != loop_thread
+            # … and the loop kept turning for the whole 0.3s the pass took.
+            assert ticks["n"] - at_start >= 10
+        finally:
+            t.cancel()
+            await s.aclose()
+
+    anyio.run(flow)
+
+
+def test_silent_consolidation_publishes_nothing(monkeypatch):
+    """A pass that changed nothing (or was throttled → None) adds no noise."""
+    from relife import agent as agent_mod
+
+    async def flow():
+        monkeypatch.setattr(agent_mod, "maybe_consolidate", lambda: None)
+        s = AgentSession(Path("."))
+        s._client = _OneTurnClient()  # type: ignore[assignment]
+        s._worker = asyncio.create_task(s._run())
+        q, _ = s.subscribe()
+        await s.submit("hello")
+        await _collect_until(q, "user")
+        await asyncio.sleep(0.1)
+        assert q.empty()
+        await s.aclose()
+
+    anyio.run(flow)
+
+
+def test_concurrent_consolidation_is_skipped_not_doubled(monkeypatch):
+    """Two sessions finishing together must not sweep the store twice at once:
+    the lock is non-blocking, so the second caller gets None and moves on."""
+    import threading
+    import time
+
+    from relife import agent as agent_mod
+
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        time.sleep(0.2)
+        return None
+
+    class _Client:
+        def maybe_consolidate(self):
+            return counted()
+
+    monkeypatch.setattr("relife.memory.client.default_client", lambda: _Client())
+
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(agent_mod.maybe_consolidate())) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert calls["n"] == 1
+    # After the pass finishes the lock is free again.
+    agent_mod.maybe_consolidate()
+    assert calls["n"] == 2
+
+
 # =============================================================================
 # Layer 2 — HTTP layer (TestClient) with a recording fake session
 # =============================================================================

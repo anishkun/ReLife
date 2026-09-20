@@ -285,6 +285,9 @@
       case "error":
         row("error", "!", esc(ev.message));
         break;
+      case "note":
+        row("result", "·", esc(ev.text));
+        break;
     }
   }
 

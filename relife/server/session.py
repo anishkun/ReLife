@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import ClaudeSDKClient
 
 from .. import config
-from ..agent import _maybe_consolidate, _tool_brief, build_options, to_event
+from ..agent import _tool_brief, build_options, maybe_consolidate_off_loop, to_event
 from ..hooks import memory_hooks
 from ..permissions import make_approval_callback
 
@@ -230,7 +230,12 @@ class AgentSession:
             finally:
                 self.touch()
             # Brain upkeep after each completed turn (deterministic, fail-safe).
-            _maybe_consolidate()
+            # Off the loop: this process hosts every session's stream and every
+            # pending approval on one loop, and a pass can take seconds on a
+            # large store — inline, all of them froze for the duration.
+            note = await maybe_consolidate_off_loop()
+            if note:
+                await self._publish({"type": "note", "text": note})
 
 
 # Factory used by SessionManager; overridable in tests.

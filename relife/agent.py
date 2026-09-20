@@ -12,9 +12,11 @@ MCP servers, and memory hooks are layered in by later build stages via the
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import anyio
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -198,14 +200,24 @@ def _render(msg: Any) -> None:
             console.print(f"[green]✓ done[/]{note}")
 
 
-def _maybe_consolidate() -> None:
-    """Run a background-style consolidation pass if enough has accrued.
+# Only one consolidation pass at a time per process. The agent server runs the
+# pass off its event loop, so two sessions finishing turns together could
+# otherwise sweep the same store concurrently; the loser just skips — the
+# throttle will fire it again after the next turn.
+_consolidate_lock = threading.Lock()
+
+
+def maybe_consolidate():
+    """Run a consolidation pass if enough has accrued; return its report or None.
 
     Brain-like upkeep after a run: fade unused memories, merge duplicates, and
     learn workflows from recurring tool sequences. Deterministic and cheap (no
     LLM); throttled by event volume and fully fail-safe so it never disrupts a
-    completed task.
+    completed task. Blocking — callers on an event loop use
+    :func:`maybe_consolidate_off_loop`.
     """
+    if not _consolidate_lock.acquire(blocking=False):
+        return None
     try:
         from .memory.client import default_client
 
@@ -214,13 +226,41 @@ def _maybe_consolidate() -> None:
         # event log the consolidation runs against. Gating here in the agent
         # process would read this process's local event log while the work runs
         # on the daemon — so it would never fire against a remote daemon.
-        report = default_client().maybe_consolidate()
-        if report and (
-            report.archived or report.deleted or report.merged or report.workflows_created
-        ):
-            console.print(f"[dim]· memory consolidated: {report.summary()}[/]")
+        return default_client().maybe_consolidate()
     except Exception:
-        pass
+        return None
+    finally:
+        _consolidate_lock.release()
+
+
+def _consolidation_note(report) -> str | None:
+    """One-line summary when a pass actually changed something, else None."""
+    if report and (
+        report.archived or report.deleted or report.merged or report.workflows_created
+    ):
+        return f"memory consolidated: {report.summary()}"
+    return None
+
+
+async def maybe_consolidate_off_loop() -> str | None:
+    """:func:`maybe_consolidate` on a worker thread, for callers on an event loop.
+
+    The pass does SQLite scans, dedupe, and (with embeddings on) ONNX inference —
+    tens to hundreds of milliseconds, seconds on a big store. Run inline on the
+    agent server's single loop it stalled every session's SSE stream and every
+    pending approval for that long. Safe on a thread: the store opens a fresh
+    SQLite connection per call (nothing is shared across threads), and the HTTP
+    client is thread-safe.
+    """
+    report = await anyio.to_thread.run_sync(maybe_consolidate)
+    return _consolidation_note(report)
+
+
+def _maybe_consolidate() -> None:
+    """CLI flavour: run the pass inline (nothing else is on the loop) and print."""
+    note = _consolidation_note(maybe_consolidate())
+    if note:
+        console.print(f"[dim]· {note}[/]")
 
 
 def _tool_brief(inp: dict[str, Any], limit: int = 80) -> str:

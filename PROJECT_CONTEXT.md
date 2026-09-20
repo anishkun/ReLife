@@ -371,9 +371,23 @@ relife chat
   so `MemoryService`/`MemoryClient` gained `archive(id) -> bool` and `get(id)`, with daemon
   routes `POST /archive` and `GET /memories/{id}` and a Local-vs-Http conformance case.
   11 CliRunner tests over an isolated store. 203 tests green (was 190).
+- **MVP pass 4 — consolidation off the server's event loop — ✅ DONE (this phase).**
+  `AgentSession._run` called the sync `_maybe_consolidate()` inline on the server's single
+  loop, so a sweep (SQLite scans, dedupe, ONNX inference with embeddings on — seconds on a
+  big store) froze every session's SSE stream and every pending approval for its duration.
+  `agent.maybe_consolidate()` now returns the report (no printing) behind a process-wide
+  **non-blocking lock** (two sessions finishing together don't sweep twice; the loser gets
+  `None` and the throttle fires next turn); `maybe_consolidate_off_loop()` runs it via
+  `anyio.to_thread` and returns a one-line note the session publishes as a `note` event
+  (rendered dim in the UI). The CLI's `_maybe_consolidate()` still runs inline and prints —
+  nothing else is on that loop. Thread-safety checked: the store and event log open a fresh
+  SQLite connection per call, nothing is shared across threads. Tests drive the **real**
+  `AgentSession._run` with a one-turn fake client and a 0.3s fake pass: the pass ran on
+  another thread and a 10ms ticker kept turning throughout (≥10 ticks), a silent pass
+  publishes nothing, and the lock serializes concurrent callers. 206 tests green (was 203).
 - **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
-  acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call
+  acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call
   in http mode); outward capabilities
   (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
