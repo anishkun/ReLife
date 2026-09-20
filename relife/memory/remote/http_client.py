@@ -105,6 +105,13 @@ class HttpMemoryClient:
         data = self._post("/forget", {"query": query})
         return wire.memory_or_none_from_dict(data["memory"])
 
+    def archive(self, mem_id) -> bool:
+        return bool(self._post("/archive", {"id": int(mem_id)})["archived"])
+
+    def get(self, mem_id) -> Memory | None:
+        data = self._get(f"/memories/{int(mem_id)}")
+        return wire.memory_or_none_from_dict(data["memory"])
+
     def all_memories(self, include_archived=True) -> list[Memory]:
         data = self._get("/memories", {"include_archived": include_archived})
         return wire.memories_from_list(data["memories"])

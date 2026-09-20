@@ -361,6 +361,16 @@ relife chat
   is set; and the three connectors via `claude mcp list`. Exit 1 on a blocker. 17 scripted
   tests; the real run on this machine is all-green (note: this account is a **pro**
   subscription per `auth status`, not Max — same auth path either way).
+- **MVP pass 3 — memory is inspectable and correctable — ✅ DONE (this phase).** The
+  differentiating feature had one read-only view (`memory stats`). Now: `relife memory
+  search` (the hook's ranking, **without reinforcing** — inspecting must never change what
+  the agent is shown next), `list` (`--kind`, `--archived`, `--sort recent|strong|oldest`),
+  `show <id>` (text, tags, importance, activation, use history), and `forget <id>… |
+  --query` (archive, reversible, confirms unless `--yes`). Forgetting by *id* needed
+  precise access the seam lacked — query-based `forget()` archives whatever matches best —
+  so `MemoryService`/`MemoryClient` gained `archive(id) -> bool` and `get(id)`, with daemon
+  routes `POST /archive` and `GET /memories/{id}` and a Local-vs-Http conformance case.
+  11 CliRunner tests over an isolated store. 203 tests green (was 190).
 - **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` is offloaded; events now add one loopback POST per tool call

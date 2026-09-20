@@ -155,6 +155,21 @@ def test_conformance_forget(client):
     assert client.forget("nonexistent topic xyz") is None
 
 
+def test_conformance_get_and_archive_by_id(client):
+    """`relife memory show/forget <id>` need precise, id-addressed access — the
+    query-based forget() archives *whatever matches best*, which is the wrong
+    tool when the user is pointing at one specific row."""
+    mid = client.save("Use ruff for linting in every Python project.", kind="preference")
+    got = client.get(mid)
+    assert got is not None and got.id == mid and got.kind == "preference"
+    assert client.get(mid + 999) is None
+
+    assert client.archive(mid) is True
+    assert client.get(mid).status == "archived"
+    assert client.recall("ruff linting") == []
+    assert client.archive(mid + 999) is False
+
+
 def test_conformance_all_memories(client):
     client.save("Fact one about the project.")
     client.save("Fact two about the project.")

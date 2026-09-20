@@ -134,10 +134,18 @@ def create_app(
         gone = svc.forget(body["query"])
         return {"memory": wire.memory_or_none_to_dict(gone)}
 
+    @app.post("/archive", dependencies=auth)
+    async def archive(body: dict[str, Any]) -> dict[str, Any]:
+        return {"archived": svc.archive(int(body["id"]))}
+
     @app.get("/memories", dependencies=auth)
     async def memories(include_archived: bool = True) -> dict[str, Any]:
         ms = svc.all_memories(include_archived=include_archived)
         return {"memories": wire.memories_to_list(ms)}
+
+    @app.get("/memories/{mem_id}", dependencies=auth)
+    async def memory(mem_id: int) -> dict[str, Any]:
+        return {"memory": wire.memory_or_none_to_dict(svc.get(mem_id))}
 
     @app.get("/count", dependencies=auth)
     async def count(include_archived: bool = True) -> dict[str, Any]:

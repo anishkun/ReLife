@@ -50,6 +50,10 @@ relife doctor              # check the environment first (CLI login, node, gh, c
 relife consolidate         # run the LLM-free memory "sleep" pass now
 relife dream               # opt-in AI deep review of memory (spends Max budget)
 relife memory stats        # what's remembered and what has faded
+relife memory search "<q>" # what the agent would be shown for a query (doesn't reinforce)
+relife memory list         # everything it has learned (--kind, --archived, --sort strong)
+relife memory show <id>    # one memory in full
+relife memory forget <id>  # archive a wrong or stale memory (reversible; --query works too)
 ```
 
 `do`/`chat`/`build` accept `--workspace PATH` (default: `./workspace`) — the directory

@@ -236,8 +236,150 @@ def serve(
     server_app.serve(host=h, port=p, token=config.AGENT_TOKEN)
 
 
-memory_app = typer.Typer(help="Inspect long-term memory.")
+memory_app = typer.Typer(help="Inspect and correct long-term memory.")
 app.add_typer(memory_app, name="memory")
+
+
+def _fmt_age(ts: float) -> str:
+    import time
+
+    secs = max(0.0, time.time() - ts)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit} ago"
+    return "just now"
+
+
+def _print_memory_line(m, *, width: int = 72) -> None:
+    """One memory as a table row: id, kind, activation, importance, text."""
+    text = " ".join(m.text.split())
+    if len(text) > width:
+        text = text[: width - 1] + "…"
+    status = "" if m.status == "active" else f" [{m.status}]"
+    typer.secho(f"  #{m.id:<5}", fg=typer.colors.BRIGHT_BLACK, nl=False)
+    typer.secho(f"{m.kind:<10}", fg=typer.colors.CYAN, nl=False)
+    typer.secho(f"act {m.activation():4.2f}  imp {m.importance:3.1f}  ", fg=typer.colors.BRIGHT_BLACK, nl=False)
+    typer.echo(f"{text}{status}")
+
+
+@memory_app.command("search")
+def memory_search(
+    query: str = typer.Argument(..., help="What to look for (same ranking the agent gets)."),
+    k: int = typer.Option(10, "-k", help="Max results."),
+    archived: bool = typer.Option(False, "--archived", help="Include faded (archived) memories."),
+) -> None:
+    """Search memory the way the recall hook does — but WITHOUT reinforcing the
+    hits, so looking never changes what the agent will be shown."""
+    config.ensure_dirs()
+    from .memory.client import default_client
+
+    hits = default_client().recall(query, k=k, reinforce=False, include_archived=archived)
+    if not hits:
+        typer.secho("no matching memories", fg=typer.colors.BRIGHT_BLACK)
+        return
+    for m in hits:
+        _print_memory_line(m)
+    typer.secho(f"\n{len(hits)} hit(s) · `relife memory show <id>` for the full record", fg=typer.colors.BRIGHT_BLACK)
+
+
+@memory_app.command("list")
+def memory_list(
+    kind: Optional[str] = typer.Option(None, "--kind", help="fact | preference | episode | pattern"),
+    archived: bool = typer.Option(False, "--archived", help="Show only faded (archived) memories."),
+    n: int = typer.Option(30, "-n", help="How many to show."),
+    sort: str = typer.Option("recent", "--sort", help="recent | strong | oldest"),
+) -> None:
+    """List what the agent has learned (newest first by default)."""
+    config.ensure_dirs()
+    from .memory.client import default_client
+
+    mems = default_client().all_memories(include_archived=True)
+    mems = [m for m in mems if (m.status != "active") == archived]
+    if kind:
+        mems = [m for m in mems if m.kind == kind]
+    keys = {
+        "recent": lambda m: -m.created_at,
+        "oldest": lambda m: m.created_at,
+        "strong": lambda m: -m.activation(),
+    }
+    if sort not in keys:
+        typer.secho("--sort must be recent | strong | oldest", fg=typer.colors.RED)
+        raise typer.Exit(2)
+    mems.sort(key=keys[sort])
+    if not mems:
+        typer.secho("nothing here", fg=typer.colors.BRIGHT_BLACK)
+        return
+    for m in mems[:n]:
+        _print_memory_line(m)
+    if len(mems) > n:
+        typer.secho(f"\n… {len(mems) - n} more (raise -n)", fg=typer.colors.BRIGHT_BLACK)
+
+
+@memory_app.command("show")
+def memory_show(mem_id: int = typer.Argument(..., help="Memory id (from search/list).")) -> None:
+    """Show one memory in full: text, tags, importance, activation, use history."""
+    config.ensure_dirs()
+    import datetime as dt
+
+    from .memory.client import default_client
+
+    m = default_client().get(mem_id)
+    if m is None:
+        typer.secho(f"no memory #{mem_id}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    when = lambda ts: dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") + f"  ({_fmt_age(ts)})"  # noqa: E731
+    typer.secho(f"#{m.id}  {m.kind}  {m.status}", bold=True)
+    typer.echo("")
+    typer.echo("  " + m.text)
+    typer.echo("")
+    if m.tags:
+        typer.echo(f"  tags        {m.tags}")
+    typer.echo(f"  importance  {m.importance:.2f}")
+    typer.echo(f"  activation  {m.activation():.2f}   (rises with use, fades when idle)")
+    typer.echo(f"  used        {m.use_count}×, last {when(m.last_used_at or m.created_at)}")
+    typer.echo(f"  created     {when(m.created_at)}")
+
+
+@memory_app.command("forget")
+def memory_forget(
+    ids: Optional[list[int]] = typer.Argument(None, help="Memory id(s) to archive."),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="Archive the single best match for this text instead."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
+) -> None:
+    """Archive memories so the agent stops being shown them. Reversible: archived
+    memories keep their row (see `list --archived`) until the slow hard-delete tier."""
+    config.ensure_dirs()
+    from .memory.client import default_client
+
+    client = default_client()
+    if bool(ids) == bool(query):
+        typer.secho("give memory id(s), or --query TEXT — not both, not neither", fg=typer.colors.RED)
+        raise typer.Exit(2)
+
+    if query:
+        hits = client.recall(query, k=1, reinforce=False)
+        if not hits:
+            typer.secho("no matching memory", fg=typer.colors.BRIGHT_BLACK)
+            raise typer.Exit(1)
+        targets = hits
+    else:
+        targets, missing = [], []
+        for mid in ids or []:
+            m = client.get(mid)
+            (targets if m else missing).append(m if m else mid)
+        for mid in missing:
+            typer.secho(f"no memory #{mid}", fg=typer.colors.YELLOW)
+        if not targets:
+            raise typer.Exit(1)
+
+    for m in targets:
+        _print_memory_line(m)
+    if not yes and not typer.confirm(f"archive {len(targets)} memor{'y' if len(targets) == 1 else 'ies'}?", default=False):
+        typer.secho("left alone", fg=typer.colors.BRIGHT_BLACK)
+        raise typer.Exit(0)
+    for m in targets:
+        client.archive(m.id)
+    typer.secho(f"archived {len(targets)}", fg=typer.colors.GREEN)
 
 
 @memory_app.command("stats")

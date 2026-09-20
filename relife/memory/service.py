@@ -57,8 +57,14 @@ class MemoryService:
         s.archive(hits[0].id)
         return hits[0]
 
-    def archive(self, mem_id: int) -> None:
-        self._resolved().archive(mem_id)
+    def archive(self, mem_id: int) -> bool:
+        """Archive one memory by id (reversible — same tier REM uses). Returns
+        False if there is no such memory, so a CLI can say so."""
+        s = self._resolved()
+        if s.get(mem_id) is None:
+            return False
+        s.archive(mem_id)
+        return True
 
     # --- reads --------------------------------------------------------------
     def recall(
@@ -75,6 +81,9 @@ class MemoryService:
 
     def all_memories(self, include_archived: bool = True) -> list[Memory]:
         return self._resolved().all_memories(include_archived=include_archived)
+
+    def get(self, mem_id: int) -> Memory | None:
+        return self._resolved().get(mem_id)
 
     def count(self, include_archived: bool = True) -> int:
         return self._resolved().count(include_archived=include_archived)
