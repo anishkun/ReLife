@@ -6,6 +6,12 @@ extras, and the claude.ai connectors (Gmail/Calendar/Drive) for outward work.
 Each of those fails *late* and cryptically when missing — mid-run, inside a
 subprocess, behind the SDK. This module checks them up front and says what to do.
 
+It also looks at the always-on side, which fails *silently* rather than late:
+schedules only fire while ``relife serve`` is running, a scheduled run that
+needed an approval nobody was there to give just records a denial, and a
+non-loopback bind without a token is refused at start. ``doctor`` surfaces
+each of those as a check with a fix.
+
 Structure follows the repo's policy modules: :func:`run_checks` is pure over an
 injected :class:`Probes` bundle (no subprocess, filesystem, or network of its own),
 so the whole matrix is unit-tested with fakes; :func:`default_probes` is the one
@@ -53,6 +59,15 @@ class Probes:
     memory_url: str | None
     http_get: Callable[[str], tuple[int, str]]  # → (status, body); raises on no connection
     extra_path_dirs: list[str] = field(default_factory=list)
+    # --- always-on side (defaults keep older probe bundles valid) ---
+    model: str = ""
+    effort: str = ""
+    agent_host: str = "127.0.0.1"
+    agent_port: int = 8600
+    agent_token: str | None = None
+    workspace_root: Path | None = None
+    schedules: list[dict] = field(default_factory=list)  # raw records from data/schedules.json
+    sidecar_exists: bool = False
 
 
 # --- the real machine --------------------------------------------------------
@@ -106,6 +121,15 @@ def default_probes() -> Probes:
         with urllib.request.urlopen(url, timeout=3) as r:  # noqa: S310
             return r.status, r.read().decode("utf-8", "replace")
 
+    def schedules() -> list[dict]:
+        # Raw records, read the same way the server does (no fastapi needed).
+        try:
+            from .server.schedules import ScheduleStore
+
+            return [s.to_dict() for s in ScheduleStore(config.AGENT_SCHEDULES_PATH).list()]
+        except Exception:  # noqa: BLE001 - a torn file is the store's problem, not doctor's
+            return []
+
     return Probes(
         which=shutil.which,
         run=run,
@@ -119,6 +143,14 @@ def default_probes() -> Probes:
         memory_url=config.MEMORY_URL,
         http_get=http_get,
         extra_path_dirs=list(config._EXTRA_PATH_DIRS),
+        model=config.MODEL,
+        effort=config.EFFORT,
+        agent_host=config.AGENT_HOST,
+        agent_port=config.AGENT_PORT,
+        agent_token=config.AGENT_TOKEN,
+        workspace_root=config.AGENT_WORKSPACE_ROOT,
+        schedules=schedules(),
+        sidecar_exists=config.MEMORY_SIDECAR_PATH.exists(),
     )
 
 
@@ -264,8 +296,21 @@ def _check_extras(p: Probes) -> list[Check]:
     return out
 
 
+def _check_model(p: Probes) -> Check:
+    if not p.model:
+        return Check("model", "skip", "unknown")
+    src = " (RELIFE_MODEL)" if p.env.get("RELIFE_MODEL") else ""
+    return Check("model", "ok", f"{p.model} · effort {p.effort or '?'}{src}")
+
+
 def _check_memory_daemon(p: Probes) -> Check:
     if not p.memory_url:
+        if p.sidecar_exists:
+            return Check(
+                "memory daemon", "warn",
+                "a daemon's sidecar file exists but RELIFE_MEMORY_URL is unset — this process would write the DB around it",
+                "set RELIFE_MEMORY_URL=http://127.0.0.1:8787 (or stop the daemon and delete data/relife.db.daemon if it crashed)",
+            )
         return Check("memory daemon", "skip", "RELIFE_MEMORY_URL unset — memory runs in-process (default)")
     url = p.memory_url.rstrip("/") + "/health"
     try:
@@ -319,9 +364,116 @@ def _check_connectors(p: Probes, cli: str | None, logged_in: bool) -> list[Check
                     "(Google account linking happens in-session on first use)",
                 )
             )
+        elif "auth" in status.lower():
+            short = name.split()[-1].lower()
+            checks.append(
+                Check(
+                    label, "warn", "enabled, but the Google account isn't linked yet",
+                    f"link it from a ReLife session — say “connect my {short}” and approve the browser sign-in "
+                    "(reads then run on their own; sends/changes still ask)",
+                )
+            )
         else:
             checks.append(Check(label, "warn", status, "re-enable the connector at claude.ai → Settings → Connectors"))
     return checks
+
+
+# --- the always-on side -------------------------------------------------------
+_BAD_RUN = re.compile(r"^(error|timeout|interrupted|skipped)")
+
+
+def _check_workspace_root(p: Probes) -> Check:
+    if p.workspace_root is None:
+        return Check("workspace root", "skip", "unknown")
+    if p.data_dir_writable(p.workspace_root):
+        return Check("workspace root", "ok", f"{p.workspace_root} (server sessions are confined here)")
+    return Check(
+        "workspace root", "fail", f"cannot write {p.workspace_root}",
+        "fix permissions or point RELIFE_AGENT_WORKSPACE_ROOT somewhere writable",
+    )
+
+
+def _agent_health_url(p: Probes) -> str:
+    host = p.agent_host.strip("[]")
+    probe = "127.0.0.1" if host in {"0.0.0.0", "", "::"} else host
+    return f"http://{probe}:{p.agent_port}/health"
+
+
+def _check_agent_server(p: Probes, enabled_schedules: int) -> Check:
+    """Bind/token sanity first (serve() refuses a bad bind), then reachability.
+
+    Not running is normal for CLI use — but not when schedules exist: they only
+    fire inside the server process, so that case is a warning with the fix.
+    """
+    from .server.security import guard_bind, is_loopback
+
+    try:
+        guard_bind(p.agent_host, p.agent_token)
+    except ValueError:
+        return Check(
+            "agent server", "fail", f"RELIFE_AGENT_HOST={p.agent_host} with no RELIFE_AGENT_TOKEN — serve() will refuse",
+            "set RELIFE_AGENT_TOKEN (and put TLS/a reverse proxy in front), or bind 127.0.0.1",
+        )
+    notes = []
+    if p.agent_token and len(p.agent_token) < 16:
+        notes.append("token is short — use 16+ random characters")
+    if not is_loopback(p.agent_host):
+        notes.append("bound beyond loopback with no TLS — only behind a reverse proxy")
+    url = _agent_health_url(p)
+    try:
+        status, body = p.http_get(url)
+    except Exception:  # noqa: BLE001 - connection refused = not running
+        if enabled_schedules:
+            return Check(
+                "agent server", "warn",
+                f"not running at {p.agent_host}:{p.agent_port} — {enabled_schedules} enabled schedule(s) will not fire",
+                "start it: `relife serve` (schedules only run inside the server process)",
+            )
+        return Check("agent server", "skip", f"not running at {p.agent_host}:{p.agent_port} (start with `relife serve`)")
+    if status != 200:
+        return Check("agent server", "fail", f"{url} → HTTP {status}", "check the server's logs")
+    info: dict = {}
+    try:
+        info = json.loads(body)
+    except (ValueError, TypeError):
+        pass
+    detail = f"running at {p.agent_host}:{p.agent_port}"
+    if info:
+        detail += f" · {info.get('sessions', '?')} session(s), {info.get('schedules', '?')} schedule(s)"
+        detail += " · auth on" if info.get("auth_required") else " · no token (loopback only)"
+    if notes:
+        return Check("agent server", "warn", detail + " — " + "; ".join(notes), "see RELIFE_AGENT_TOKEN / RELIFE_AGENT_HOST")
+    return Check("agent server", "ok", detail)
+
+
+def _check_schedules(p: Probes) -> Check:
+    """What the schedules did last time, in one line — the panel shows it too,
+    but doctor is where someone looks when \"nothing seems to happen\"."""
+    if not p.schedules:
+        return Check("schedules", "skip", "none defined (add one in the web console)")
+    enabled = [s for s in p.schedules if s.get("enabled", True)]
+    failing = []
+    needed = []
+    for sc in enabled:
+        last = sc.get("runs") or []
+        entry = last[-1] if last else {}
+        status = str(entry.get("status") or sc.get("last_status") or "")
+        if _BAD_RUN.match(status):
+            failing.append(f"{sc.get('name')} ({status})")
+        if entry.get("denied"):
+            needed.append(f"{sc.get('name')} ({entry['denied']} denied)")
+    head = f"{len(enabled)} enabled, {len(p.schedules) - len(enabled)} paused"
+    if failing or needed:
+        parts = []
+        if failing:
+            parts.append("last run failed: " + ", ".join(failing))
+        if needed:
+            parts.append("needed you: " + ", ".join(needed))
+        return Check(
+            "schedules", "warn", head + " — " + "; ".join(parts),
+            "open the console → schedules → runs for each one's summary and the exact actions that were denied",
+        )
+    return Check("schedules", "ok", head + (" — last runs fine" if any(s.get("runs") for s in enabled) else " — none run yet"))
 
 
 def run_checks(p: Probes) -> list[Check]:
@@ -331,14 +483,26 @@ def run_checks(p: Probes) -> list[Check]:
     login = _check_login(p, cli)
     checks.append(login)
     checks.append(_check_api_key(p))
+    checks.append(_check_model(p))
     checks.append(_check_node(p))
     checks.append(_check_gh(p))
     checks.append(_check_fts5(p))
     checks.append(_check_data_dir(p))
+    checks.append(_check_workspace_root(p))
     checks.extend(_check_extras(p))
     checks.append(_check_memory_daemon(p))
+    enabled = sum(1 for s in p.schedules if s.get("enabled", True))
+    checks.append(_check_agent_server(p, enabled))
+    checks.append(_check_schedules(p))
     checks.extend(_check_connectors(p, cli, login.status == "ok"))
     return checks
+
+
+def to_json(checks: list[Check]) -> dict:
+    return {
+        "overall": worst(checks),
+        "checks": [{"name": c.name, "status": c.status, "detail": c.detail, "fix": c.fix} for c in checks],
+    }
 
 
 def worst(checks: list[Check]) -> Status:

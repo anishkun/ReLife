@@ -13,7 +13,7 @@ pip install -e .                  # install (editable); creates the `relife` ent
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
 pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
 pip install -e ".[server]"        # + optional always-on agent server + web UI (fastapi/uvicorn)
-python -m pytest tests/           # run all tests (239: 235 deterministic + 4 semantic)
+python -m pytest tests/           # run all tests (248: 244 deterministic + 4 semantic)
 python -m pytest tests/test_permissions.py::test_name -v   # single test
 python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memories)
 
@@ -21,7 +21,8 @@ relife do "<task>"                # one-shot: run a task to completion
 relife chat                       # interactive multi-turn session
 relife build "<spec>"             # orchestrated large build (decompose → delegate → resume)
 relife build --resume [ID]        # continue a build (most recent for the workspace if no ID)
-relife doctor                     # check CLI+login, node, gh, FTS5, extras, daemon, claude.ai connectors; exit 1 on a blocker
+relife doctor [--json]            # check CLI+login, model, node, gh, FTS5, data/workspace dirs, extras, memory daemon,
+                                  #   agent server + schedules (will they fire? did last runs need you?), connectors; exit 1 on a blocker
 relife consolidate                # run a memory "sleep" pass now (decay/dedupe/learn workflows)
 relife dream [--max N]            # opt-in LLM "REM" pass: adversarial critic prunes/reweights memory
 relife memory stats               # counts, strongest memories, what has faded

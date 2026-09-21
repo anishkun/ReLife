@@ -119,15 +119,23 @@ def build(
 
 
 @app.command("doctor")
-def doctor_cmd() -> None:
+def doctor_cmd(
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output (one JSON object)."),
+) -> None:
     """Check the environment: Claude CLI + login, Node, gh, SQLite FTS5, optional
-    extras, the memory daemon, and the claude.ai connectors (Gmail etc.). Says what
-    to fix. Exits 1 if anything would stop a run."""
-    from .doctor import default_probes, run_checks, worst
+    extras, the memory daemon, the agent server + schedules (do they fire? did the
+    last runs need you?), and the claude.ai connectors (Gmail etc.). Says what to
+    fix. Exits 1 if anything would stop a run."""
+    import json as _json
+
+    from .doctor import default_probes, run_checks, to_json, worst
 
     glyph = {"ok": ("✓", typer.colors.GREEN), "warn": ("!", typer.colors.YELLOW),
              "fail": ("✗", typer.colors.RED), "skip": ("·", typer.colors.BRIGHT_BLACK)}
     checks = run_checks(default_probes())
+    if as_json:
+        typer.echo(_json.dumps(to_json(checks), indent=2))
+        raise typer.Exit(1 if worst(checks) == "fail" else 0)
     width = max(len(c.name) for c in checks)
     for c in checks:
         mark, color = glyph[c.status]

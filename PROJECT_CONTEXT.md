@@ -426,6 +426,18 @@ relife chat
   per-run list with a "needed you — denied unattended" block. Browser smoke with a scripted
   session that hits a denied approval: card read `done · 1 tool · $0.010 · 1 denied` with the
   agent's closing note and the exact `gh pr create` it could not run. 239 tests (was 232).
+- **MVP pass 7 — `relife doctor` knows the always-on side — ✅ DONE (this phase).** The
+  scheduler introduced a class of failure that is *silent* rather than late: schedules only
+  fire inside `relife serve`, an unattended run just records a denial, a non-loopback bind
+  without a token is refused at start. `doctor` now checks the model/effort in effect, the
+  workspace root (writable — it's the auto-allow radius), the agent server (bind/token sanity
+  via the same `guard_bind`, then `/health`: **skip** when not running, **warn** when not
+  running *and* enabled schedules exist — "N schedules will not fire"), the schedules'
+  last outcomes in one line ("last run failed: …; needed you: inbox (2 denied)"), and a
+  stray memory-daemon sidecar with `RELIFE_MEMORY_URL` unset. Connector advice was wrong for
+  the real `Needs authentication` state (it said re-enable; it now says link the Google
+  account in-session). `--json` for scripts. Same pure `run_checks(Probes)` shape — new
+  probe fields default so older bundles stay valid. 248 tests (was 239).
 - **Phase 3 (next):** a pre-authorized outward allowlist per schedule (so an unattended run
   can e.g. send *to me* without a human at the card — a deliberate policy widening); async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
