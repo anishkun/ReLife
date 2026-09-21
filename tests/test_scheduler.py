@@ -148,12 +148,17 @@ def test_store_ignores_a_torn_file(tmp_path):
 # Layer 2 — scheduler policy against a fake manager
 # =============================================================================
 class FakeSession:
+    """Enough of AgentSession for the scheduler: submit + a pubsub the test
+    drives by hand with :meth:`emit`."""
+
     def __init__(self, workspace: Path, sid: str) -> None:
         self.id = sid
         self.workspace = workspace
         self.submitted: list[str] = []
         self.busy = False
         self.queue_full = False
+        self.subs: set[asyncio.Queue] = set()
+        self.seq = 0
 
     async def submit(self, text: str) -> None:
         from relife.server.session import TurnQueueFull
@@ -161,6 +166,20 @@ class FakeSession:
         if self.queue_full:
             raise TurnQueueFull("full")
         self.submitted.append(text)
+
+    def subscribe(self, last_id=None):
+        q: asyncio.Queue = asyncio.Queue()
+        self.subs.add(q)
+        return q, []
+
+    def unsubscribe(self, q) -> None:
+        self.subs.discard(q)
+
+    def emit(self, *events: dict) -> None:
+        for ev in events:
+            self.seq += 1
+            for q in list(self.subs):
+                q.put_nowait((self.seq, ev))
 
 
 class FakeManager:
@@ -185,13 +204,37 @@ class FakeManager:
 
 @pytest.fixture
 def sched(tmp_path):
+    from relife.server.runs import RunStore
     from relife.server.scheduler import Scheduler
 
     root = tmp_path / "ws"
     root.mkdir()
     store = ScheduleStore(tmp_path / "schedules.json")
     manager = FakeManager()
-    return Scheduler(store, manager, workspace_root=root, tick=0.01), store, manager, root
+    scheduler = Scheduler(
+        store, manager, workspace_root=root, tick=0.01, runs=RunStore(tmp_path / "runs"), run_timeout=2.0
+    )
+    return scheduler, store, manager, root
+
+
+def _turn(prompt: str, *middle: dict, result: dict | None = None) -> list[dict]:
+    """A scripted turn: the session's `user` echo, whatever happened, and the end."""
+    return [{"type": "user", "text": prompt}, *middle, result or {"type": "result", "cost_usd": 0.02}]
+
+
+async def _settle(scheduler) -> None:
+    for _ in range(100):
+        if not scheduler._recorders:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("recorder never finished")
+
+
+async def _complete(scheduler, manager, schedule, text="ok") -> None:
+    """Play the scheduled turn to its end so the recorder finishes."""
+    sess = manager.sessions[schedule.session_id]
+    sess.emit(*_turn(sess.submitted[-1], {"type": "text", "text": text}))
+    await _settle(scheduler)
 
 
 def test_tick_fires_due_schedules_into_their_own_sessions(sched):
@@ -200,52 +243,76 @@ def test_tick_fires_due_schedules_into_their_own_sessions(sched):
     b = store.add(Schedule.new(name="b", task="do B", spec={"every": "2h"}, now=0.0))
     c = store.add(Schedule.new(name="c", task="do C", spec={"every": "1h"}, enabled=False, now=0.0))
 
-    fired = anyio.run(scheduler.tick, 3600.0)
-    assert fired == [a.id]  # b isn't due yet, c is disabled
-    assert manager.created == [root / "proj-a"] and (root / "proj-a").is_dir()
-    sess = manager.sessions[a.session_id]
-    assert sess.submitted and sess.submitted[0].endswith("do A")
-    assert sess.submitted[0].startswith("[Scheduled run: a]")
-    assert a.last_status == "submitted" and a.next_run_at == 7200.0
-    assert b.last_status is None and c.last_status is None
+    async def flow():
+        fired = await scheduler.tick(3600.0)
+        assert fired == [a.id]  # b isn't due yet, c is disabled
+        assert manager.created == [root / "proj-a"] and (root / "proj-a").is_dir()
+        sess = manager.sessions[a.session_id]
+        assert sess.submitted and sess.submitted[0].endswith("do A")
+        assert sess.submitted[0].startswith("[Scheduled run: a]")
+        assert a.last_status == "submitted" and a.next_run_at == 7200.0
+        assert b.last_status is None and c.last_status is None
 
-    # The record hit disk (a restart must not forget the run happened).
-    assert ScheduleStore(store.path).get(a.id).last_status == "submitted"
+        # The record hit disk (a restart must not forget the run happened).
+        assert ScheduleStore(store.path).get(a.id).last_status == "submitted"
+        await _complete(scheduler, manager, a)
+        assert a.last_status == "done"
 
-    # Next slot: reuses the same session rather than spawning another.
-    fired = anyio.run(scheduler.tick, 7200.0)
-    assert set(fired) == {a.id, b.id}
-    assert len(manager.created) == 2  # one new session for b only
-    assert len(sess.submitted) == 2
+        # Next slot: reuses the same session rather than spawning another.
+        fired = await scheduler.tick(7200.0)
+        assert set(fired) == {a.id, b.id}
+        assert len(manager.created) == 2  # one new session for b only
+        assert len(sess.submitted) == 2
+        # Both runs are being recorded at once; end both, then let them settle.
+        sess.emit(*_turn(sess.submitted[-1], {"type": "text", "text": "A again"}))
+        sb = manager.sessions[b.session_id]
+        sb.emit(*_turn(sb.submitted[-1], {"type": "text", "text": "B"}))
+        await _settle(scheduler)
+        assert a.runs[-1]["summary"] == "A again" and b.runs[-1]["summary"] == "B"
+
+    anyio.run(flow)
 
 
 def test_busy_session_skips_the_slot_instead_of_stacking_turns(sched):
     scheduler, store, manager, _ = sched
     a = store.add(Schedule.new(name="a", task="long job", spec={"every": "1h"}, now=0.0))
-    anyio.run(scheduler.tick, 3600.0)
-    sess = manager.sessions[a.session_id]
-    sess.busy = True
 
-    anyio.run(scheduler.tick, 7200.0)
-    assert len(sess.submitted) == 1
-    assert a.last_status == "skipped: previous run still in progress"
-    assert a.next_run_at == 10800.0  # advanced anyway: no tight retry loop
+    async def flow():
+        await scheduler.tick(3600.0)
+        sess = manager.sessions[a.session_id]
+        sess.busy = True  # the first run is still going
 
-    sess.busy = False
-    anyio.run(scheduler.tick, 10800.0)
-    assert len(sess.submitted) == 2 and a.last_status == "submitted"
+        await scheduler.tick(7200.0)
+        assert len(sess.submitted) == 1
+        assert a.last_status == "skipped: previous run still in progress"
+        assert a.next_run_at == 10800.0  # advanced anyway: no tight retry loop
+        assert a.runs[-1].get("run_id") is None  # nothing to record for a skip
+
+        await _complete(scheduler, manager, a)
+        sess.busy = False
+        await scheduler.tick(10800.0)
+        assert len(sess.submitted) == 2 and a.last_status == "submitted"
+        await _complete(scheduler, manager, a)
+
+    anyio.run(flow)
 
 
 def test_reaped_session_is_recreated_on_the_next_slot(sched):
     scheduler, store, manager, _ = sched
     a = store.add(Schedule.new(name="a", task="t", spec={"every": "1h"}, now=0.0))
-    anyio.run(scheduler.tick, 3600.0)
-    first = a.session_id
-    manager.sessions.pop(first)  # the idle reaper closed it
 
-    anyio.run(scheduler.tick, 7200.0)
-    assert a.session_id != first and a.last_status == "submitted"
-    assert a.session_id in manager.sessions
+    async def flow():
+        await scheduler.tick(3600.0)
+        first = a.session_id
+        await _complete(scheduler, manager, a)
+        manager.sessions.pop(first)  # the idle reaper closed it
+
+        await scheduler.tick(7200.0)
+        assert a.session_id != first and a.last_status == "submitted"
+        assert a.session_id in manager.sessions
+        await _complete(scheduler, manager, a)
+
+    anyio.run(flow)
 
 
 def test_session_ceiling_and_full_queue_are_recorded_not_raised(sched):
@@ -257,10 +324,17 @@ def test_session_ceiling_and_full_queue_are_recorded_not_raised(sched):
     assert a.session_id is None and a.next_run_at == 7200.0
 
     manager.limit = 8
-    anyio.run(scheduler.tick, 7200.0)
-    manager.sessions[a.session_id].queue_full = True
-    anyio.run(scheduler.tick, 10800.0)
-    assert a.last_status == "skipped: full"
+
+    async def flow():
+        await scheduler.tick(7200.0)
+        await _complete(scheduler, manager, a)
+        sess = manager.sessions[a.session_id]
+        sess.queue_full = True
+        await scheduler.tick(10800.0)
+        assert a.last_status == "skipped: full"
+        assert not sess.subs  # the recorder let go when the submit failed
+
+    anyio.run(flow)
 
 
 def test_workspace_outside_root_is_an_error_not_a_session(sched):
@@ -274,8 +348,12 @@ def test_workspace_outside_root_is_an_error_not_a_session(sched):
 def test_fire_runs_a_schedule_that_is_not_due(sched):
     scheduler, store, manager, _ = sched
     a = store.add(Schedule.new(name="a", task="t", spec={"at": "09:00"}, now=_local(2026, 9, 21, 8, 0)))
-    status = anyio.run(lambda: scheduler.fire(a, now=_local(2026, 9, 21, 8, 5)))
-    assert status == "submitted" and a.session_id in manager.sessions
+    async def flow():
+        status = await scheduler.fire(a, now=_local(2026, 9, 21, 8, 5))
+        assert status == "submitted" and a.session_id in manager.sessions
+        await _complete(scheduler, manager, a)
+
+    anyio.run(flow)
     # Firing by hand doesn't steal the regular slot: 09:00 today still stands.
     assert a.next_run_at == _local(2026, 9, 21, 9, 0)
 
@@ -344,6 +422,143 @@ def test_agent_session_reports_busy_while_a_turn_runs():
     anyio.run(flow)
 
 
+def test_recorder_persists_the_outcome_and_upgrades_the_history(sched):
+    """`submitted` only means queued. Once the turn ends the run record holds
+    what actually happened — and the entry the panel shows says so too."""
+    scheduler, store, manager, _ = sched
+    a = store.add(Schedule.new(name="inbox", task="triage", spec={"every": "1h"}, now=0.0))
+
+    async def flow():
+        await scheduler.tick(3600.0)
+        sess = manager.sessions[a.session_id]
+        assert a.last_status == "submitted" and a.runs[-1]["run_id"]
+        assert len(sess.subs) == 1  # recorder attached before the turn ran
+        sess.emit(*_turn(
+            sess.submitted[0],
+            {"type": "text", "text": "Looking… "},
+            {"type": "tool_use", "name": "mcp__claude_ai_Gmail__search", "brief": "is:unread"},
+            {"type": "tool_result", "brief": "3 threads"},
+            {"type": "tool_use", "name": "Bash", "brief": "gh pr create"},
+            {"type": "approval_request", "approval_id": "ap1", "tool": "Bash",
+             "reason": "outward-facing", "brief": "gh pr create -t x"},
+            {"type": "approval_resolved", "approval_id": "ap1", "approved": False},
+            {"type": "tool_result", "brief": "denied"},
+            {"type": "text", "text": "Two urgent mails from the bank. "},
+            {"type": "text", "text": "I could not open the PR (approval denied)."},
+        ))
+        await _settle(scheduler)
+        assert not sess.subs  # detached: the idle reaper may have the session back
+
+    anyio.run(flow)
+    run_id = a.runs[-1]["run_id"]
+    rec = scheduler.runs.get(a.id, run_id)
+    assert rec is not None and rec.status == "done" and rec.session_id == a.session_id
+    assert rec.summary == "Two urgent mails from the bank. I could not open the PR (approval denied)."
+    assert rec.tool_calls == 2 and rec.cost_usd == 0.02
+    assert rec.denied == [{"tool": "Bash", "brief": "gh pr create -t x", "reason": "outward-facing"}]
+    assert rec.events[0]["type"] == "user" and rec.events[-1]["type"] == "result"
+    # The inline history entry the panel renders was upgraded in place …
+    entry = a.runs[-1]
+    assert entry["status"] == "done" and entry["denied"] == 1 and entry["tool_calls"] == 2
+    assert entry["summary"].startswith("Two urgent")
+    assert a.last_status == "done"
+    # … and both are on disk.
+    assert ScheduleStore(store.path).get(a.id).last_status == "done"
+    assert scheduler.runs.list(a.id)[0].run_id == run_id
+
+
+def test_recorder_only_takes_its_own_turn(sched):
+    """A turn the user typed into the schedule's session (or one still draining)
+    must not be recorded as the scheduled run's outcome."""
+    scheduler, store, manager, _ = sched
+    a = store.add(Schedule.new(name="n", task="t", spec={"every": "1h"}, now=0.0))
+
+    async def flow():
+        await scheduler.tick(3600.0)
+        sess = manager.sessions[a.session_id]
+        sess.emit(*_turn("something the user typed", {"type": "text", "text": "user answer"}))
+        sess.emit(*_turn(sess.submitted[0], {"type": "text", "text": "scheduled answer"}))
+        await _settle(scheduler)
+
+    anyio.run(flow)
+    rec = scheduler.runs.list(a.id)[0]
+    assert rec.summary == "scheduled answer"
+    assert all(e.get("text") != "user answer" for e in rec.events)
+
+
+def test_recorder_records_errors_and_timeouts(sched):
+    scheduler, store, manager, _ = sched
+    scheduler.run_timeout = 0.05
+    a = store.add(Schedule.new(name="a", task="t", spec={"every": "1h"}, now=0.0))
+    b = store.add(Schedule.new(name="b", task="t", spec={"every": "1h"}, now=0.0))
+
+    async def flow():
+        await scheduler.tick(3600.0)
+        sa = manager.sessions[a.session_id]
+        sa.emit(*_turn(sa.submitted[0], result={"type": "error", "message": "boom"}))
+        # b's session never finishes its turn.
+        await _settle(scheduler)
+
+    anyio.run(flow)
+    assert scheduler.runs.list(a.id)[0].status == "error"
+    assert scheduler.runs.list(a.id)[0].error == "boom"
+    assert a.runs[-1]["status"] == "error"
+    assert scheduler.runs.list(b.id)[0].status == "timeout"
+    assert b.last_status == "timeout"
+
+
+def test_aclose_interrupts_recorders_but_keeps_the_record(sched):
+    scheduler, store, manager, _ = sched
+    a = store.add(Schedule.new(name="a", task="t", spec={"every": "1h"}, now=0.0))
+
+    async def flow():
+        await scheduler.tick(3600.0)
+        assert scheduler._recorders
+        await scheduler.aclose()
+        assert not scheduler._recorders
+
+    anyio.run(flow)
+    rec = scheduler.runs.list(a.id)[0]
+    assert rec.status == "interrupted"
+    assert a.last_status == "interrupted"
+
+
+def test_summarize_events_without_tools_uses_all_text():
+    from relife.server.runs import summarize_events
+
+    info = summarize_events([
+        {"type": "user", "text": "p"},
+        {"type": "text", "text": "Nothing to do. "},
+        {"type": "thinking"},
+        {"type": "text", "text": "All quiet."},
+        {"type": "result", "cost_usd": None},
+    ])
+    assert info == {
+        "summary": "Nothing to do. All quiet.", "tool_calls": 0, "cost_usd": None, "denied": [], "error": None,
+    }
+    assert summarize_events([])["summary"] == ""
+
+
+def test_run_store_is_bounded_and_removable(tmp_path):
+    from relife.server.runs import RunRecord, RunStore
+
+    rs = RunStore(tmp_path / "runs", keep=3)
+    for i in range(5):
+        rec = RunRecord(schedule_id="s1", run_id=f"2026-{i:02d}", started_at=float(i))
+        rec.finish("done", [{"type": "text", "text": f"run {i}"}], now=float(i) + 1)
+        rs.save(rec)
+    ids = [r.run_id for r in rs.list("s1")]
+    assert ids == ["2026-04", "2026-03", "2026-02"]  # newest first, oldest pruned
+    assert rs.list("s1", limit=1)[0].summary == "run 4"
+    assert rs.get("s1", "2026-00") is None and rs.get("nope", "x") is None
+    d = rs.get("s1", "2026-04").to_dict()
+    assert "events" not in d and d["event_count"] == 1
+    assert "events" in rs.get("s1", "2026-04").to_dict(with_events=True)
+    rs.remove_all("s1")
+    assert rs.list("s1") == [] and not (tmp_path / "runs" / "s1").exists()
+    rs.remove_all("s1")  # idempotent
+
+
 # =============================================================================
 # Layer 3 — HTTP routes
 # =============================================================================
@@ -367,7 +582,8 @@ class RecordingSession:
         return True
 
     def subscribe(self, last_id=None):
-        return asyncio.Queue(), []
+        self.q: asyncio.Queue = asyncio.Queue()
+        return self.q, []
 
     def unsubscribe(self, q) -> None:
         pass
@@ -397,6 +613,7 @@ def http(tmp_path, monkeypatch):
             workspace_root=root,
             reap=False,
             schedules_path=tmp_path / "schedules.json",
+            runs_dir=tmp_path / "runs",
             run_scheduler=False,
         )
         return TestClient(app), created, app
@@ -486,6 +703,42 @@ def test_scheduler_tick_uses_the_apps_manager(http):
     assert fired == [rec["id"]]
     assert created and created[0].submitted[0].endswith("\n\nt")
     assert tc.get(f"/schedules/{rec['id']}").json()["session_id"] == created[0].id
+
+
+def test_run_outcomes_over_http(http, tmp_path):
+    tc, created, app = http()
+    sid = tc.post("/schedules", json={"name": "n", "task": "t", "every": "1h"}).json()["id"]
+    assert tc.get(f"/schedules/{sid}/runs").json() == {"runs": []}
+    assert tc.get("/schedules/nope/runs").status_code == 404
+    assert tc.get(f"/schedules/{sid}/runs/nope").status_code == 404
+
+    # Feed the turn's events to the recorder on the app's loop and let it finish.
+    async def finish():
+        sess = created[0]
+        sess.q.put_nowait((1, {"type": "user", "text": sess.submitted[0]}))
+        sess.q.put_nowait((2, {"type": "text", "text": "did the thing"}))
+        sess.q.put_nowait((3, {"type": "result", "cost_usd": 0.5}))
+        for _ in range(100):
+            if not app.state.scheduler._recorders:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("recorder still running")
+
+    with tc:  # one loop for the run + the recorder (the portal lives inside the context)
+        tc.post(f"/schedules/{sid}/run")
+        tc.portal.call(finish)
+
+    runs = tc.get(f"/schedules/{sid}/runs").json()["runs"]
+    assert len(runs) == 1 and runs[0]["status"] == "done" and runs[0]["summary"] == "did the thing"
+    assert "events" not in runs[0]
+    full = tc.get(f"/schedules/{sid}/runs/{runs[0]['run_id']}").json()
+    assert [e["type"] for e in full["events"]] == ["user", "text", "result"]
+    sched = tc.get(f"/schedules/{sid}").json()
+    assert sched["last_status"] == "done" and sched["runs"][-1]["summary"] == "did the thing"
+    assert (tmp_path / "runs" / sid).is_dir()
+
+    tc.delete(f"/schedules/{sid}")
+    assert not (tmp_path / "runs" / sid).exists()
 
 
 def test_schedules_require_auth_and_same_origin(http):

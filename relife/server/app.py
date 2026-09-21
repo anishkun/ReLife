@@ -43,6 +43,8 @@ Endpoints:
   PATCH  /schedules/{id}                      → edit / enable / disable
   DELETE /schedules/{id}                      → remove
   POST   /schedules/{id}/run                  → fire it now
+  GET    /schedules/{id}/runs                 → recorded outcomes, newest first
+  GET    /schedules/{id}/runs/{run_id}        → one outcome, with its event stream
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .. import config
+from .runs import RunStore
 from .scheduler import Scheduler
 from .schedules import (
     Schedule,
@@ -102,6 +105,7 @@ def create_app(
     workspace_root: Path | None = None,
     reap: bool = True,
     schedules_path: Path | None = None,
+    runs_dir: Path | None = None,
     run_scheduler: bool | None = None,
 ) -> FastAPI:
     """Build the agent server app.
@@ -111,16 +115,17 @@ def create_app(
     that emits scripted events so the whole HTTP + SSE + approval flow runs with
     no model calls. Nothing here touches the network or spawns a task at build
     time — the idle reaper and the scheduler start under the app lifespan.
-    ``schedules_path`` is where schedules persist (tests point it at a tmp
-    file); ``run_scheduler=False`` keeps the tick loop off so tests drive
-    ``app.state.scheduler.tick(now)`` by hand.
+    ``schedules_path`` is where schedules persist and ``runs_dir`` where run
+    outcomes go (tests point both at tmp); ``run_scheduler=False`` keeps the
+    tick loop off so tests drive ``app.state.scheduler.tick(now)`` by hand.
     """
     manager = SessionManager(session_factory=session_factory)
     root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
     ui_html = _load_ui()
     auth_limiter = AttemptLimiter(config.AGENT_AUTH_MAX_ATTEMPTS, config.AGENT_AUTH_WINDOW)
     store = ScheduleStore(schedules_path)
-    scheduler = Scheduler(store, manager, workspace_root=root)
+    runs = RunStore(runs_dir)
+    scheduler = Scheduler(store, manager, workspace_root=root, runs=runs)
     tick = config.AGENT_SCHEDULER if run_scheduler is None else run_scheduler
 
     @asynccontextmanager
@@ -139,6 +144,8 @@ def create_app(
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
+            # In-flight run recorders write an `interrupted` outcome.
+            await scheduler.aclose()
             # Every session owns a ClaudeSDKClient subprocess; shutting the
             # server down must not orphan them.
             await manager.aclose()
@@ -148,6 +155,7 @@ def create_app(
     app.state.workspace_root = root
     app.state.schedules = store
     app.state.scheduler = scheduler
+    app.state.runs = runs
 
     def _authenticated(request: Request) -> bool:
         return token_matches(
@@ -392,6 +400,7 @@ def create_app(
     async def delete_schedule(schedule_id: str) -> dict[str, Any]:
         if not store.remove(schedule_id):
             raise HTTPException(status_code=404, detail="unknown schedule")
+        runs.remove_all(schedule_id)
         return {"removed": True}
 
     @app.post("/schedules/{schedule_id}/run", dependencies=mutate)
@@ -399,6 +408,20 @@ def create_app(
         schedule = _schedule_or_404(schedule_id)
         status = await scheduler.fire(schedule)
         return {"status": status, "session_id": schedule.session_id, "schedule": schedule.to_dict()}
+
+    @app.get("/schedules/{schedule_id}/runs", dependencies=auth)
+    async def list_runs(schedule_id: str, limit: int = 20) -> dict[str, Any]:
+        _schedule_or_404(schedule_id)
+        limit = max(1, min(limit, config.AGENT_RUN_HISTORY or limit))
+        return {"runs": [r.to_dict() for r in runs.list(schedule_id, limit)]}
+
+    @app.get("/schedules/{schedule_id}/runs/{run_id}", dependencies=auth)
+    async def get_run(schedule_id: str, run_id: str) -> dict[str, Any]:
+        _schedule_or_404(schedule_id)
+        rec = runs.get(schedule_id, run_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        return rec.to_dict(with_events=True)
 
     return app
 

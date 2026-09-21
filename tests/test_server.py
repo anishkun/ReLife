@@ -305,6 +305,7 @@ def http(tmp_path):
             token=token,
             session_factory=factory,
             schedules_path=tmp_path / "schedules.json",
+            runs_dir=tmp_path / "runs",
             run_scheduler=False,
         )
         return TestClient(app), created

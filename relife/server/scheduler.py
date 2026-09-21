@@ -1,4 +1,4 @@
-"""The scheduler: fires due schedules into agent sessions.
+"""The scheduler: fires due schedules into agent sessions and records outcomes.
 
 Runs as one background task under the app lifespan (like the idle reaper) and
 ticks every ``AGENT_SCHEDULER_TICK`` seconds. A firing is just a *turn
@@ -8,6 +8,14 @@ reaper closes it), so a scheduled run streams, journals and asks for approvals
 exactly like a turn typed in the console — the UI can attach to it with
 "watch". Nobody watching means an ask-case times out to **deny**, the same safe
 default as the non-interactive CLI; the prompt tells the agent so.
+
+Because nobody is watching, the run must also *deliver* unattended: for each
+firing a **recorder** subscribes to the session for exactly that turn (from
+its ``user`` echo to ``result``/``error``) and persists a
+:class:`~.runs.RunRecord` — closing summary, tool count, cost, every approval
+denied in absentia, the events — then upgrades the schedule's history entry
+from ``submitted`` to the real outcome. The session's ring buffer is thus
+never the only copy of what a scheduled run did.
 
 Policy, all deterministic and unit-tested with a fake manager:
   * due = ``enabled and next_run_at <= now``; after any attempt the schedule
@@ -28,9 +36,10 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from .runs import RunRecord, RunStore
 from .schedules import Schedule, ScheduleStore
 from .security import resolve_workspace
-from .session import SessionLimitReached, SessionManager, TurnQueueFull
+from .session import SessionLimitReached, SessionManager, TooManySubscribers, TurnQueueFull
 
 
 def scheduled_prompt(schedule: Schedule) -> str:
@@ -54,11 +63,16 @@ class Scheduler:
         *,
         workspace_root: Path | None = None,
         tick: float | None = None,
+        runs: RunStore | None = None,
+        run_timeout: float | None = None,
     ) -> None:
         self.store = store
         self.manager = manager
+        self.runs = runs if runs is not None else RunStore()
         self.root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
         self.tick_seconds = config.AGENT_SCHEDULER_TICK if tick is None else tick
+        self.run_timeout = config.AGENT_SCHEDULE_RUN_TIMEOUT if run_timeout is None else run_timeout
+        self._recorders: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         """Background loop: tick forever. Upkeep must never kill the server."""
@@ -70,6 +84,18 @@ class Scheduler:
                 raise
             except Exception:  # noqa: BLE001
                 pass
+
+    async def aclose(self) -> None:
+        """Stop in-flight recorders (each writes an ``interrupted`` record)."""
+        await asyncio.sleep(0)  # a recorder created this tick must start before it can be cancelled
+        for t in list(self._recorders):
+            t.cancel()
+        for t in list(self._recorders):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._recorders.clear()
 
     async def tick(self, now: float | None = None) -> list[str]:
         """Fire every due schedule once. Returns the ids fired."""
@@ -83,12 +109,13 @@ class Scheduler:
     async def fire(self, schedule: Schedule, *, now: float | None = None) -> str:
         """Run one schedule now (due or not) and record the outcome."""
         t = time.time() if now is None else now
-        status = await self._submit(schedule)
-        schedule.record_run(t, status)
+        run_id = RunRecord.new_id(t)
+        status = await self._submit(schedule, run_id, t)
+        schedule.record_run(t, status, run_id=run_id if status == "submitted" else None)
         self.store.save()
         return status
 
-    async def _submit(self, schedule: Schedule) -> str:
+    async def _submit(self, schedule: Schedule, run_id: str, now: float) -> str:
         session: Any = self.manager.get(schedule.session_id) if schedule.session_id else None
         if session is not None and getattr(session, "busy", False):
             return "skipped: previous run still in progress"
@@ -105,8 +132,83 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - a bad workspace/subprocess must not kill the tick
                 return f"error: {e}"
             schedule.session_id = session.id
+        prompt = scheduled_prompt(schedule)
+        # Subscribe *before* submitting so the turn's first event can't be missed.
         try:
-            await session.submit(scheduled_prompt(schedule))
+            queue, _backlog = session.subscribe()
+        except TooManySubscribers:
+            queue = None
+        try:
+            await session.submit(prompt)
         except TurnQueueFull as e:
+            if queue is not None:
+                session.unsubscribe(queue)
             return f"skipped: {e}"
+        if queue is not None:
+            record = RunRecord(
+                schedule_id=schedule.id, run_id=run_id, started_at=now, session_id=session.id
+            )
+            task = asyncio.create_task(self._record(schedule, record, session, queue, prompt))
+            self._recorders.add(task)
+            task.add_done_callback(self._recorders.discard)
         return "submitted"
+
+    async def _record(
+        self, schedule: Schedule, record: RunRecord, session: Any, queue: asyncio.Queue, prompt: str
+    ) -> None:
+        """Collect exactly this turn's events, then persist the outcome."""
+        events: list[dict[str, Any]] = []
+        started = False
+        status = "timeout"
+        deadline = time.monotonic() + self.run_timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    _sid, ev = await asyncio.wait_for(queue.get(), remaining)
+                except asyncio.TimeoutError:
+                    break
+                if not started:
+                    # The session echoes the turn as a `user` event when it
+                    # dequeues it; anything before that belongs to another turn.
+                    if ev.get("type") == "user" and ev.get("text") == prompt:
+                        started = True
+                        events.append(ev)
+                    continue
+                events.append(ev)
+                if ev.get("type") == "result":
+                    status = "done"
+                    break
+                if ev.get("type") == "error":
+                    status = "error"
+                    break
+        except asyncio.CancelledError:
+            status = "interrupted"
+            self._finish(schedule, record, status, events)
+            raise
+        finally:
+            session.unsubscribe(queue)
+        self._finish(schedule, record, status, events)
+
+    def _finish(
+        self, schedule: Schedule, record: RunRecord, status: str, events: list[dict[str, Any]]
+    ) -> None:
+        record.finish(status, events)
+        try:
+            self.runs.save(record)
+        except OSError:  # pragma: no cover - a full disk must not crash the loop
+            pass
+        fields: dict[str, Any] = {"status": status, "tool_calls": record.tool_calls}
+        if record.cost_usd is not None:
+            fields["cost_usd"] = record.cost_usd
+        if record.denied:
+            fields["denied"] = len(record.denied)
+        if record.summary:
+            fields["summary"] = record.summary[:200]
+        schedule.update_run(record.run_id, **fields)
+        try:
+            self.store.save()
+        except OSError:  # pragma: no cover
+            pass

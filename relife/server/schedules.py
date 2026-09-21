@@ -185,14 +185,35 @@ class Schedule:
     def is_due(self, now: float) -> bool:
         return self.enabled and self.next_run_at <= now
 
-    def record_run(self, now: float, status: str, *, keep: int | None = None) -> None:
-        """Note an attempt (fired, skipped, failed) and advance to the next slot."""
+    def record_run(
+        self, now: float, status: str, *, run_id: str | None = None, keep: int | None = None
+    ) -> None:
+        """Note an attempt (fired, skipped, failed) and advance to the next slot.
+
+        ``run_id`` links the entry to its durable :class:`~.runs.RunRecord`; the
+        recorder later upgrades the entry's ``status`` from ``submitted`` to the
+        real outcome via :meth:`update_run`.
+        """
         limit = config.AGENT_SCHEDULE_HISTORY if keep is None else keep
         self.last_run_at = now
         self.last_status = status
-        self.runs.append({"at": now, "status": status})
+        entry: dict[str, Any] = {"at": now, "status": status}
+        if run_id:
+            entry["run_id"] = run_id
+        self.runs.append(entry)
         del self.runs[:-limit]
         self.next_run_at = next_run(self.spec, now)
+
+    def update_run(self, run_id: str, **fields: Any) -> bool:
+        """Patch the history entry for ``run_id`` (and ``last_status`` if it's
+        the latest). False if the entry has already aged out of the history."""
+        for entry in reversed(self.runs):
+            if entry.get("run_id") == run_id:
+                entry.update(fields)
+                if entry is self.runs[-1] and "status" in fields:
+                    self.last_status = fields["status"]
+                return True
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

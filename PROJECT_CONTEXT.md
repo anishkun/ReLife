@@ -133,7 +133,8 @@ relife/
     app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
     security.py             # pure auth/CSRF/bind/workspace-confinement policy
     schedules.py            # Schedule record, spec parsing, next_run(), JSON ScheduleStore
-    scheduler.py            # lifespan tick loop: fire due schedules into sessions
+    scheduler.py            # lifespan tick loop: fire due schedules into sessions + record outcomes
+    runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
     agents.py               # `builder` subagent definition (Task-delegated milestones)
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
@@ -411,7 +412,22 @@ relife chat
   console attached and streamed the run; the lifespan tick then fired the next slot on its
   own. 232 tests green (was 206): cadence math at fixed instants, scheduler policy against a
   fake manager, the routes over `TestClient` (`run_scheduler=False`, tmp store).
-- **Phase 3 (next):** async
+- **MVP pass 6 — scheduled runs deliver unattended — ✅ DONE (this phase).** The scheduler
+  exposed the gap it created: a 09:00 run fired with nobody watching left its transcript
+  only in the session ring buffer, which the idle reaper wiped an hour later — the panel
+  said `submitted` (= queued) and nothing else. Now `relife/server/runs.py` holds a durable
+  `RunRecord` per firing (closing summary, tool count, cost, **every approval denied because
+  no one was there**, the event stream) under `data/runs/<schedule>/`, written by a recorder
+  task that subscribes to the session *before* the turn is submitted and takes exactly that
+  turn (matched by the `user` echo; a turn the user typed into the same session is ignored),
+  ending on `result`/`error`, a run timeout, or shutdown (`interrupted`). The schedule's inline
+  history entry is upgraded in place from `submitted` to the outcome. Routes
+  `GET /schedules/{id}/runs[/{run_id}]`; the panel shows the last summary on the card and a
+  per-run list with a "needed you — denied unattended" block. Browser smoke with a scripted
+  session that hits a denied approval: card read `done · 1 tool · $0.010 · 1 denied` with the
+  agent's closing note and the exact `gh pr create` it could not run. 239 tests (was 232).
+- **Phase 3 (next):** a pre-authorized outward allowlist per schedule (so an unattended run
+  can e.g. send *to me* without a human at the card — a deliberate policy widening); async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call
   in http mode); outward capabilities

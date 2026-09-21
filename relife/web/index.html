@@ -151,7 +151,24 @@
   .sched .meta { font-family: var(--mono); font-size: 11px; color: var(--faint); }
   .sched .meta .bad { color: var(--red); }
   .sched .meta .ok { color: var(--green); }
+  .sched .outcome { font-size: 12.5px; color: var(--text); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; white-space: pre-wrap;
+    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
   .sched .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .sched .acts button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+  .runs { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .runs[hidden] { display: none; }
+  .run { border-top: 1px solid var(--line); padding-top: 6px; }
+  .run .line { font-family: var(--mono); font-size: 11px; color: var(--faint); cursor: pointer; }
+  .run .line .st { font-weight: 600; }
+  .run .line .st.done { color: var(--green); }
+  .run .line .st.bad { color: var(--red); }
+  .run .line .st.amber { color: var(--amber); }
+  .run .detail { margin-top: 4px; font-size: 12.5px; white-space: pre-wrap; }
+  .run .detail[hidden] { display: none; }
+  .run .denied { margin-top: 6px; border-left: 2px solid var(--amber); padding-left: 8px; }
+  .run .denied .label { color: var(--amber); display: block; margin-bottom: 2px; }
+  .run .denied code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); display: block; }
   .sched .acts button, .addform button, .schedules .newsession {
     font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
     color: var(--muted); background: transparent; border: 1px solid var(--line);
@@ -626,26 +643,77 @@
     for (const sc of items) {
       const el = document.createElement("div");
       el.className = "sched" + (sc.enabled ? "" : " paused");
+      const lastRun = sc.runs && sc.runs.length ? sc.runs[sc.runs.length - 1] : null;
       const last = sc.last_status
-        ? `<span class="${sc.last_status === "submitted" ? "ok" : "bad"}">${esc(sc.last_status)}</span> ${esc(rel(sc.last_run_at))}`
+        ? `<span class="${statusClass(sc.last_status)}">${esc(sc.last_status)}</span> ${esc(rel(sc.last_run_at))}${runFacts(lastRun)}`
         : "never run";
+      const outcome = lastRun && lastRun.summary ? `<div class="outcome" title="last run's closing summary">${esc(lastRun.summary)}</div>` : "";
       el.innerHTML = `
         <div class="top"><span class="name">${esc(sc.name)}</span><span class="cadence">${esc(sc.spec_text)}</span></div>
         <div class="task">${esc(sc.task)}</div>
         <div class="meta">${sc.enabled ? "next " + esc(rel(sc.next_run_at)) : "paused"} · last: ${last}</div>
+        ${outcome}
         <div class="acts">
           <button type="button" data-act="watch" ${sc.session_id ? "" : "disabled"} title="Attach the console to this schedule's session">watch</button>
           <button type="button" data-act="run" title="Fire it now">run now</button>
+          <button type="button" data-act="runs" aria-pressed="false" title="What each recorded run did">runs</button>
           <button type="button" data-act="toggle">${sc.enabled ? "pause" : "resume"}</button>
           <button type="button" class="danger" data-act="delete">delete</button>
-        </div>`;
+        </div>
+        <div class="runs" hidden></div>`;
       el.querySelectorAll("button[data-act]").forEach(b => b.onclick = () => scheduleAction(sc, b.dataset.act, b));
+      if (openRuns.has(sc.id)) showRuns(sc, el.querySelector("button[data-act=runs]"), true);
       schedList.appendChild(el);
+    }
+  }
+
+  // Outcome rendering. `submitted` only means the turn was queued; the recorder
+  // upgrades it to done/error/timeout once the run ends, and a scheduled run
+  // that needed an approval nobody was there to give shows a denied count.
+  const openRuns = new Set();
+  const statusClass = (st) => st === "done" ? "ok" : st === "submitted" ? "" : /^skipped/.test(st) ? "" : "bad";
+  const money = (c) => c ? ` · $${Number(c).toFixed(3)}` : "";
+  function runFacts(r) {
+    if (!r || r.status === "submitted" || r.tool_calls == null) return "";
+    const denied = r.denied ? ` · <span class="bad">${r.denied} denied</span>` : "";
+    return ` · ${r.tool_calls} tool${r.tool_calls === 1 ? "" : "s"}${esc(money(r.cost_usd))}${denied}`;
+  }
+
+  async function showRuns(sc, btn, open) {
+    const card = btn.closest(".sched");
+    const box = card.querySelector(".runs");
+    if (!open) { box.hidden = true; btn.setAttribute("aria-pressed", "false"); openRuns.delete(sc.id); return; }
+    openRuns.add(sc.id);
+    btn.setAttribute("aria-pressed", "true");
+    box.hidden = false;
+    box.innerHTML = `<p class="note">loading…</p>`;
+    let runs = [];
+    try {
+      const r = await fetch(`/schedules/${sc.id}/runs?limit=10`);
+      if (r.ok) runs = (await r.json()).runs;
+    } catch (_) {}
+    box.innerHTML = runs.length ? "" : `<p class="note">No recorded runs yet.</p>`;
+    for (const run of runs) {
+      const el = document.createElement("div");
+      el.className = "run";
+      const cls = run.status === "done" ? "done" : run.status === "running" ? "amber" : "bad";
+      // `.detail` is pre-wrap: keep this markup free of stray newlines/indentation.
+      const denied = run.denied.length
+        ? `<div class="denied"><span class="label">needed you — denied unattended</span>` +
+          run.denied.map(d => `<code>${esc(d.tool)} ${esc(d.brief)}</code>`).join("") + `</div>`
+        : "";
+      const tools = `${run.tool_calls} tool${run.tool_calls === 1 ? "" : "s"}`;
+      el.innerHTML = `
+        <div class="line"><span class="st ${cls}">${esc(run.status)}</span> · ${esc(rel(run.started_at))} · ${tools}${esc(money(run.cost_usd))}${run.denied.length ? ` · <span class="st bad">${run.denied.length} denied</span>` : ""}</div>
+        <div class="detail" hidden>${esc(run.summary || run.error || "(no closing summary)")}${denied}</div>`;
+      el.querySelector(".line").onclick = () => { const d = el.querySelector(".detail"); d.hidden = !d.hidden; };
+      box.appendChild(el);
     }
   }
 
   async function scheduleAction(sc, act, btn) {
     if (act === "watch") { await watchSession(sc.session_id); return; }
+    if (act === "runs") { await showRuns(sc, btn, btn.getAttribute("aria-pressed") !== "true"); return; }
     if (act === "delete" && btn.dataset.armed !== "1") {
       btn.dataset.armed = "1"; btn.textContent = "sure?";
       setTimeout(() => { btn.dataset.armed = ""; btn.textContent = "delete"; }, 3000);
@@ -690,7 +758,7 @@
     schedulesPanel.hidden = !show;
     schedulesBtn.setAttribute("aria-pressed", String(show));
     if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
-    if (show) { loadSchedules(); schedTimer = setInterval(loadSchedules, 30000); }
+    if (show) { loadSchedules(); schedTimer = setInterval(loadSchedules, 15000); }
   }
   schedulesBtn.addEventListener("click", () => toggleSchedules());
   schKind.addEventListener("change", () => {

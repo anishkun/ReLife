@@ -185,8 +185,16 @@ AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
 # Floor on the interval form ("every 30m"): every run spends Max budget, so a
 # one-minute schedule is a mistake to refuse, not a wish to honour.
 AGENT_SCHEDULE_MIN_INTERVAL = float(os.environ.get("RELIFE_AGENT_SCHEDULE_MIN_INTERVAL", "300"))
-AGENT_SCHEDULE_HISTORY = 10          # run outcomes kept per schedule
+AGENT_SCHEDULE_HISTORY = 10          # run entries kept inline on the schedule record
 AGENT_SCHEDULES_PATH = DATA_DIR / "schedules.json"
+# Durable outcome of each scheduled run (closing summary, tool count, cost,
+# approvals denied unattended, the event stream) — the session it ran in is
+# reaped an hour later, so this is the copy the user actually reads.
+AGENT_RUNS_DIR = DATA_DIR / "runs"
+AGENT_RUN_HISTORY = int(os.environ.get("RELIFE_AGENT_RUN_HISTORY", "50"))   # records kept per schedule
+# A scheduled run still streaming after this long is recorded as `timeout`
+# (the recorder stops waiting; the agent itself is not killed).
+AGENT_SCHEDULE_RUN_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SCHEDULE_RUN_TIMEOUT", "7200"))
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
