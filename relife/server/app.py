@@ -17,7 +17,13 @@ Security posture (every policy decision is a pure function in ``security.py``):
     unconstrained path in the request body would let the caller choose the
     auto-allow blast radius;
   * ``serve()`` refuses a non-loopback bind without a token (fail closed);
-  * sessions, queued turns, event streams, and message size are all bounded.
+  * sessions, queued turns, event streams, message size — and schedules — are
+    all bounded.
+
+Schedules (autonomous triggers) live in ``schedules.py``/``scheduler.py``: a
+background task under the lifespan fires each due schedule as a turn in its own
+session, so an unattended run goes through the very same approval path (and
+times out to deny when no one is watching).
 
 Endpoints:
   GET    /                                    → the self-contained web UI
@@ -31,12 +37,19 @@ Endpoints:
   POST   /sessions/{id}/messages              → submit a turn
   GET    /sessions/{id}/events                → SSE stream of agent events
   POST   /sessions/{id}/approvals/{approval}  → resolve an approval (allow|deny)
+  GET    /schedules                           → list schedules
+  POST   /schedules                           → create one → the record
+  GET    /schedules/{id}                      → one schedule
+  PATCH  /schedules/{id}                      → edit / enable / disable
+  DELETE /schedules/{id}                      → remove
+  POST   /schedules/{id}/run                  → fire it now
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -45,6 +58,15 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .. import config
+from .scheduler import Scheduler
+from .schedules import (
+    Schedule,
+    ScheduleStore,
+    next_run,
+    normalize_spec,
+    validate_name,
+    validate_task,
+)
 from .security import (
     AttemptLimiter,
     guard_bind,
@@ -79,6 +101,8 @@ def create_app(
     session_factory: SessionFactory | None = None,
     workspace_root: Path | None = None,
     reap: bool = True,
+    schedules_path: Path | None = None,
+    run_scheduler: bool | None = None,
 ) -> FastAPI:
     """Build the agent server app.
 
@@ -86,23 +110,33 @@ def create_app(
     default creates real (model-backed) sessions. Tests inject a fake factory
     that emits scripted events so the whole HTTP + SSE + approval flow runs with
     no model calls. Nothing here touches the network or spawns a task at build
-    time — the idle reaper starts under the app lifespan.
+    time — the idle reaper and the scheduler start under the app lifespan.
+    ``schedules_path`` is where schedules persist (tests point it at a tmp
+    file); ``run_scheduler=False`` keeps the tick loop off so tests drive
+    ``app.state.scheduler.tick(now)`` by hand.
     """
     manager = SessionManager(session_factory=session_factory)
     root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
     ui_html = _load_ui()
     auth_limiter = AttemptLimiter(config.AGENT_AUTH_MAX_ATTEMPTS, config.AGENT_AUTH_WINDOW)
+    store = ScheduleStore(schedules_path)
+    scheduler = Scheduler(store, manager, workspace_root=root)
+    tick = config.AGENT_SCHEDULER if run_scheduler is None else run_scheduler
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        reaper = asyncio.create_task(manager.run_reaper()) if reap else None
+        tasks = []
+        if reap:
+            tasks.append(asyncio.create_task(manager.run_reaper()))
+        if tick:
+            tasks.append(asyncio.create_task(scheduler.run()))
         try:
             yield
         finally:
-            if reaper is not None:
-                reaper.cancel()
+            for t in tasks:
+                t.cancel()
                 try:
-                    await reaper
+                    await t
                 except (asyncio.CancelledError, Exception):
                     pass
             # Every session owns a ClaudeSDKClient subprocess; shutting the
@@ -112,6 +146,8 @@ def create_app(
     app = FastAPI(title="ReLife agent server", version="0.1.0", lifespan=lifespan)
     app.state.manager = manager
     app.state.workspace_root = root
+    app.state.schedules = store
+    app.state.scheduler = scheduler
 
     def _authenticated(request: Request) -> bool:
         return token_matches(
@@ -147,7 +183,12 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "sessions": manager.count(), "auth_required": token is not None}
+        return {
+            "status": "ok",
+            "sessions": manager.count(),
+            "schedules": store.count(),
+            "auth_required": token is not None,
+        }
 
     # --- auth ---------------------------------------------------------------
     @app.get("/auth/status")
@@ -272,6 +313,92 @@ def create_app(
                 manager.touch(session)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
+
+    # --- schedules ----------------------------------------------------------
+    def _schedule_or_404(schedule_id: str) -> Schedule:
+        schedule = store.get(schedule_id)
+        if schedule is None:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        return schedule
+
+    def _spec_from(body: dict[str, Any]) -> dict[str, Any] | None:
+        """Accept the spec nested (``{"spec": {...}}``) or flat (``every``/``at``/``days``)."""
+        if isinstance(body.get("spec"), dict):
+            return body["spec"]
+        flat = {k: body[k] for k in ("every", "at", "days") if k in body}
+        return flat or None
+
+    def _check_workspace(raw: Any) -> str:
+        # Same containment as POST /sessions: a schedule's workspace is where the
+        # permission policy auto-allows writes, so it must live under the root.
+        try:
+            resolve_workspace(raw, root)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return str(raw or "").strip()
+
+    @app.get("/schedules", dependencies=auth)
+    async def list_schedules() -> dict[str, Any]:
+        return {"schedules": [s.to_dict() for s in store.list()]}
+
+    @app.post("/schedules", dependencies=mutate, status_code=201)
+    async def create_schedule(body: dict[str, Any]) -> dict[str, Any]:
+        if config.AGENT_MAX_SCHEDULES and store.count() >= config.AGENT_MAX_SCHEDULES:
+            raise HTTPException(
+                status_code=429,
+                detail=f"at most {config.AGENT_MAX_SCHEDULES} schedules "
+                "(remove one, or raise RELIFE_AGENT_MAX_SCHEDULES)",
+            )
+        ws = _check_workspace(body.get("workspace"))
+        try:
+            schedule = Schedule.new(
+                name=body.get("name"),
+                task=body.get("task"),
+                spec=_spec_from(body),
+                workspace=ws,
+                enabled=body.get("enabled", True),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        store.add(schedule)
+        return schedule.to_dict()
+
+    @app.get("/schedules/{schedule_id}", dependencies=auth)
+    async def get_schedule(schedule_id: str) -> dict[str, Any]:
+        return _schedule_or_404(schedule_id).to_dict()
+
+    @app.patch("/schedules/{schedule_id}", dependencies=mutate)
+    async def update_schedule(schedule_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        schedule = _schedule_or_404(schedule_id)
+        try:
+            if "name" in body:
+                schedule.name = validate_name(body["name"])
+            if "task" in body:
+                schedule.task = validate_task(body["task"])
+            if "workspace" in body:
+                schedule.workspace = _check_workspace(body["workspace"])
+            spec = _spec_from(body)
+            if spec is not None:
+                schedule.spec = normalize_spec(spec)
+                schedule.next_run_at = next_run(schedule.spec, time.time())
+            if "enabled" in body:
+                schedule.enabled = bool(body["enabled"])
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        store.save()
+        return schedule.to_dict()
+
+    @app.delete("/schedules/{schedule_id}", dependencies=mutate)
+    async def delete_schedule(schedule_id: str) -> dict[str, Any]:
+        if not store.remove(schedule_id):
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        return {"removed": True}
+
+    @app.post("/schedules/{schedule_id}/run", dependencies=mutate)
+    async def run_schedule(schedule_id: str) -> dict[str, Any]:
+        schedule = _schedule_or_404(schedule_id)
+        status = await scheduler.fire(schedule)
+        return {"status": status, "session_id": schedule.session_id, "schedule": schedule.to_dict()}
 
     return app
 

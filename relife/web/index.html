@@ -51,10 +51,12 @@
     color: var(--muted); background: transparent; border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 10px; cursor: pointer; }
   .newsession:hover { color: var(--text); border-color: var(--faint); }
+  .newsession[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(108,195,138,.5);} 70%{box-shadow:0 0 0 6px rgba(108,195,138,0);} 100%{box-shadow:0 0 0 0 rgba(108,195,138,0);} }
 
-  /* Transcript */
-  main { flex: 1; overflow-y: auto; }
+  /* Transcript (+ the schedules panel beside it) */
+  .body-row { flex: 1; display: flex; min-height: 0; }
+  main { flex: 1; overflow-y: auto; min-width: 0; }
   .stream {
     max-width: 860px; margin: 0 auto; padding: 26px 20px 40px;
     border-left: 1px solid var(--line);
@@ -129,6 +131,51 @@
   .send:disabled { opacity: .45; cursor: default; }
   .hint { max-width: 860px; margin: 8px auto 0; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
 
+  /* Schedules panel — autonomous triggers, managed beside the transcript */
+  aside.schedules { width: min(380px, 100%); border-left: 1px solid var(--line);
+    background: var(--surface); overflow-y: auto; padding: 18px 18px 30px;
+    display: flex; flex-direction: column; gap: 16px; }
+  aside.schedules[hidden] { display: none; }
+  @media (max-width: 760px) { aside.schedules { position: fixed; inset: 57px 0 0 0; width: 100%; z-index: 20; } }
+  .schedules h2 { margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
+    font-family: var(--mono); color: var(--muted); font-weight: 600; }
+  .schedules .note { color: var(--faint); font-size: 12px; margin: 0; }
+  .sched { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    background: var(--surface-2); display: flex; flex-direction: column; gap: 4px; }
+  .sched.paused { opacity: .6; }
+  .sched .top { display: flex; align-items: baseline; gap: 8px; }
+  .sched .name { font-weight: 600; }
+  .sched .cadence { font-family: var(--mono); font-size: 11.5px; color: var(--accent); margin-left: auto; white-space: nowrap; }
+  .sched .task { font-size: 13px; color: var(--muted); white-space: pre-wrap;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .sched .meta { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .sched .meta .bad { color: var(--red); }
+  .sched .meta .ok { color: var(--green); }
+  .sched .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .sched .acts button, .addform button, .schedules .newsession {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+    color: var(--muted); background: transparent; border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 9px; cursor: pointer; }
+  .sched .acts button:hover, .addform button:hover { color: var(--text); border-color: var(--faint); }
+  .sched .acts button.danger:hover { color: var(--red); border-color: var(--red); }
+  .sched .acts button:disabled { opacity: .5; cursor: default; }
+  .addform { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 14px; }
+  .addform input, .addform textarea, .addform select {
+    font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%; }
+  .addform textarea { resize: vertical; min-height: 64px; }
+  .addform .split { display: flex; gap: 8px; }
+  .addform .split > * { flex: 1; min-width: 0; }
+  .addform .days { display: flex; gap: 4px; flex-wrap: wrap; }
+  .addform .days[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
+  .addform .days label { font-family: var(--mono); font-size: 11px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 5px; padding: 3px 7px; cursor: pointer; user-select: none; }
+  .addform .days input { display: none; }
+  .addform .days input:checked + span { color: var(--accent); }
+  .addform .days label:has(input:checked) { border-color: var(--accent); }
+  .addform button.primary { color: #06121f; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .addform .err { color: var(--red); font-size: 12px; min-height: 14px; font-family: var(--mono); }
+
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
 
   /* Auth gate */
@@ -156,9 +203,11 @@
     <span class="status" id="status" data-state="connecting">
       <span class="dot"></span><span id="statusText">connecting</span>
     </span>
+    <button class="newsession" id="schedulesBtn" type="button" aria-pressed="false" title="Tasks the agent runs on a schedule" hidden>schedules</button>
     <button class="newsession" id="newSession" type="button" title="Close this agent and start a fresh one" hidden>new session</button>
   </header>
 
+  <div class="body-row">
   <main id="main">
     <div class="stream" id="stream">
       <div class="empty" id="empty">
@@ -168,6 +217,37 @@
       </div>
     </div>
   </main>
+
+  <aside class="schedules" id="schedules" hidden>
+    <h2>Schedules</h2>
+    <p class="note">Each fires as a turn in its own session. If nobody is watching,
+       an action that needs approval is denied when the timer runs out.</p>
+    <div id="schedList"></div>
+    <form class="addform" id="addForm" autocomplete="off">
+      <input id="schName" placeholder="name (e.g. inbox triage)" maxlength="80" required />
+      <textarea id="schTask" placeholder="what should the agent do each time?" required></textarea>
+      <div class="split">
+        <select id="schKind">
+          <option value="every">every</option>
+          <option value="at">daily at</option>
+        </select>
+        <input id="schValue" placeholder="30m, 2h, 1d" required />
+      </div>
+      <div class="days" id="schDays" hidden>
+        <label><input type="checkbox" value="mon"><span>mon</span></label>
+        <label><input type="checkbox" value="tue"><span>tue</span></label>
+        <label><input type="checkbox" value="wed"><span>wed</span></label>
+        <label><input type="checkbox" value="thu"><span>thu</span></label>
+        <label><input type="checkbox" value="fri"><span>fri</span></label>
+        <label><input type="checkbox" value="sat"><span>sat</span></label>
+        <label><input type="checkbox" value="sun"><span>sun</span></label>
+      </div>
+      <input id="schWorkspace" placeholder="workspace subfolder (optional)" />
+      <div class="err" id="schErr"></div>
+      <button class="primary" type="submit">Add schedule</button>
+    </form>
+  </aside>
+  </div>
 
   <div class="gate" id="gate" hidden>
     <form id="gateForm" autocomplete="off">
@@ -206,6 +286,14 @@
   const gateErr = document.getElementById("gateErr");
 
   const newSessionBtn = document.getElementById("newSession");
+  const schedulesBtn = document.getElementById("schedulesBtn");
+  const schedulesPanel = document.getElementById("schedules");
+  const schedList = document.getElementById("schedList");
+  const addForm = document.getElementById("addForm");
+  const schKind = document.getElementById("schKind");
+  const schValue = document.getElementById("schValue");
+  const schDays = document.getElementById("schDays");
+  const schErr = document.getElementById("schErr");
 
   let sessionId = null;
   let source = null;
@@ -249,9 +337,16 @@
   function handle(ev) {
     if (ev.type !== "text") lastTextRow = null;
     switch (ev.type) {
-      case "user":
-        row("user", "›", esc(ev.text), { turn: true });
+      case "user": {
+        // A scheduled turn carries a long unattended-run preamble for the
+        // agent; the transcript shows the schedule's name and the task only.
+        const m = /^\[Scheduled run: ([^\]]*)\][\s\S]*?\n\n([\s\S]*)$/.exec(ev.text);
+        const body = m
+          ? `<span class="label" style="display:block;margin-bottom:2px">scheduled · ${esc(m[1])}</span>${esc(m[2])}`
+          : esc(ev.text);
+        row("user", m ? "⏱" : "›", body, { turn: true });
         break;
+      }
       case "text":
         if (lastTextRow) {
           lastTextRow.querySelector(".body").textContent += ev.text;
@@ -349,6 +444,7 @@
       setStatus("open", "connected");
       hint.textContent = `session ${sessionId.slice(0,8)}`;
       newSessionBtn.hidden = false;
+      schedulesBtn.hidden = false;
     };
     source.onerror = () => setStatus("connecting", "reconnecting");
     source.onmessage = (e) => {
@@ -496,6 +592,140 @@
       sendBtn.disabled = false; input.focus();
     }
   }
+
+  // --- schedules ----------------------------------------------------------
+  // Autonomous triggers. The panel is a thin view over /schedules; each
+  // schedule's run lands in its own session, which "watch" attaches this
+  // console to (the same reattach path a reload uses).
+  let schedTimer = null;
+  const rel = (epoch) => {
+    if (!epoch) return "—";
+    const d = epoch * 1000 - Date.now(), a = Math.abs(d);
+    const u = a < 60e3 ? [Math.round(a / 1e3), "s"] : a < 3600e3 ? [Math.round(a / 60e3), "m"]
+      : a < 86400e3 ? [Math.round(a / 3600e3), "h"] : [Math.round(a / 86400e3), "d"];
+    return d >= 0 ? `in ${u[0]}${u[1]}` : `${u[0]}${u[1]} ago`;
+  };
+
+  async function loadSchedules() {
+    try {
+      const r = await fetch("/schedules");
+      if (r.status === 401) { showGate("session expired — enter the token again"); return; }
+      if (!r.ok) throw new Error(await r.text());
+      renderSchedules((await r.json()).schedules);
+    } catch (e) {
+      schedList.innerHTML = `<p class="note">could not load schedules</p>`;
+    }
+  }
+
+  function renderSchedules(items) {
+    schedList.innerHTML = "";
+    if (!items.length) {
+      schedList.innerHTML = `<p class="note">No schedules yet.</p>`;
+      return;
+    }
+    for (const sc of items) {
+      const el = document.createElement("div");
+      el.className = "sched" + (sc.enabled ? "" : " paused");
+      const last = sc.last_status
+        ? `<span class="${sc.last_status === "submitted" ? "ok" : "bad"}">${esc(sc.last_status)}</span> ${esc(rel(sc.last_run_at))}`
+        : "never run";
+      el.innerHTML = `
+        <div class="top"><span class="name">${esc(sc.name)}</span><span class="cadence">${esc(sc.spec_text)}</span></div>
+        <div class="task">${esc(sc.task)}</div>
+        <div class="meta">${sc.enabled ? "next " + esc(rel(sc.next_run_at)) : "paused"} · last: ${last}</div>
+        <div class="acts">
+          <button type="button" data-act="watch" ${sc.session_id ? "" : "disabled"} title="Attach the console to this schedule's session">watch</button>
+          <button type="button" data-act="run" title="Fire it now">run now</button>
+          <button type="button" data-act="toggle">${sc.enabled ? "pause" : "resume"}</button>
+          <button type="button" class="danger" data-act="delete">delete</button>
+        </div>`;
+      el.querySelectorAll("button[data-act]").forEach(b => b.onclick = () => scheduleAction(sc, b.dataset.act, b));
+      schedList.appendChild(el);
+    }
+  }
+
+  async function scheduleAction(sc, act, btn) {
+    if (act === "watch") { await watchSession(sc.session_id); return; }
+    if (act === "delete" && btn.dataset.armed !== "1") {
+      btn.dataset.armed = "1"; btn.textContent = "sure?";
+      setTimeout(() => { btn.dataset.armed = ""; btn.textContent = "delete"; }, 3000);
+      return;
+    }
+    btn.disabled = true;
+    try {
+      let r;
+      if (act === "run") r = await fetch(`/schedules/${sc.id}/run`, { method: "POST" });
+      else if (act === "toggle") r = await fetch(`/schedules/${sc.id}`, {
+        method: "PATCH", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !sc.enabled }) });
+      else if (act === "delete") r = await fetch(`/schedules/${sc.id}`, { method: "DELETE" });
+      if (r && r.status === 401) { showGate("session expired — enter the token again"); return; }
+      if (act === "run" && r && r.ok) {
+        const body = await r.json();
+        hint.textContent = `schedule "${sc.name}": ${body.status}`;
+        if (body.status === "submitted" && body.session_id) await watchSession(body.session_id);
+      }
+    } catch (_) {}
+    await loadSchedules();
+  }
+
+  async function watchSession(id) {
+    /* Point the console at another live session (a schedule's). */
+    if (!id) return;
+    try {
+      const r = await fetch(`/sessions/${encodeURIComponent(id)}`);
+      if (!r.ok) { hint.textContent = "that schedule's session has ended (idle) — run it again to start one"; return; }
+    } catch (_) { return; }
+    if (id === sessionId) return;
+    disconnect();
+    sessionId = id;
+    remembered.set(id);
+    clearStream();
+    setStatus("connecting", "attaching");
+    connect({ replay: true });
+  }
+
+  function toggleSchedules(open) {
+    const show = open ?? schedulesPanel.hidden;
+    schedulesPanel.hidden = !show;
+    schedulesBtn.setAttribute("aria-pressed", String(show));
+    if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
+    if (show) { loadSchedules(); schedTimer = setInterval(loadSchedules, 30000); }
+  }
+  schedulesBtn.addEventListener("click", () => toggleSchedules());
+  schKind.addEventListener("change", () => {
+    const at = schKind.value === "at";
+    schDays.hidden = !at;
+    schValue.placeholder = at ? "09:00" : "30m, 2h, 1d";
+  });
+  addForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    schErr.textContent = "";
+    const body = {
+      name: document.getElementById("schName").value,
+      task: document.getElementById("schTask").value,
+      workspace: document.getElementById("schWorkspace").value,
+    };
+    if (schKind.value === "at") {
+      body.at = schValue.value;
+      body.days = [...schDays.querySelectorAll("input:checked")].map(i => i.value);
+    } else {
+      body.every = schValue.value;
+    }
+    try {
+      const r = await fetch("/schedules", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (r.status === 401) { showGate("session expired — enter the token again"); return; }
+      if (!r.ok) {
+        let msg = await r.text();
+        try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+        schErr.textContent = msg; return;
+      }
+      addForm.reset(); schDays.hidden = true; schValue.placeholder = "30m, 2h, 1d";
+      await loadSchedules();
+    } catch (_) {
+      schErr.textContent = "could not reach the server";
+    }
+  });
 
   function autosize() {
     input.style.height = "auto";

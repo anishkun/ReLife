@@ -315,7 +315,12 @@ def http(tmp_path):
 
     def make(token: str | None = None):
         app = create_app(
-            token=token, session_factory=factory, workspace_root=root, reap=False
+            token=token,
+            session_factory=factory,
+            workspace_root=root,
+            reap=False,
+            schedules_path=tmp_path / "schedules.json",
+            run_scheduler=False,
         )
         return TestClient(app), created, root
 

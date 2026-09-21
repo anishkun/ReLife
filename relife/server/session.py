@@ -122,6 +122,7 @@ class AgentSession:
         self._broker = ApprovalBroker(self._publish)
         self._client: ClaudeSDKClient | None = None
         self._worker: asyncio.Task[None] | None = None
+        self._turn_active = False
         self.last_active = time.monotonic()
 
     # --- lifecycle ----------------------------------------------------------
@@ -211,11 +212,18 @@ class AgentSession:
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
+    @property
+    def busy(self) -> bool:
+        """A turn is running or queued. The scheduler skips a slot rather than
+        stacking another turn behind one still in progress."""
+        return self._turn_active or not self._inbound.empty()
+
     # --- worker -------------------------------------------------------------
     async def _run(self) -> None:
         assert self._client is not None
         while True:
             turn = await self._inbound.get()
+            self._turn_active = True
             await self._publish({"type": "user", "text": turn})
             try:
                 await self._client.query(turn)
@@ -228,6 +236,7 @@ class AgentSession:
                 await self._publish({"type": "error", "message": str(e)})
                 continue
             finally:
+                self._turn_active = False
                 self.touch()
             # Brain upkeep after each completed turn (deterministic, fail-safe).
             # Off the loop: this process hosts every session's stream and every

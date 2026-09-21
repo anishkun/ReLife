@@ -287,7 +287,7 @@ class RecordingSession:
 
 
 @pytest.fixture
-def http():
+def http(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -301,7 +301,12 @@ def http():
         return s
 
     def make(token: str | None = None):
-        app = create_app(token=token, session_factory=factory)
+        app = create_app(
+            token=token,
+            session_factory=factory,
+            schedules_path=tmp_path / "schedules.json",
+            run_scheduler=False,
+        )
         return TestClient(app), created
 
     return make

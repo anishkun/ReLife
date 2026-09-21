@@ -175,6 +175,19 @@ AGENT_MAX_MESSAGE_CHARS = int(os.environ.get("RELIFE_AGENT_MAX_MESSAGE_CHARS", "
 AGENT_MAX_QUEUED_TURNS = int(os.environ.get("RELIFE_AGENT_MAX_QUEUED_TURNS", "8"))
 AGENT_MAX_SUBSCRIBERS = int(os.environ.get("RELIFE_AGENT_MAX_SUBSCRIBERS", "8"))
 
+# Scheduler (autonomous triggers on top of the agent server). A schedule is a
+# task text + cadence; the server fires it as a turn in a per-schedule session,
+# so it streams / journals / asks for approval like a typed turn — and, with no
+# one watching, an ask-case times out to deny (the CLI's non-interactive rule).
+AGENT_SCHEDULER = os.environ.get("RELIFE_AGENT_SCHEDULER", "1") != "0"
+AGENT_SCHEDULER_TICK = float(os.environ.get("RELIFE_AGENT_SCHEDULER_TICK", "30"))
+AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
+# Floor on the interval form ("every 30m"): every run spends Max budget, so a
+# one-minute schedule is a mistake to refuse, not a wish to honour.
+AGENT_SCHEDULE_MIN_INTERVAL = float(os.environ.get("RELIFE_AGENT_SCHEDULE_MIN_INTERVAL", "300"))
+AGENT_SCHEDULE_HISTORY = 10          # run outcomes kept per schedule
+AGENT_SCHEDULES_PATH = DATA_DIR / "schedules.json"
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 

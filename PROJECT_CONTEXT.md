@@ -128,6 +128,12 @@ relife/
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
     server.py               # relife_build MCP server (plan_set/milestone_update/status)
+  server/
+    session.py              # AgentSession (busy flag) / ApprovalBroker / SessionManager
+    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
+    security.py             # pure auth/CSRF/bind/workspace-confinement policy
+    schedules.py            # Schedule record, spec parsing, next_run(), JSON ScheduleStore
+    scheduler.py            # lifespan tick loop: fire due schedules into sessions
     agents.py               # `builder` subagent definition (Task-delegated milestones)
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
@@ -385,7 +391,27 @@ relife chat
   `AgentSession._run` with a one-turn fake client and a 0.3s fake pass: the pass ran on
   another thread and a 10ms ticker kept turning throughout (≥10 ticks), a silent pass
   publishes nothing, and the lock serializes concurrent callers. 206 tests green (was 203).
-- **Phase 3 (next):** scheduler / autonomous triggers on top of the agent server; async
+- **Scheduler / autonomous triggers — ✅ DONE (this phase).** The first thing built on top
+  of the hardened server: `relife/server/schedules.py` (pure cadence logic + `Schedule`
+  record + JSON-file `ScheduleStore` at `data/schedules.json`) and `scheduler.py` (one
+  lifespan task that fires each due schedule as a turn in a per-schedule `AgentSession`).
+  Design choices, each a deliberate answer to "what does unattended mean here": a run goes
+  through the **same** session/approval machinery as a typed turn, so with nobody watching
+  an outward action times out to deny (and the prompt tells the agent so); a slot missed
+  during downtime fires **once** (advance from now, never a catch-up burst); a session still
+  busy from the previous run **skips** the slot instead of queueing behind it; failures to
+  start are recorded in the schedule's bounded history and the schedule still advances; the
+  interval form is floored (`AGENT_SCHEDULE_MIN_INTERVAL`, 5 min) because every run spends
+  Max budget; workspaces are confined exactly like `POST /sessions`. Two spec forms:
+  `every: 30m|2h|1d` and `at: HH:MM` (+ weekdays) in local wall-clock time (DST-safe via
+  naive-local arithmetic). Routes `GET/POST /schedules`, `GET/PATCH/DELETE /schedules/{id}`,
+  `POST /schedules/{id}/run`; the web UI gained a schedules panel (add / pause / run now /
+  delete / **watch** = attach the console to the schedule's session). `AgentSession.busy` is
+  new. Smoke-tested in a real browser against a scripted fake session: add → run now →
+  console attached and streamed the run; the lifespan tick then fired the next slot on its
+  own. 232 tests green (was 206): cadence math at fixed instants, scheduler policy against a
+  fake manager, the routes over `TestClient` (`run_scheduler=False`, tmp store).
+- **Phase 3 (next):** async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call
   in http mode); outward capabilities
