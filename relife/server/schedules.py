@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..permissions import describe_grant, normalize_grants
 
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _EVERY_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$")
@@ -155,6 +156,9 @@ class Schedule:
     last_status: str | None = None
     session_id: str | None = None
     runs: list[dict[str, Any]] = field(default_factory=list)  # newest last, bounded
+    # Pre-authorized outward actions for this schedule's runs (see
+    # ``permissions.grant_allows``) — e.g. [{"kind": "email", "addresses": [me]}].
+    grants: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def new(
@@ -165,12 +169,14 @@ class Schedule:
         spec: dict[str, Any],
         workspace: str = "",
         enabled: bool = True,
+        grants: list[dict[str, Any]] | None = None,
         now: float | None = None,
     ) -> "Schedule":
         t = time.time() if now is None else now
         name = validate_name(name)
         task = validate_task(task)
         spec = normalize_spec(spec)
+        grants = normalize_grants(grants)
         return cls(
             id=uuid.uuid4().hex[:12],
             name=name,
@@ -180,6 +186,7 @@ class Schedule:
             enabled=bool(enabled),
             created_at=t,
             next_run_at=next_run(spec, t),
+            grants=grants,
         )
 
     def is_due(self, now: float) -> bool:
@@ -218,11 +225,16 @@ class Schedule:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["spec_text"] = describe_spec(self.spec)
+        d["grants_text"] = [describe_grant(g) for g in self.grants]
         return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Schedule":
         known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
+        try:
+            known["grants"] = normalize_grants(known.get("grants"))
+        except ValueError:
+            known["grants"] = []  # a hand-edited, invalid grant is dropped, never widened
         return cls(**known)
 
 

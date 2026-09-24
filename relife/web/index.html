@@ -87,6 +87,8 @@
     padding-left: 4px; }
   .done .body { color: var(--green); font-family: var(--mono); font-size: 13px; }
   .done .tick { color: var(--green); }
+  .auto .body { color: var(--green); font-family: var(--mono); font-size: 12px; padding-left: 4px; }
+  .auto .tick { color: var(--green); }
   .error .body { color: var(--red); font-family: var(--mono); font-size: 13px; }
   .error .tick { color: var(--red); }
 
@@ -169,6 +171,16 @@
   .run .denied { margin-top: 6px; border-left: 2px solid var(--amber); padding-left: 8px; }
   .run .denied .label { color: var(--amber); display: block; margin-bottom: 2px; }
   .run .denied code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); display: block; }
+  .run .acted { margin-top: 6px; border-left: 2px solid var(--green); padding-left: 8px; }
+  .run .acted .label { color: var(--green); display: block; margin-bottom: 2px; }
+  .run .acted code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); display: block; }
+  .sched .grants { font-family: var(--mono); font-size: 11px; color: var(--green); }
+  .addform fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px;
+    margin: 0; display: flex; flex-direction: column; gap: 6px; }
+  .addform legend { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 0 4px; }
+  .addform fieldset .note { font-size: 11.5px; }
+  .addform .check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+  .addform .check input { width: auto; accent-color: var(--accent); }
   .sched .acts button, .addform button, .schedules .newsession {
     font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
     color: var(--muted); background: transparent; border: 1px solid var(--line);
@@ -260,6 +272,12 @@
         <label><input type="checkbox" value="sun"><span>sun</span></label>
       </div>
       <input id="schWorkspace" placeholder="workspace subfolder (optional)" />
+      <fieldset>
+        <legend>pre-approve (optional)</legend>
+        <p class="note">Lets an unattended run act without a card — only for these addresses, at most a few times per run.</p>
+        <input id="schEmail" type="text" inputmode="email" placeholder="may email: me@example.com" />
+        <label class="check"><input id="schCal" type="checkbox" /> may add calendar events (guests only from the addresses above)</label>
+      </fieldset>
       <div class="err" id="schErr"></div>
       <button class="primary" type="submit">Add schedule</button>
     </form>
@@ -388,6 +406,10 @@
         break;
       case "approval_resolved":
         settleApproval(ev.approval_id, ev.approved);
+        break;
+      case "approval_auto":
+        // The tool_use line just above already shows the call; say which grant let it through.
+        row("auto", "✓", `pre-approved · ${esc(ev.grant)}`);
         break;
       case "result": {
         const cost = ev.cost_usd ? `  ·  usage-equiv $${Number(ev.cost_usd).toFixed(4)}` : "";
@@ -651,6 +673,7 @@
       el.innerHTML = `
         <div class="top"><span class="name">${esc(sc.name)}</span><span class="cadence">${esc(sc.spec_text)}</span></div>
         <div class="task">${esc(sc.task)}</div>
+        ${(sc.grants_text || []).length ? `<div class="grants" title="Pre-approved: runs may do this without asking">✓ may ${sc.grants_text.map(esc).join(" · ")}</div>` : ""}
         <div class="meta">${sc.enabled ? "next " + esc(rel(sc.next_run_at)) : "paused"} · last: ${last}</div>
         ${outcome}
         <div class="acts">
@@ -676,7 +699,8 @@
   function runFacts(r) {
     if (!r || r.status === "submitted" || r.tool_calls == null) return "";
     const denied = r.denied ? ` · <span class="bad">${r.denied} denied</span>` : "";
-    return ` · ${r.tool_calls} tool${r.tool_calls === 1 ? "" : "s"}${esc(money(r.cost_usd))}${denied}`;
+    const acted = r.acted ? ` · <span class="ok">${r.acted} pre-approved</span>` : "";
+    return ` · ${r.tool_calls} tool${r.tool_calls === 1 ? "" : "s"}${esc(money(r.cost_usd))}${acted}${denied}`;
   }
 
   async function showRuns(sc, btn, open) {
@@ -702,10 +726,15 @@
         ? `<div class="denied"><span class="label">needed you — denied unattended</span>` +
           run.denied.map(d => `<code>${esc(d.tool)} ${esc(d.brief)}</code>`).join("") + `</div>`
         : "";
+      const actedList = run.acted || [];
+      const acted = actedList.length
+        ? `<div class="acted"><span class="label">done for you — pre-approved</span>` +
+          actedList.map(a => `<code>${esc(a.tool)} ${esc(a.brief)}</code>`).join("") + `</div>`
+        : "";
       const tools = `${run.tool_calls} tool${run.tool_calls === 1 ? "" : "s"}`;
       el.innerHTML = `
-        <div class="line"><span class="st ${cls}">${esc(run.status)}</span> · ${esc(rel(run.started_at))} · ${tools}${esc(money(run.cost_usd))}${run.denied.length ? ` · <span class="st bad">${run.denied.length} denied</span>` : ""}</div>
-        <div class="detail" hidden>${esc(run.summary || run.error || "(no closing summary)")}${denied}</div>`;
+        <div class="line"><span class="st ${cls}">${esc(run.status)}</span> · ${esc(rel(run.started_at))} · ${tools}${esc(money(run.cost_usd))}${actedList.length ? ` · <span class="st done">${actedList.length} pre-approved</span>` : ""}${run.denied.length ? ` · <span class="st bad">${run.denied.length} denied</span>` : ""}</div>
+        <div class="detail" hidden>${esc(run.summary || run.error || "(no closing summary)")}${acted}${denied}</div>`;
       el.querySelector(".line").onclick = () => { const d = el.querySelector(".detail"); d.hidden = !d.hidden; };
       box.appendChild(el);
     }
@@ -774,6 +803,11 @@
       task: document.getElementById("schTask").value,
       workspace: document.getElementById("schWorkspace").value,
     };
+    const addrs = document.getElementById("schEmail").value.split(/[\s,;]+/).filter(Boolean);
+    const grants = [];
+    if (addrs.length) grants.push({ kind: "email", addresses: addrs });
+    if (document.getElementById("schCal").checked) grants.push({ kind: "calendar", addresses: addrs });
+    if (grants.length) body.grants = grants;
     if (schKind.value === "at") {
       body.at = schValue.value;
       body.days = [...schDays.querySelectorAll("input:checked")].map(i => i.value);

@@ -450,8 +450,24 @@ relife chat
   still goes out but records `submitted (unrecorded: …)` instead of a `submitted` no recorder
   would ever upgrade. (5) A `[tool.ruff]` baseline (`python -m ruff check relife tests scripts`,
   zero findings). 252 tests (was 248).
-- **Phase 3 (next):** a pre-authorized outward allowlist per schedule (so an unattended run
-  can e.g. send *to me* without a human at the card — a deliberate policy widening); async
+- **MVP pass 9 — schedule grants (pre-authorized outward actions) — ✅ DONE (this phase).** An
+  unattended run had no one at the approval card, so "summarize my inbox and email me" could
+  never finish. A schedule may now carry **grants**: `email` (Gmail send/reply/forward/draft) and
+  `calendar` (create-event), each bound to ≤5 listed addresses. Policy is pure and fail-closed in
+  `permissions.py` (`normalize_grants`/`grant_allows`): connector ask-cases only (never shell/file/
+  unknown tools), destructive ops excluded even if the op also matches, every address outside
+  free-text fields must be listed, a recipient field holding a non-address fails, and email needs
+  a visible recipient (thread-inferred reply / raw MIME ⇒ ask). Grants ride **one turn**
+  (`AgentSession.submit(text, grants=)`, so typing into the same session gets none), are capped
+  per run by `AGENT_GRANT_MAX_USES` (3; bounds a loop or a prompt-injected "mail me 50 times"),
+  and every use is an `approval_auto` event → the run record's `acted` list ("done for you —
+  pre-approved" in the UI). The scheduled preamble tells the agent what it may do. Schedules
+  accept `grants` on POST/PATCH; an invalid hand-edited grant is dropped on load, never widened.
+  UI: pre-approve fieldset on the add form, grants line on the card. 286 tests (was 252).
+  **Not yet exercised live** against the real Gmail/Calendar connectors — their input field
+  names aren't known here, so the recipient check is deliberately schema-agnostic; a first live
+  run may show a legitimate send falling back to ask (the safe direction).
+- **Phase 3 (next):** async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call
   in http mode); outward capabilities

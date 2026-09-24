@@ -308,6 +308,150 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
     return "ask", "unrecognized tool — approval required by default"
 
 
+# --- pre-authorized grants (scheduled runs) ---------------------------------
+# An unattended scheduled run has nobody at the approval card, so an ask-case
+# times out to deny — which makes "summarize my inbox and email me the digest"
+# impossible to finish. A schedule may therefore carry a few *grants*: narrow,
+# user-set pre-approvals that turn specific connector asks into allows.
+#
+# This is a deliberate policy widening, so it is kept pure and fail-closed:
+#   * grants only ever cover claude.ai connector actions — never the shell,
+#     file writes, or an unknown tool;
+#   * each kind names a service and an operation shape, and anything
+#     destructive (delete/modify/share/…) is excluded even if it also matches;
+#   * every email address in the call — outside free-text content — must be on
+#     the grant's list, and a recipient field holding anything that isn't an
+#     allowlisted address (a group alias, garbage) fails the check;
+#   * email must name at least one recipient we can see (a reply that infers
+#     its recipient from the thread, or a raw MIME blob, falls back to asking).
+GRANT_KINDS = ("email", "calendar")
+GRANT_MAX_ADDRESSES = 5
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_EMAIL_FULL = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+# Free-text fields: an address mentioned in a digest body is content, not a recipient.
+_CONTENT_KEY = re.compile(
+    r"^(?:body|content|text|html|plain|message|subject|snippet|description|summary|"
+    r"title|notes?|location)(?:_|$)",
+    re.IGNORECASE,
+)
+_RECIPIENT_KEY = re.compile(r"^(?:to|cc|bcc|recipients?|attendees?|guests?|invitees?)$", re.IGNORECASE)
+_GRANT_OPS: dict[str, tuple[str, re.Pattern[str]]] = {
+    # kind → (service substring in the tool name, op shape)
+    "email": ("gmail", re.compile(r"(?:^|_)(?:send|reply|forward|draft)(?:_|$)", re.IGNORECASE)),
+    "calendar": (
+        "calendar",
+        re.compile(r"(?:^|_)(?:create|insert|add|quick_?add)(?:_\w*)?_?event", re.IGNORECASE),
+    ),
+}
+_GRANT_NEVER = re.compile(
+    r"(?:^|_)(?:delete|trash|remove|modify|update|patch|move|archive|label|share|batch|"
+    r"import|export|upload|decline|accept|rsvp)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def normalize_grants(raw: Any) -> list[dict[str, Any]]:
+    """Validate a schedule's grants → canonical list. Raises ``ValueError``.
+
+    Shape: ``[{"kind": "email", "addresses": ["me@x.com"]},
+    {"kind": "calendar", "addresses": []}]`` — at most one grant per kind.
+    An email grant needs at least one address; a calendar grant with none
+    means "events with no guests at all".
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("grants must be a list")
+    out: dict[str, dict[str, Any]] = {}
+    for g in raw:
+        if not isinstance(g, dict):
+            raise ValueError("each grant must be an object")
+        kind = str(g.get("kind", "")).strip().lower()
+        if kind not in GRANT_KINDS:
+            raise ValueError(f"unknown grant kind {kind!r} (expected one of {', '.join(GRANT_KINDS)})")
+        if kind in out:
+            raise ValueError(f"duplicate {kind} grant")
+        addrs = g.get("addresses", [])
+        if isinstance(addrs, str):
+            addrs = [a for a in re.split(r"[,;\s]+", addrs) if a]
+        if not isinstance(addrs, list):
+            raise ValueError(f"{kind} grant: addresses must be a list")
+        clean: list[str] = []
+        for a in addrs:
+            a = str(a).strip().lower()
+            if not _EMAIL_FULL.match(a):
+                raise ValueError(f"{kind} grant: not an email address: {a!r}")
+            if a not in clean:
+                clean.append(a)
+        if len(clean) > GRANT_MAX_ADDRESSES:
+            raise ValueError(f"{kind} grant: at most {GRANT_MAX_ADDRESSES} addresses")
+        if kind == "email" and not clean:
+            raise ValueError("email grant needs at least one address (who may be emailed)")
+        out[kind] = {"kind": kind, "addresses": clean}
+    return [out[k] for k in GRANT_KINDS if k in out]
+
+
+def describe_grant(grant: dict[str, Any]) -> str:
+    addrs = ", ".join(grant.get("addresses") or [])
+    if grant.get("kind") == "email":
+        return f"send email only to {addrs}"
+    return f"add calendar events with guests only {addrs}" if addrs else "add calendar events with no guests"
+
+
+def _addresses_in(value: Any, key: str = "") -> tuple[set[str], bool]:
+    """Every email address in ``value`` outside free-text content, plus whether a
+    recipient-shaped field held something that isn't a plain address."""
+    found: set[str] = set()
+    junk = False
+    if isinstance(value, dict):
+        for k, v in value.items():
+            f, j = _addresses_in(v, str(k))
+            found |= f
+            junk |= j
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            f, j = _addresses_in(v, key)
+            found |= f
+            junk |= j
+    elif isinstance(value, str):
+        if key and _CONTENT_KEY.match(key):
+            return found, junk
+        found |= {a.lower() for a in _EMAIL.findall(value)}
+        if key and _RECIPIENT_KEY.match(key):
+            # "Me <me@x.com>, ops-team" — every token must be an address.
+            for part in re.split(r"[,;]", value):
+                part = part.strip()
+                if part and not _EMAIL.search(part):
+                    junk = True
+    return found, junk
+
+
+def grant_allows(
+    grants: list[dict[str, Any]], tool_name: str, tool_input: dict[str, Any]
+) -> str | None:
+    """Pure: the description of the grant that pre-authorizes this call, or
+    ``None`` (→ the normal ask path). Never consulted for a call ``classify``
+    already allows, and never widens anything but connector actions."""
+    if not grants or not tool_name.startswith(_CONNECTOR_PREFIX):
+        return None
+    service = tool_name[len(_CONNECTOR_PREFIX):].split("__", 1)[0].lower()
+    op = _connector_tool(tool_name)
+    if _GRANT_NEVER.search(op):
+        return None
+    for grant in grants:
+        needle, shape = _GRANT_OPS.get(grant.get("kind", ""), ("", None))
+        if not needle or needle not in service or shape is None or not shape.search(op):
+            continue
+        found, junk = _addresses_in(tool_input if isinstance(tool_input, dict) else {})
+        allowed = {a.lower() for a in grant.get("addresses") or []}
+        if junk or not found <= allowed:
+            continue
+        if grant["kind"] == "email" and not found:
+            continue  # recipient we can't see ⇒ ask
+        return describe_grant(grant)
+    return None
+
+
 def make_permission_callback(
     workspace: Path,
     *,
@@ -362,6 +506,7 @@ def make_approval_callback(
     broker: Any,
     *,
     timeout: float,
+    preauthorize: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None,
 ) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
     """Build a ``can_use_tool`` that routes ask-cases to a UI approval broker.
 
@@ -373,11 +518,19 @@ def make_approval_callback(
 
     ``broker`` must expose an async ``request(tool_name, tool_input, reason, *,
     timeout) -> bool``.
+
+    ``preauthorize`` (optional) is consulted for ask-cases *before* the broker:
+    if it returns a grant description the call is allowed without a card. The
+    session supplies it, applying the current turn's grants (``grant_allows``)
+    plus a per-run use cap.
     """
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):
         decision, reason = classify(tool_name, tool_input, workspace)
         if decision == "allow":
+            return PermissionResultAllow()
+
+        if preauthorize is not None and await preauthorize(tool_name, tool_input):
             return PermissionResultAllow()
 
         approved = await broker.request(tool_name, tool_input, reason, timeout=timeout)

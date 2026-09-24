@@ -37,6 +37,7 @@ from typing import Any
 
 from .. import config
 from .runs import RunRecord, RunStore
+from ..permissions import describe_grant
 from .schedules import Schedule, ScheduleStore
 from .security import resolve_workspace
 from .session import SessionLimitReached, SessionManager, TooManySubscribers, TurnQueueFull
@@ -50,8 +51,21 @@ def scheduled_prompt(schedule: Schedule) -> str:
         "schedule, not typed by the user, and may be unattended — an action that needs "
         "approval can be denied by timeout; if that happens, say so and stop rather than "
         "retrying. Do the task, then finish with a short summary of what you did and "
-        "anything that needs the user.\n\n"
+        f"anything that needs the user.{_grants_note(schedule)}\n\n"
         f"{schedule.task}"
+    )
+
+
+def _grants_note(schedule: Schedule) -> str:
+    """One sentence (same paragraph — the UI splits the preamble at the first
+    blank line) telling the agent what it may do without an approval."""
+    if not schedule.grants:
+        return ""
+    allowed = "; ".join(describe_grant(g) for g in schedule.grants)
+    return (
+        f" The user pre-approved these actions for this run, so they need no approval: "
+        f"{allowed} (at most {config.AGENT_GRANT_MAX_USES} uses). Anything else still "
+        "needs approval."
     )
 
 
@@ -144,7 +158,7 @@ class Scheduler:
             queue = None
             unrecorded = f"submitted (unrecorded: {e})"
         try:
-            await session.submit(prompt)
+            await session.submit(prompt, grants=schedule.grants)
         except TurnQueueFull as e:
             if queue is not None:
                 session.unsubscribe(queue)
@@ -211,6 +225,8 @@ class Scheduler:
             fields["cost_usd"] = record.cost_usd
         if record.denied:
             fields["denied"] = len(record.denied)
+        if record.acted:
+            fields["acted"] = len(record.acted)
         if record.summary:
             fields["summary"] = record.summary[:200]
         schedule.update_run(record.run_id, **fields)

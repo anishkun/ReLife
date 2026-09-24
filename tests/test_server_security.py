@@ -284,7 +284,7 @@ class RecordingSession:
     def touch(self) -> None:
         self.last_active = time.monotonic()
 
-    async def submit(self, text: str) -> None:
+    async def submit(self, text: str, *, grants=None) -> None:
         self.submitted.append(text)
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:

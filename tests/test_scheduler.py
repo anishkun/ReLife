@@ -155,17 +155,19 @@ class FakeSession:
         self.id = sid
         self.workspace = workspace
         self.submitted: list[str] = []
+        self.grants: list = []
         self.busy = False
         self.queue_full = False
         self.subs: set[asyncio.Queue] = set()
         self.seq = 0
 
-    async def submit(self, text: str) -> None:
+    async def submit(self, text: str, *, grants=None) -> None:
         from relife.server.session import TurnQueueFull
 
         if self.queue_full:
             raise TurnQueueFull("full")
         self.submitted.append(text)
+        self.grants.append(grants)
 
     def subscribe(self, last_id=None):
         q: asyncio.Queue = asyncio.Queue()
@@ -560,7 +562,8 @@ def test_summarize_events_without_tools_uses_all_text():
         {"type": "result", "cost_usd": None},
     ])
     assert info == {
-        "summary": "Nothing to do. All quiet.", "tool_calls": 0, "cost_usd": None, "denied": [], "error": None,
+        "summary": "Nothing to do. All quiet.", "tool_calls": 0, "cost_usd": None, "denied": [], "acted": [],
+        "error": None,
     }
     assert summarize_events([])["summary"] == ""
 
@@ -617,7 +620,7 @@ class RecordingSession:
     async def aclose(self) -> None:
         pass
 
-    async def submit(self, text: str) -> None:
+    async def submit(self, text: str, *, grants=None) -> None:
         self.submitted.append(text)
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:

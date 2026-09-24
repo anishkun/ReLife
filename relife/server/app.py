@@ -61,6 +61,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .. import config
 from .runs import RunStore
+from ..permissions import normalize_grants
 from .scheduler import Scheduler
 from .schedules import (
     Schedule,
@@ -365,6 +366,7 @@ def create_app(
                 spec=_spec_from(body),
                 workspace=ws,
                 enabled=body.get("enabled", True),
+                grants=body.get("grants"),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -391,6 +393,8 @@ def create_app(
                 schedule.next_run_at = next_run(schedule.spec, time.time())
             if "enabled" in body:
                 schedule.enabled = bool(body["enabled"])
+            if "grants" in body:
+                schedule.grants = normalize_grants(body["grants"])
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         store.save()

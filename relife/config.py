@@ -195,6 +195,10 @@ AGENT_RUN_HISTORY = int(os.environ.get("RELIFE_AGENT_RUN_HISTORY", "50"))   # re
 # A scheduled run still streaming after this long is recorded as `timeout`
 # (the recorder stops waiting; the agent itself is not killed).
 AGENT_SCHEDULE_RUN_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SCHEDULE_RUN_TIMEOUT", "7200"))
+# How many times one scheduled run may use its pre-authorized grants (e.g. "email
+# me") before further matching actions fall back to asking. Bounds a runaway loop
+# — or an email that talks the agent into mailing you fifty times.
+AGENT_GRANT_MAX_USES = int(os.environ.get("RELIFE_AGENT_GRANT_MAX_USES", "3"))
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

@@ -26,7 +26,7 @@ from claude_agent_sdk import ClaudeSDKClient
 from .. import config
 from ..agent import _tool_brief, build_options, maybe_consolidate_off_loop, to_event
 from ..hooks import memory_hooks
-from ..permissions import make_approval_callback
+from ..permissions import grant_allows, make_approval_callback
 
 # How many recent events to keep per session for SSE reconnect/replay.
 _RING_MAX = 500
@@ -115,7 +115,11 @@ class AgentSession:
     def __init__(self, workspace: Path, *, session_id: str | None = None) -> None:
         self.id = session_id or uuid.uuid4().hex
         self.workspace = workspace
-        self._inbound: asyncio.Queue[str] = asyncio.Queue(maxsize=config.AGENT_MAX_QUEUED_TURNS)
+        # Each queued turn carries the grants that apply to it (a scheduled turn's
+        # pre-authorizations; ``[]`` for anything typed).
+        self._inbound: asyncio.Queue[tuple[str, list[dict[str, Any]]]] = asyncio.Queue(
+            maxsize=config.AGENT_MAX_QUEUED_TURNS
+        )
         self._subscribers: set[asyncio.Queue[tuple[int, dict[str, Any]]]] = set()
         self._ring: deque[tuple[int, dict[str, Any]]] = deque(maxlen=_RING_MAX)
         self._seq = 0
@@ -123,6 +127,8 @@ class AgentSession:
         self._client: ClaudeSDKClient | None = None
         self._worker: asyncio.Task[None] | None = None
         self._turn_active = False
+        self._turn_grants: list[dict[str, Any]] = []
+        self._grant_uses = 0
         self.last_active = time.monotonic()
 
     # --- lifecycle ----------------------------------------------------------
@@ -130,7 +136,10 @@ class AgentSession:
         options = build_options(
             cwd=self.workspace,
             can_use_tool=make_approval_callback(
-                self.workspace, self._broker, timeout=config.AGENT_APPROVAL_TIMEOUT
+                self.workspace,
+                self._broker,
+                timeout=config.AGENT_APPROVAL_TIMEOUT,
+                preauthorize=self._preauthorize,
             ),
             mcp_servers=config.default_mcp_servers(),
             hooks=memory_hooks(),
@@ -153,17 +162,40 @@ class AgentSession:
                 pass
 
     # --- inbound / outbound -------------------------------------------------
-    async def submit(self, text: str) -> None:
+    async def submit(self, text: str, *, grants: list[dict[str, Any]] | None = None) -> None:
         """Queue a turn. Raises :class:`TurnQueueFull` rather than blocking the
-        request handler (which would pin an event-loop task per pending turn)."""
+        request handler (which would pin an event-loop task per pending turn).
+
+        ``grants`` pre-authorize specific outward actions for *this turn only*
+        (the scheduler passes a schedule's; a typed turn gets none)."""
         try:
-            self._inbound.put_nowait(text)
+            self._inbound.put_nowait((text, list(grants or [])))
         except asyncio.QueueFull as e:
             raise TurnQueueFull("too many turns queued for this session") from e
         self.touch()
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._broker.resolve(approval_id, approved)
+
+    async def _preauthorize(self, tool_name: str, tool_input: dict[str, Any]) -> str | None:
+        """Apply the running turn's grants to an ask-case. Capped per turn at
+        ``AGENT_GRANT_MAX_USES``; every use is published as ``approval_auto`` so
+        the transcript and the run record show what was done on the user's behalf."""
+        if not self._turn_grants or self._grant_uses >= config.AGENT_GRANT_MAX_USES:
+            return None
+        grant = grant_allows(self._turn_grants, tool_name, tool_input)
+        if grant is None:
+            return None
+        self._grant_uses += 1
+        await self._publish(
+            {
+                "type": "approval_auto",
+                "tool": tool_name,
+                "grant": grant,
+                "brief": _tool_brief(tool_input, limit=400),
+            }
+        )
+        return grant
 
     def subscribe(
         self, last_id: int | None = None
@@ -222,7 +254,8 @@ class AgentSession:
     async def _run(self) -> None:
         assert self._client is not None
         while True:
-            turn = await self._inbound.get()
+            turn, self._turn_grants = await self._inbound.get()
+            self._grant_uses = 0
             self._turn_active = True
             await self._publish({"type": "user", "text": turn})
             try:
@@ -237,6 +270,7 @@ class AgentSession:
                 continue
             finally:
                 self._turn_active = False
+                self._turn_grants = []
                 self.touch()
             # Brain upkeep after each completed turn (deterministic, fail-safe).
             # Off the loop: this process hosts every session's stream and every

@@ -40,6 +40,8 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     used a tool, all of its text. ``denied`` lists approvals that resolved to
     ``False`` (unattended ⇒ timeout ⇒ deny), each with the tool and the brief
     the user would have seen on the card, so they can do it by hand.
+    ``acted`` lists outward actions a schedule grant pre-authorized
+    (``approval_auto``) — what the agent did on the user's behalf.
     """
     tool_calls = 0
     cost = None
@@ -47,6 +49,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     last_tool_idx = -1
     pending: dict[str, dict[str, Any]] = {}
     denied: list[dict[str, Any]] = []
+    acted: list[dict[str, Any]] = []
     for i, ev in enumerate(events):
         t = ev.get("type")
         if t == "tool_use":
@@ -58,6 +61,10 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             cost = ev.get("cost_usd")
         elif t == "error":
             error = ev.get("message")
+        elif t == "approval_auto":
+            acted.append(
+                {"tool": ev.get("tool", "?"), "brief": ev.get("brief", ""), "grant": ev.get("grant", "")}
+            )
         elif t == "approval_request":
             pending[ev.get("approval_id", "")] = ev
         elif t == "approval_resolved" and not ev.get("approved"):
@@ -80,6 +87,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_calls": tool_calls,
         "cost_usd": cost,
         "denied": denied,
+        "acted": acted,
         "error": error,
     }
 
@@ -95,6 +103,7 @@ class RunRecord:
     tool_calls: int = 0
     cost_usd: float | None = None
     denied: list[dict[str, Any]] = field(default_factory=list)
+    acted: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     session_id: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -113,6 +122,7 @@ class RunRecord:
         self.tool_calls = info["tool_calls"]
         self.cost_usd = info["cost_usd"]
         self.denied = info["denied"]
+        self.acted = info["acted"]
         self.error = info["error"]
 
     def to_dict(self, *, with_events: bool = False) -> dict[str, Any]:
