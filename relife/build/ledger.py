@@ -103,7 +103,7 @@ class BuildLedger:
                 candidates.append(led)
         if not candidates:
             return None
-        return max(candidates, key=lambda l: l.updated_at)
+        return max(candidates, key=lambda led: led.updated_at)
 
     def save(self) -> None:
         self.updated_at = time.time()

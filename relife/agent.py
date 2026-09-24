@@ -23,7 +23,6 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultDeny,
     ResultMessage,
-    SystemMessage,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,

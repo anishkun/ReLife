@@ -21,7 +21,7 @@ from relife.memory import events as ev
 from relife.memory import skills as sk
 from relife.memory import store as store_mod
 from relife.memory import workflows as wf
-from relife.memory.client import LocalMemoryClient, MemoryClient
+from relife.memory.client import LocalMemoryClient
 from relife.memory.remote import wire
 from relife.memory.events import Event
 from relife.memory.skills import Skill

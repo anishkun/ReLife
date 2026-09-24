@@ -48,7 +48,7 @@ def test_prune_is_reversible_archive(tmp_path, monkeypatch):
     assert store.get(b).status == "active"
     # The action was journaled.
     lines = (tmp_path / "rem_journal.jsonl").read_text(encoding="utf-8").splitlines()
-    assert any(json.loads(l)["id"] == a and json.loads(l)["action"] == "archive" for l in lines)
+    assert any(json.loads(line)["id"] == a and json.loads(line)["action"] == "archive" for line in lines)
 
 
 def test_reweight_clamps(tmp_path, monkeypatch):

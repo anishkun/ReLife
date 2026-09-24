@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,6 +27,9 @@ from .. import config
 SUMMARY_MAX_CHARS = 2000
 # Cap the persisted event list so a runaway turn can't write an unbounded file.
 EVENTS_MAX = 2000
+# Shape of :meth:`RunRecord.new_id`. A run id arrives as a URL path parameter and
+# names a file, so anything else is refused before it touches the filesystem.
+_RUN_ID = re.compile(r"^\d{8}-\d{6}-\d{3}$")
 
 
 def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -156,6 +160,8 @@ class RunStore:
                 pass
 
     def get(self, schedule_id: str, run_id: str) -> RunRecord | None:
+        if not _RUN_ID.match(run_id or ""):
+            return None
         path = self._path(schedule_id, run_id)
         if not path.exists():
             return None

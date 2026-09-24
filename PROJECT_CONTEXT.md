@@ -62,7 +62,8 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 131 passing (`python -m pytest tests/`). Covers permission classify, store
+**Tests:** 252 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -140,7 +141,7 @@ relife/
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
 data/                       # gitignored runtime: relife.db, skills/, builds/, logs
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 111 tests (107 deterministic + 4 semantic, embeddings forced off)
+tests/                      # 252 tests (248 deterministic + 4 semantic, embeddings forced off)
 ```
 
 ## 6. Setup / run
@@ -438,6 +439,17 @@ relife chat
   the real `Needs authentication` state (it said re-enable; it now says link the Google
   account in-session). `--json` for scripts. Same pure `run_checks(Probes)` shape — new
   probe fields default so older bundles stay valid. 248 tests (was 239).
+- **MVP pass 8 — hardening sweep — ✅ DONE (this phase).** (1) Stop-hook **episodes are scoped
+  to the turn**, not the session: the event log is keyed by session id and a chat/server session
+  runs many turns, so the prompt hook now stashes the session's latest event id and the Stop hook
+  only takes events after it (every later episode used to replay the whole session's tools and
+  skew the pattern detector). (2) **All three hooks fail soft** — daemon down / store error ⇒ no
+  injected context / nothing captured, never an exception into the SDK. (3) **Run-id path
+  traversal closed**: `RunStore.get` refuses any id not shaped like `RunRecord.new_id`
+  (`YYYYMMDD-HHMMSS-mmm`) before it names a file. (4) A scheduled run with every SSE slot taken
+  still goes out but records `submitted (unrecorded: …)` instead of a `submitted` no recorder
+  would ever upgrade. (5) A `[tool.ruff]` baseline (`python -m ruff check relife tests scripts`,
+  zero findings). 252 tests (was 248).
 - **Phase 3 (next):** a pre-authorized outward allowlist per schedule (so an unattended run
   can e.g. send *to me* without a human at the card — a deliberate policy widening); async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —

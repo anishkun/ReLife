@@ -12,8 +12,15 @@ Two jobs:
    to the event log. The consolidation pass mines that journal for recurring
    action sequences and turns them into reusable workflows.
 
-Both hook callbacks are plain functions, so they're exercised directly by
-deterministic tests (no live agent needed).
+3. **Episode capture** (``Stop``) — a deterministic one-liner (task intent +
+   this turn's collapsed tool approach) is saved for multi-step runs, so the
+   recurring-episode detector has material even when the agent never calls
+   ``memory_save``. Scoped to the *turn*, not the session: the prompt hook
+   records where the turn starts in the journal.
+
+All three are plain functions exercised directly by deterministic tests (no
+live agent). They fail **soft**: a memory error degrades to "no context" /
+"nothing captured" and never breaks the run.
 """
 
 from __future__ import annotations
@@ -40,16 +47,42 @@ def _is_dup(text: str, kept: list[set[str]]) -> bool:
     return False
 
 
+def _turn_start_event_id(client: Any, session_id: str) -> int:
+    """Id of the session's latest journaled event right now (0 if none).
+
+    The event log is keyed by *session*, and a chat / server session runs many
+    turns — so without this watermark every Stop episode would replay every
+    earlier turn's tools as if they belonged to this one.
+    """
+    try:
+        evs = client.events_for_task(session_id)
+        return max((e.id for e in evs), default=0)
+    except Exception:
+        return 0  # unknown ⇒ take everything; a partial journal is still an episode
+
+
 async def _recall_hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any):
     prompt = input_data.get("prompt", "")
-    # Remember the prompt so the Stop hook can pair it with the tool approach.
+    sid = input_data.get("session_id", "") or ""
+    client = default_client()
+    # Remember the prompt (and where this turn starts in the journal) so the
+    # Stop hook can pair intent with *this turn's* tool approach.
     if prompt:
-        _last_prompt[input_data.get("session_id", "") or ""] = prompt
+        _last_prompt[sid] = (prompt, _turn_start_event_id(client, sid))
 
+    try:
+        return _recall_context(client, prompt)
+    except Exception:
+        # Recall is a convenience, not a dependency: a memory daemon that is
+        # down (or any store error) must degrade to "no recalled context",
+        # never break the prompt. Same fail-soft rule as the other two hooks.
+        return {}
+
+
+def _recall_context(client: Any, prompt: str) -> dict[str, Any]:
     # Gather candidate blocks in priority order: memory, then skills, then a
     # workflow. Each carries the key text used for cross-section de-duplication.
     candidates: list[tuple[str, str, str]] = []  # (section_label, key_text, rendered)
-    client = default_client()
     for m in client.recall(prompt, k=5, reinforce=True):
         rendered = f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "")
         candidates.append(("memory", m.text + " " + m.tags, rendered))
@@ -116,10 +149,11 @@ async def _event_hook(input_data: dict[str, Any], tool_use_id: str | None, conte
     return {}
 
 
-# Last user prompt per session, captured at UserPromptSubmit so the Stop hook can
-# pair task intent with the tool approach into an episode. Single-process, popped
-# on Stop; bounded by the number of concurrent sessions (typically one).
-_last_prompt: dict[str, str] = {}
+# Last user prompt per session (+ the event id the turn started after), captured
+# at UserPromptSubmit so the Stop hook can pair task intent with *this turn's*
+# tool approach into an episode. Single-process, popped on Stop; bounded by the
+# number of concurrent sessions.
+_last_prompt: dict[str, tuple[str, int]] = {}
 
 
 def _episode_text(prompt: str, tools: list[str]) -> str:
@@ -132,11 +166,14 @@ def _episode_text(prompt: str, tools: list[str]) -> str:
 async def _episode_hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any):
     """On Stop, save an episode (intent + approach) for multi-step runs."""
     sid = input_data.get("session_id", "") or ""
-    prompt = _last_prompt.pop(sid, "")
+    prompt, start_id = _last_prompt.pop(sid, ("", 0))
     if not prompt:
         return {}
     client = default_client()
-    evs = client.events_for_task(sid)
+    try:
+        evs = [e for e in client.events_for_task(sid) if e.id > start_id]
+    except Exception:
+        return {}  # journal unreachable — nothing to capture, nothing to break
     if len(evs) < config.EPISODE_MIN_EVENTS:
         return {}  # too little happened to be worth remembering
     seq: list[str] = []

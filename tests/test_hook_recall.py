@@ -87,3 +87,48 @@ def test_stop_hook_skips_trivial_runs(tmp_path):
         {"tool_name": "Read", "tool_input": {}, "session_id": sid}, None, None))
     anyio.run(lambda: hooks._episode_hook({"session_id": sid}, None, None))
     assert [m for m in store.all_memories() if m.kind == "episode"] == []
+
+
+def _turn(sid, prompt, tools):
+    anyio.run(lambda: hooks._recall_hook({"prompt": prompt, "session_id": sid}, None, None))
+    for tool in tools:
+        anyio.run(lambda t=tool: hooks._event_hook(
+            {"tool_name": t, "tool_input": {}, "session_id": sid}, None, None))
+    anyio.run(lambda: hooks._episode_hook({"session_id": sid}, None, None))
+
+
+def test_episode_is_scoped_to_the_turn_not_the_session(tmp_path):
+    """A chat / server session runs many turns under one session id. Each Stop
+    episode must describe only its own turn's tools, or every later episode
+    replays the whole session's history and the pattern detector clusters on it."""
+    _isolate(tmp_path)
+    sid = "sess-multi"
+    _turn(sid, "set up the repo", ["Bash", "Write", "Bash"])
+    _turn(sid, "write the README", ["Read", "Edit", "Edit"])
+
+    episodes = sorted((m.text for m in store.all_memories() if m.kind == "episode"))
+    assert len(episodes) == 2
+    first = next(e for e in episodes if "set up the repo" in e)
+    second = next(e for e in episodes if "write the readme" in e.lower())
+    assert "Bash" in first and "Read" not in first
+    assert "Read" in second and "Bash" not in second, second
+
+
+def test_hooks_fail_soft_when_memory_is_unreachable(tmp_path, monkeypatch):
+    """With RELIFE_MEMORY_URL set and the daemon down, every hook must degrade
+    (no context / nothing captured), never raise into the SDK."""
+    _isolate(tmp_path)
+
+    class Down:
+        def __getattr__(self, name):
+            def boom(*a, **k):
+                raise ConnectionError("memory daemon unreachable")
+            return boom
+
+    monkeypatch.setattr(hooks, "default_client", lambda: Down())
+    sid = "sess-down"
+    out = anyio.run(lambda: hooks._recall_hook({"prompt": "anything at all", "session_id": sid}, None, None))
+    assert out == {}
+    anyio.run(lambda: hooks._event_hook({"tool_name": "Read", "tool_input": {}, "session_id": sid}, None, None))
+    assert anyio.run(lambda: hooks._episode_hook({"session_id": sid}, None, None)) == {}
+    assert sid not in hooks._last_prompt  # the stash is popped even on failure

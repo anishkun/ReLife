@@ -39,7 +39,7 @@ def test_migrates_v1_schema(tmp_path):
 def test_reinforcement_strengthens_and_reorders(tmp_path):
     s = _fresh(tmp_path)
     a = s.save("Python ruff is the linter.", tags="python")
-    b = s.save("Python pytest is the test runner.", tags="python")
+    s.save("Python pytest is the test runner.", tags="python")
 
     # Both match "python" equally on keywords; reinforce A so it activates higher.
     for _ in range(8):

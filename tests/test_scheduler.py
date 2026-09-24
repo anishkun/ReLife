@@ -337,6 +337,32 @@ def test_session_ceiling_and_full_queue_are_recorded_not_raised(sched):
     anyio.run(flow)
 
 
+def test_run_with_no_free_stream_slot_still_runs_but_says_it_is_unrecorded(sched):
+    """When every SSE slot is held by watchers the turn still goes out, but the
+    history must not show a `submitted` that no recorder will ever upgrade."""
+    scheduler, store, manager, _ = sched
+    a = store.add(Schedule.new(name="a", task="t", spec={"every": "1h"}, now=0.0))
+
+    async def flow():
+        await scheduler.tick(3600.0)
+        await _complete(scheduler, manager, a)
+        sess = manager.sessions[a.session_id]
+
+        def full(last_id=None):
+            from relife.server.session import TooManySubscribers
+
+            raise TooManySubscribers("too many event streams open for this session")
+
+        sess.subscribe = full
+        await scheduler.tick(7200.0)
+        assert len(sess.submitted) == 2  # the task was still submitted
+        assert a.last_status.startswith("submitted (unrecorded: too many event streams")
+        assert "run_id" not in a.runs[-1]  # nothing will ever upgrade this entry
+        assert not scheduler._recorders and a.next_run_at == 10800.0
+
+    anyio.run(flow)
+
+
 def test_workspace_outside_root_is_an_error_not_a_session(sched):
     scheduler, store, manager, root = sched
     a = store.add(Schedule.new(name="a", task="t", spec={"every": "1h"}, workspace="../escape", now=0.0))
@@ -543,20 +569,36 @@ def test_run_store_is_bounded_and_removable(tmp_path):
     from relife.server.runs import RunRecord, RunStore
 
     rs = RunStore(tmp_path / "runs", keep=3)
+
+    def rid(i: int) -> str:
+        return f"20260922-0900{i:02d}-000"  # the real id shape, time-ordered
+
     for i in range(5):
-        rec = RunRecord(schedule_id="s1", run_id=f"2026-{i:02d}", started_at=float(i))
+        rec = RunRecord(schedule_id="s1", run_id=rid(i), started_at=float(i))
         rec.finish("done", [{"type": "text", "text": f"run {i}"}], now=float(i) + 1)
         rs.save(rec)
     ids = [r.run_id for r in rs.list("s1")]
-    assert ids == ["2026-04", "2026-03", "2026-02"]  # newest first, oldest pruned
+    assert ids == [rid(4), rid(3), rid(2)]  # newest first, oldest pruned
     assert rs.list("s1", limit=1)[0].summary == "run 4"
-    assert rs.get("s1", "2026-00") is None and rs.get("nope", "x") is None
-    d = rs.get("s1", "2026-04").to_dict()
+    assert rs.get("s1", rid(0)) is None and rs.get("nope", rid(4)) is None
+    d = rs.get("s1", rid(4)).to_dict()
     assert "events" not in d and d["event_count"] == 1
-    assert "events" in rs.get("s1", "2026-04").to_dict(with_events=True)
+    assert "events" in rs.get("s1", rid(4)).to_dict(with_events=True)
     rs.remove_all("s1")
     assert rs.list("s1") == [] and not (tmp_path / "runs" / "s1").exists()
     rs.remove_all("s1")  # idempotent
+
+
+def test_run_store_refuses_ids_that_are_not_run_ids(tmp_path):
+    """A run id is a URL path parameter that names a file: only the exact shape
+    ``new_id`` produces may reach the filesystem."""
+    from relife.server.runs import RunRecord, RunStore
+
+    rs = RunStore(tmp_path / "runs")
+    (tmp_path / "secret.json").write_text("{}", encoding="utf-8")
+    for bad in ("../../secret", "..", "", "x", "20260922-090000-000.json", "20260922-090000"):
+        assert rs.get("s1", bad) is None
+    assert RunRecord.new_id(0.0) and rs.get("s1", RunRecord.new_id(0.0)) is None  # valid shape, absent
 
 
 # =============================================================================

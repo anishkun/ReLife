@@ -1,7 +1,7 @@
 """The memory daemon — a FastAPI service core over the same ``MemoryService`` the
 in-process path uses.
 
-Design notes (see ``.claude/plans`` for the full rationale):
+Design notes (``MODULE_DEEP_DIVE.md`` §M8 has the full rationale):
 
 - **DB binding.** ``save``/``recall``/… honour an injected store, but
   ``consolidate()`` / ``dream()`` mine the module-level store (``store._DB_PATH``)

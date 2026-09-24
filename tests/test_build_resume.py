@@ -47,7 +47,7 @@ class _FakeClient:
 
     async def receive_response(self):
         return
-        yield  # noqa: makes this an (empty) async generator
+        yield  # unreachable on purpose: makes this an (empty) async generator
 
     async def disconnect(self):
         self.disconnected = True

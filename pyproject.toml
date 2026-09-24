@@ -50,3 +50,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["relife"]
+
+[tool.ruff]
+# Lint baseline the suite is kept clean against: `python -m ruff check relife tests scripts`.
+target-version = "py311"
+line-length = 100

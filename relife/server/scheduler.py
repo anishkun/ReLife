@@ -136,21 +136,27 @@ class Scheduler:
         # Subscribe *before* submitting so the turn's first event can't be missed.
         try:
             queue, _backlog = session.subscribe()
-        except TooManySubscribers:
+        except TooManySubscribers as e:
+            # Every stream slot is taken by watchers, so the run can still go
+            # out (someone is clearly looking) but no recorder can follow it.
+            # Say so in the history rather than leave a `submitted` that would
+            # never be upgraded to an outcome.
             queue = None
+            unrecorded = f"submitted (unrecorded: {e})"
         try:
             await session.submit(prompt)
         except TurnQueueFull as e:
             if queue is not None:
                 session.unsubscribe(queue)
             return f"skipped: {e}"
-        if queue is not None:
-            record = RunRecord(
-                schedule_id=schedule.id, run_id=run_id, started_at=now, session_id=session.id
-            )
-            task = asyncio.create_task(self._record(schedule, record, session, queue, prompt))
-            self._recorders.add(task)
-            task.add_done_callback(self._recorders.discard)
+        if queue is None:
+            return unrecorded
+        record = RunRecord(
+            schedule_id=schedule.id, run_id=run_id, started_at=now, session_id=session.id
+        )
+        task = asyncio.create_task(self._record(schedule, record, session, queue, prompt))
+        self._recorders.add(task)
+        task.add_done_callback(self._recorders.discard)
         return "submitted"
 
     async def _record(

@@ -63,7 +63,7 @@ def test_load_roundtrip_preserves_state(builds_dir):
 
 
 def test_latest_for_picks_most_recent_matching_workspace(builds_dir):
-    old = BuildLedger.create("old", "/ws-a")
+    BuildLedger.create("old", "/ws-a")  # older, same workspace
     time.sleep(0.01)
     new = BuildLedger.create("new", "/ws-a")
     other = BuildLedger.create("other", "/ws-b")

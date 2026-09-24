@@ -98,9 +98,12 @@ relife do "<task>"     # one shot: do this task to completion, then stop
 relife chat            # back-and-forth conversation in one workspace
 relife build "<spec>"  # BIG job: plan → split into milestones → build each
 relife build --resume  # continue a build that was interrupted
+relife serve           # ALWAYS-ON: agent server + web console + schedules (see §6b)
+relife doctor          # is everything set up? (login, node, gh, connectors, server, schedules)
 relife consolidate     # run the cheap "sleep" pass now (fade/merge/learn) — no AI
 relife dream           # opt-in DEEP review: AI critiques & tidies memory (spends budget)
 relife memory stats    # peek at what's remembered and what has faded
+relife memory search|list|show|forget   # look at — and correct — what it learned
 ```
 
 All of them take `--workspace PATH` (default `./workspace`) — **the only folder
@@ -110,6 +113,8 @@ touch anything off it.
 
 `do` and `chat` are for normal-sized tasks (one Claude conversation is enough).
 `build` exists for projects too large to fit in a single conversation — see §6.
+`serve` is for when you want the agent *around* — in a browser tab, and running
+tasks on a schedule while you're not — see §6b.
 
 ---
 
@@ -426,6 +431,59 @@ what each milestone produced. That's the whole machine working end to end.
 
 ---
 
+## 6b. The always-on side — `relife serve` (server, console, schedules)
+
+`do` and `chat` are **cold**: a process per task, and approvals happen in the
+terminal. `relife serve` keeps one process running instead, and three things fall
+out of that.
+
+### The web console
+
+Open `http://127.0.0.1:8600` and you get a plain, self-contained page: type a
+task, watch the agent's text / tool calls / results stream in live, and — when it
+wants to do something outward (send an email, post to GitHub) — an **approval
+card** appears with the concrete details (recipient, subject, command). Click
+allow or deny. If you don't click within five minutes the action is **denied**,
+exactly like an unattended terminal run.
+
+Behind the page: each browser session is one long-lived agent conversation (one
+`claude` subprocess, kept open across turns), the page reattaches to it on
+reload instead of starting a new one, and the server is **local-only** by design
+(binding beyond `127.0.0.1` requires a token and is refused without one).
+
+### Schedules — tasks that run themselves
+
+In the console's *schedules* panel you add a task and a cadence — `every 30m`,
+or `daily at 09:00 on mon, wed, fri`. When it's due, the server fires the task
+**as a turn in its own session**, so it recalls memory, journals, learns and asks
+for approvals exactly like something you typed. Nobody watching ⇒ an approval
+times out ⇒ denied, and the agent is told up front to *report* that rather than
+retry.
+
+Every run's **outcome is recorded** (`data/runs/…`): the agent's closing summary,
+how many tools it used, the cost, and — the important part — **anything it
+needed you for** (each denied action, with what it was). The panel shows the
+last outcome on the card and a *runs* list per schedule. Intervals under five
+minutes are refused: every run spends your Max budget.
+
+### `relife doctor`
+
+Everything ReLife leans on lives outside the package (the `claude` login, Node,
+`gh`, connectors, the server) and fails late or silently. `doctor` checks it all
+up front, prints a fix for anything wrong, and tells you when "nothing seems to
+happen" is because the server isn't running or a scheduled run was denied
+something.
+
+### Optional: memory as its own process
+
+`relife memory serve` runs the memory layer as a small daemon; set
+`RELIFE_MEMORY_URL=http://127.0.0.1:8787` and every ReLife process (CLI runs,
+the server, scheduled runs) shares **one brain** instead of each opening the
+database. Unset the variable and nothing changes — memory is in-process by
+default.
+
+---
+
 ## 7. Where things live on disk
 
 ```
@@ -441,8 +499,11 @@ D:\ReLife\
 │   ├─ consolidate_state.json   bookkeeping for the auto "sleep" pass
 │   ├─ rem_state.json       bookkeeping for the "dream" pass (what's been reviewed)
 │   ├─ rem_journal.jsonl    audit log of every change the AI critic made (undoable)
-│   └─ builds/<id>/         one folder per `relife build` (ledger.json + plan.md)
-├─ tests/                   77 deterministic tests (no live AI — safe & fast)
+│   ├─ builds/<id>/         one folder per `relife build` (ledger.json + plan.md)
+│   ├─ schedules.json       the schedules you set up in the console
+│   ├─ runs/<schedule>/     one JSON per scheduled run (summary, cost, what needed you)
+│   └─ relife.db.daemon     marker left by a running `relife memory serve` (optional)
+├─ tests/                   252 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
 └─ HOW_IT_WORKS.md          ← you are here (the friendly guide)
@@ -457,11 +518,12 @@ D:\ReLife\
   were set, ReLife would refuse to use it. Heavy runs (especially big builds) draw
   on the *same* usage budget as your interactive Claude Code — so a giant build
   can hit "you've hit your session limit." That's exactly what `--resume` is for.
-- **The tests never call the live model.** All 77 tests are deterministic — they
+- **The tests never call the live model.** All 252 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
-  the cognitive activation/decay math, workflow learning, ledger persistence, and
-  the REM critic's *application* logic via a stubbed AI), not Claude. So you can
-  run them freely without spending budget.
+  the cognitive activation/decay math, workflow learning, ledger persistence, the
+  REM critic's *application* logic via a stubbed AI, and the whole server —
+  auth, streaming, approvals, schedules — against a scripted fake agent), not
+  Claude. So you can run them freely without spending budget.
 - **There are two kinds of "memory cleanup", and only one uses AI.** The automatic
   **sleep** pass (`consolidate`) is mechanical and free — it runs itself. The
   **dream** pass (`relife dream`) is the only thing in the whole memory layer that
@@ -497,8 +559,11 @@ D:\ReLife\
    it can never corrupt itself.
 7. For **big** jobs, `relife build` **plans milestones → delegates each to a
    fresh builder → records everything in a ledger**, which makes it **resumable**.
-8. It runs on your **Max subscription**; deterministic **tests** verify the
+8. `relife serve` keeps it **always on**: a web console with approval cards, and
+   **schedules** that run tasks unattended and record what they did and what
+   they needed you for.
+9. It runs on your **Max subscription**; deterministic **tests** verify the
    plumbing without spending budget.
 
 That's ReLife. When in doubt, open `plan.md` inside a build folder to *see* the
-machine thinking, or re-read §4 (one request) and §6 (a build).
+machine thinking, or re-read §4 (one request), §6 (a build) and §6b (the server).

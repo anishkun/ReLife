@@ -6,7 +6,6 @@ isn't actually installed — so CI without the optional dep stays green while a
 dev box with it gets real coverage of paraphrase dedup and semantic recall.
 """
 
-import time
 
 import pytest
 
