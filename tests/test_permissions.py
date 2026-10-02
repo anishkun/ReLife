@@ -171,3 +171,99 @@ def test_connector_unknown_verb_asks():
 def test_connector_reason_names_the_operation():
     _, reason = classify("mcp__claude_ai_Gmail__gmail_send_message", {}, WS)
     assert "gmail_send_message" in reason
+
+
+# --- GitHub CLI: verb-based ------------------------------------------------
+
+def gh(c, tool="Bash"):
+    return d(tool, {"command": c})
+
+
+def test_gh_reads_allow():
+    """Reading the user's own work items must not prompt — otherwise a scheduled
+    "triage my issues" run can't even look."""
+    for c in (
+        "gh issue list --assignee @me",
+        "gh issue view 42 --comments",
+        "gh pr list -R anishkun/ReLife --state open",
+        "gh pr view 7 --json title,body",
+        "gh pr diff 7",
+        "gh pr checks 7",
+        "gh pr status",
+        "gh pr checkout 7",
+        "gh search issues --assignee @me --state open",
+        "gh status",
+        "gh run list --limit 5",
+        "gh run view 123 --log-failed",
+        "gh release list",
+        "gh repo view anishkun/ReLife",
+        "gh repo clone anishkun/ReLife",
+        "gh auth status",
+        "gh --version",
+        "gh issue list --json number,title | jq '.[]'",
+        "gh api repos/anishkun/ReLife/issues",
+        "gh api -X GET search/issues -f q='assignee:@me is:open'",
+        "gh api --method=GET repos/o/r/pulls --paginate",
+        "gh api repos/o/r/issues -H 'Accept: application/vnd.github+json' --jq '.[].title'",
+    ):
+        assert gh(c) == "allow", c
+    assert gh("& 'C:/Program Files/GitHub CLI/gh.exe' issue list", "PowerShell") == "allow"
+
+
+def test_gh_repo_create_stays_autonomous():
+    """The v1 build → create repo → push flow was authorized like `git push`."""
+    assert gh("gh repo create relife-demo --private --source . --push") == "allow"
+
+
+def test_gh_writes_ask():
+    for c in (
+        "gh pr create --fill",
+        "gh pr merge 7 --squash",
+        "gh pr comment 7 -b hi",
+        "gh pr review 7 --approve",
+        "gh issue create -t x -b y",
+        "gh issue comment 42 -b done",
+        "gh issue close 42",
+        "gh issue edit 42 --add-label bug",
+        "gh release create v1.0",
+        "gh gist create secrets.env",
+        # used to be auto-allowed: not in the old group list
+        "gh repo delete anishkun/ReLife --yes",
+        "gh repo edit --visibility public",
+        "gh secret set TOKEN -b x",
+        "gh workflow run deploy.yml",
+        "gh run rerun 123",
+        "gh label create urgent",
+        "gh ssh-key add ~/.ssh/id_ed25519.pub",
+        "gh auth login",
+        "gh extension install some/ext",
+        "gh unknown-thing",
+    ):
+        assert gh(c) == "ask", c
+
+
+def test_gh_api_writes_ask():
+    for c in (
+        "gh api repos/o/r/issues -f title=x",
+        "gh api repos/o/r/issues -F title=x",
+        "gh api repos/o/r/issues --field title=x",
+        "gh api repos/o/r/issues --input body.json",
+        "gh api -X POST repos/o/r/issues",
+        "gh api -XDELETE repos/o/r",
+        "gh api --method PATCH repos/o/r -f private=false",
+        "gh api graphql -f query='query { viewer { login } }'",
+        "gh api",
+    ):
+        assert gh(c) == "ask", c
+
+
+def test_gh_write_hidden_behind_a_read_or_wrapper_asks():
+    """Every `gh` in the command must be a read — chaining or wrapping a write
+    behind a harmless one can't launder it."""
+    assert gh("gh issue list && gh issue close 42") == "ask"
+    assert gh("gh pr list; gh pr merge 7") == "ask"
+    assert gh("bash -c \"gh issue create -t x\"") == "ask"
+    assert gh("time gh pr create --fill") == "ask"
+    assert gh("echo 42 | xargs gh issue close") == "ask"
+    assert gh("$(gh pr merge 7)") == "ask"
+    assert gh("gh -R o/r issue delete 1") == "ask"

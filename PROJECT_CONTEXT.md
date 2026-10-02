@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 252 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** 291 passing (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
@@ -467,6 +467,18 @@ relife chat
   **Not yet exercised live** against the real Gmail/Calendar connectors — their input field
   names aren't known here, so the recipient check is deliberately schema-agnostic; a first live
   run may show a legitimate send falling back to ask (the safe direction).
+- **MVP pass 10 — verb-based GitHub CLI policy — ✅ DONE (this phase).** `gh` was gated by
+  *group* (`gh pr|issue|release|api|gist` → ask), wrong in both directions: reading the
+  user's own work items (`gh issue list --assignee @me`, `gh pr view`) prompted — so a
+  scheduled "triage my issues" run was denied before it could look — while `gh repo delete`,
+  `gh repo edit --visibility public`, `gh secret set`, `gh workflow run` and `gh auth login`
+  ran **unasked**. Now `_gh_outward` (pure, in `permissions.py`) requires *every* `gh`
+  occurrence in the command — wrapped in `bash -c`, after `time`/`xargs`, a full `gh.exe`
+  path — to be a known read (`_GH_READ`) or `gh repo create|clone` (the v1 create→push flow,
+  kept autonomous like `git push`); everything else asks. `gh api` allows only a REST GET (no
+  method and no field flags, or an explicit `-X GET`); `graphql` always asks (it can mutate).
+  The system prompt tells the agent what reads freely and to show what it will post. 291 tests
+  (was 286).
 - **Phase 3 (next):** async
   `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
   acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call

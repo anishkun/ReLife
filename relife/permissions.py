@@ -82,8 +82,7 @@ _OUTWARD_SHELL = re.compile(
     # --- email senders -----------------------------------------------------
       \b(?:sendmail|mailx|mutt|mail)\b
     | \bSend-MailMessage\b
-    # --- GitHub CLI outward ops --------------------------------------------
-    | \bgh\s+(?:pr|issue|release|api|gist)\b
+    # (GitHub CLI is verb-based — see ``_gh_outward``.)
     # --- HTTP writes / uploads / downloads-to-disk -------------------------
     | \bcurl\b[^|;&]*\s(?:-d|--data\S*|-T|--upload-file|-X\s*(?:POST|PUT|DELETE|PATCH))\b
     | \bwget\b[^|;&]*--post
@@ -113,6 +112,120 @@ _OUTWARD_SHELL = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# --- GitHub CLI ------------------------------------------------------------
+# `gh` used to be gated by group (`gh pr|issue|release|api|gist` → ask), which
+# was wrong in both directions: reading the user's own work items (`gh issue
+# list --assignee @me`) prompted — so a scheduled "triage my issues" run could
+# not even look — while `gh repo delete`, `gh secret set` and `gh workflow run`
+# ran unasked. The policy is now verb-based and fail-closed, like connectors:
+# every `gh` invocation in the command must be a known read (or a local op);
+# anything else asks. `gh repo create` stays autonomous — it is the v1
+# build → create → push flow the user authorized, same as `git push`.
+_GH_READ: dict[str, frozenset[str] | None] = {
+    # group → read-only subcommands (None = every subcommand reads)
+    "pr": frozenset({"list", "view", "status", "diff", "checks", "checkout"}),
+    "issue": frozenset({"list", "view", "status"}),
+    "release": frozenset({"list", "view", "download"}),
+    "run": frozenset({"list", "view", "watch", "download"}),
+    "workflow": frozenset({"list", "view"}),
+    "repo": frozenset({"list", "view", "clone", "create"}),
+    "gist": frozenset({"list", "view", "clone"}),
+    "label": frozenset({"list"}),
+    "secret": frozenset({"list"}),
+    "variable": frozenset({"list", "get"}),
+    "cache": frozenset({"list"}),
+    "ruleset": frozenset({"list", "view", "check"}),
+    "project": frozenset({"list", "view", "field-list", "item-list"}),
+    "auth": frozenset({"status"}),
+    "search": None,
+    "status": None,
+    "help": None,
+    "version": None,
+}
+# Flags that may precede the group and consume the next token as their value.
+_GH_VALUE_FLAGS = {"-R", "--repo", "--hostname"}
+# Every `gh` occurrence anywhere in the command (inside `bash -c "…"`, after
+# `time`/`xargs`, a full path to gh.exe) — not just at a segment start, so a
+# wrapper can't smuggle a write past the check. Prose that happens to say
+# "gh …" asks, which is the safe direction.
+_GH_CALL = re.compile(r"""\bgh(?:\.exe)?["']?(?=\s|$)([^;|&\n]*)""", re.IGNORECASE)
+# `gh api` field flags switch the request to POST unless a method is given.
+_GH_API_FIELDS = re.compile(r"^(?:-[fF]|--field|--raw-field|--input)(?:=|$)|^-[fF].")
+
+
+def _gh_api_reads(args: list[str]) -> bool:
+    """True if a `gh api …` call is a plain GET of a REST endpoint."""
+    method: str | None = None
+    has_fields = False
+    endpoint: str | None = None
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in ("-X", "--method"):
+            method = args[i + 1] if i + 1 < len(args) else ""
+            i += 2
+            continue
+        if tok.startswith("--method="):
+            method = tok.split("=", 1)[1]
+        elif tok.startswith("-X") and len(tok) > 2:
+            method = tok[2:]
+        elif _GH_API_FIELDS.match(tok):
+            has_fields = True
+        elif tok in ("-H", "--header", "-q", "--jq", "-t", "--template",
+                     "--hostname", "--cache", "-p", "--preview"):
+            i += 2  # these take a value that must not be read as the endpoint
+            continue
+        elif not tok.startswith("-") and endpoint is None:
+            endpoint = tok
+        i += 1
+    if endpoint is None or endpoint.lower().lstrip("/") == "graphql":
+        return False  # graphql can mutate; reading via REST/`gh search` suffices
+    if method is not None:
+        return method.upper() == "GET"
+    return not has_fields
+
+
+def _gh_outward(command: str) -> str | None:
+    """The first `gh` invocation in ``command`` that isn't a known read, else None."""
+    for match in _GH_CALL.finditer(command):
+        args = [t.strip("\"'()`") for t in match.group(1).split()]
+        args = [a for a in args if a]
+        positional: list[str] = []
+        i = 0
+        while i < len(args) and len(positional) < 2:
+            tok = args[i]
+            if tok in _GH_VALUE_FLAGS:
+                i += 2
+                continue
+            if not tok.startswith("-"):
+                positional.append(tok.lower())
+            i += 1
+        if not positional:
+            continue  # bare `gh`, `gh --version`, `gh --help`
+        group = positional[0]
+        if group == "api":
+            if _gh_api_reads(_after(args, "api")):
+                continue
+            return "gh api " + " ".join(_after(args, "api"))[:60]
+        if group not in _GH_READ:
+            return f"gh {group}"
+        subs = _GH_READ[group]
+        if subs is None:
+            continue
+        sub = positional[1] if len(positional) > 1 else ""
+        if sub not in subs:
+            return f"gh {group} {sub}".rstrip()
+    return None
+
+
+def _after(args: list[str], word: str) -> list[str]:
+    """Tokens following the first case-insensitive ``word`` in ``args``."""
+    for i, tok in enumerate(args):
+        if tok.lower() == word:
+            return args[i + 1:]
+    return []
+
 
 # --- shell path analysis ----------------------------------------------------
 # The workspace boundary used to be enforced only on the Write/Edit tools, so
@@ -282,6 +395,9 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
         command = str(tool_input.get("command", ""))
         if _OUTWARD_SHELL.search(command):
             return "ask", "shell command looks outward-facing or destructive"
+        gh = _gh_outward(command)
+        if gh:
+            return "ask", f"GitHub CLI action changes the outside world: {gh}"
         # The workspace is a boundary for the shell too, not just for Write/Edit
         # — otherwise a single redirect walks around the whole file-write policy.
         escaped = _escapes(_write_targets(command), workspace, strict=False)

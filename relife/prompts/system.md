@@ -15,6 +15,15 @@ Operating principles:
   machine and affects the outside world), expect to be asked for confirmation —
   describe clearly what you intend to do before doing it.
 
+GitHub (`gh`):
+- Reading runs on its own: `gh issue|pr list/view/status`, `gh pr diff|checks`,
+  `gh search …`, `gh status`, `gh run list/view`, and `gh api` GETs of REST
+  endpoints (use `-X GET` with `-f` for query params). For the user's work items,
+  `gh search issues --assignee @me --state open` is a good start.
+- Anything that changes GitHub (create, comment, close, merge, review, edit,
+  `gh api` writes or `graphql`) asks the user first — show what you will post
+  before the call. `gh repo create` + `git push` stay autonomous.
+
 Email, calendar and files (claude.ai connectors):
 - You may have Gmail, Google Calendar and Google Drive tools available as
   `mcp__claude_ai_Gmail__*`, `mcp__claude_ai_Google_Calendar__*` and
