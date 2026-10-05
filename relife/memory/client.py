@@ -14,8 +14,11 @@ construct one; tests can still point it at an isolated store via the service.
 
 from __future__ import annotations
 
+import functools
 import warnings
-from typing import Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
+
+import anyio
 
 from .. import config
 from .events import Event
@@ -23,6 +26,24 @@ from .service import MemoryService
 from .skills import Skill
 from .store import Memory
 from .workflows import Workflow
+
+
+_T = TypeVar("_T")
+
+
+async def off_loop(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """Run a sync client call on a worker thread, for callers on an event loop.
+
+    The client is synchronous, but its async consumers — the memory hooks and
+    the memory MCP tools — run on the loop that ``relife serve`` shares across
+    *every* session. Inline, each recall (FTS scan, ONNX inference with
+    embeddings on), each journaled tool call (a loopback POST in daemon mode)
+    and an agent-requested consolidation froze every other session's stream
+    and pending approval for its duration. Safe to thread: the store opens a
+    fresh SQLite connection per call, the embedding model loads under a lock,
+    and ``httpx.Client`` is thread-safe.
+    """
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
 
 
 @runtime_checkable

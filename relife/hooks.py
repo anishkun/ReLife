@@ -31,7 +31,7 @@ from claude_agent_sdk import HookMatcher
 
 from . import config
 from .memory._text import tokenize as _tokens
-from .memory.client import default_client
+from .memory.client import default_client, off_loop
 
 
 def _is_dup(text: str, kept: list[set[str]]) -> bool:
@@ -68,10 +68,11 @@ async def _recall_hook(input_data: dict[str, Any], tool_use_id: str | None, cont
     # Remember the prompt (and where this turn starts in the journal) so the
     # Stop hook can pair intent with *this turn's* tool approach.
     if prompt:
-        _last_prompt[sid] = (prompt, _turn_start_event_id(client, sid))
+        _last_prompt[sid] = (prompt, await off_loop(_turn_start_event_id, client, sid))
 
     try:
-        return _recall_context(client, prompt)
+        # Off the loop: under `relife serve` every session shares it.
+        return await off_loop(_recall_context, client, prompt)
     except Exception:
         # Recall is a convenience, not a dependency: a memory daemon that is
         # down (or any store error) must degrade to "no recalled context",
@@ -141,8 +142,9 @@ async def _event_hook(input_data: dict[str, Any], tool_use_id: str | None, conte
             # RELIFE_MEMORY_URL is set (one loopback POST per tool call — fine at
             # localhost; in-process by default). Consolidate reads them back
             # daemon-side.
-            default_client().log_event(
-                tool, _brief(input_data.get("tool_input", {})), task_id=task_id
+            await off_loop(
+                default_client().log_event,
+                tool, _brief(input_data.get("tool_input", {})), task_id=task_id,
             )
         except Exception:
             pass  # journaling must never break a run
@@ -171,7 +173,7 @@ async def _episode_hook(input_data: dict[str, Any], tool_use_id: str | None, con
         return {}
     client = default_client()
     try:
-        evs = [e for e in client.events_for_task(sid) if e.id > start_id]
+        evs = [e for e in await off_loop(client.events_for_task, sid) if e.id > start_id]
     except Exception:
         return {}  # journal unreachable — nothing to capture, nothing to break
     if len(evs) < config.EPISODE_MIN_EVENTS:
@@ -182,7 +184,7 @@ async def _episode_hook(input_data: dict[str, Any], tool_use_id: str | None, con
         if not seq or seq[-1] != short:
             seq.append(short)
     try:
-        client.save(_episode_text(prompt, seq), kind="episode")
+        await off_loop(client.save, _episode_text(prompt, seq), kind="episode")
     except Exception:
         pass  # episodic capture must never break a run
     return {}

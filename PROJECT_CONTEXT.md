@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 291 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** 297 passing (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
@@ -479,11 +479,21 @@ relife chat
   method and no field flags, or an explicit `-X GET`); `graphql` always asks (it can mutate).
   The system prompt tells the agent what reads freely and to show what it will post. 291 tests
   (was 286).
-- **Phase 3 (next):** async
-  `MemoryClient` variants (today the sync recall/save/log briefly block an async caller's loop —
-  acceptable at loopback, only `dream` and now consolidation are offloaded; events now add one loopback POST per tool call
-  in http mode); outward capabilities
-  (email/calendar/work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
+- **MVP pass 11 — memory off the server's event loop — ✅ DONE (this phase).** Pass 4 moved
+  auto-consolidation to a thread, but the rest of memory still ran inline: the three hooks and
+  the memory MCP tools are `async` callers of the *sync* client, and under `relife serve` they
+  share one loop with every session — each recall (FTS + ONNX with embeddings), each
+  journaled tool call (a loopback POST in daemon mode) and an agent-called
+  `memory_consolidate` froze every other session's stream and pending approval. New
+  `memory.client.off_loop(fn, …)` (`anyio.to_thread`) wraps every such call; thread safety is
+  the pass-4 argument (fresh SQLite connection per call, locked model load, thread-safe
+  `httpx.Client`). This delivers the practical goal of the planned async `MemoryClient`
+  variants without a second client surface. Tests drive the real hooks/tools against a
+  blocking fake client with a 10ms ticker on the same loop (fail on the old code: 6/6).
+  297 tests (was 291).
+- **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
+  async caller off the loop via `off_loop`); remaining: more outward capabilities
+  (work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember

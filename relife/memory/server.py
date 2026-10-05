@@ -13,7 +13,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from .client import default_client
+from .client import default_client, off_loop
 
 
 @tool(
@@ -48,7 +48,8 @@ from .client import default_client
 )
 async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        mid = default_client().save(
+        mid = await off_loop(
+            default_client().save,
             text=args["text"],
             kind=args.get("kind", "fact"),
             tags=args.get("tags", ""),
@@ -74,7 +75,7 @@ async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
-    hits = default_client().recall(args["query"], k=int(args.get("k", 5)), reinforce=True)
+    hits = await off_loop(default_client().recall, args["query"], k=int(args.get("k", 5)), reinforce=True)
     if not hits:
         return {"content": [{"type": "text", "text": "(no relevant memories)"}]}
     lines = [f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "") for m in hits]
@@ -100,7 +101,9 @@ async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        slug = default_client().skill_write(args["name"], args.get("when_to_use", ""), args["steps"])
+        slug = await off_loop(
+            default_client().skill_write, args["name"], args.get("when_to_use", ""), args["steps"]
+        )
     except Exception as e:  # noqa: BLE001
         return {"content": [{"type": "text", "text": f"Error writing skill: {e}"}], "is_error": True}
     return {"content": [{"type": "text", "text": f"Saved skill '{slug}'."}]}
@@ -121,7 +124,7 @@ async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = default_client().skill_find(args["query"], k=int(args.get("k", 3)))
+    hits = await off_loop(default_client().skill_find, args["query"], k=int(args.get("k", 3)))
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching skills yet)"}]}
     blocks = [f"## {s.name}\nWhen to use: {s.when_to_use}\n\n{s.body}" for s in hits]
@@ -143,7 +146,7 @@ async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
-    forgotten = default_client().forget(args["query"])
+    forgotten = await off_loop(default_client().forget, args["query"])
     if forgotten is None:
         return {"content": [{"type": "text", "text": "(nothing matched; nothing forgotten)"}]}
     return {"content": [{"type": "text", "text": f"Archived: {forgotten.text}"}]}
@@ -168,7 +171,8 @@ async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        slug = default_client().workflow_write(
+        slug = await off_loop(
+            default_client().workflow_write,
             args["name"], args.get("when_to_use", ""), args["steps"], args.get("trigger", "")
         )
     except Exception as e:  # noqa: BLE001
@@ -190,7 +194,7 @@ async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = default_client().workflow_find(args["query"], k=int(args.get("k", 3)))
+    hits = await off_loop(default_client().workflow_find, args["query"], k=int(args.get("k", 3)))
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching workflows yet)"}]}
     blocks = [
@@ -209,7 +213,7 @@ async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        report = default_client().consolidate()
+        report = await off_loop(default_client().consolidate)
     except Exception as e:  # noqa: BLE001
         return {"content": [{"type": "text", "text": f"Error consolidating: {e}"}], "is_error": True}
     lines = [f"Consolidation: {report.summary()}."]
