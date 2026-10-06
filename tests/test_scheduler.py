@@ -189,6 +189,7 @@ class FakeManager:
         self.sessions: dict[str, FakeSession] = {}
         self.limit = limit
         self.created: list[Path] = []
+        self.closed: list[str] = []
 
     async def create(self, workspace: Path) -> FakeSession:
         from relife.server.session import SessionLimitReached
@@ -202,6 +203,10 @@ class FakeManager:
 
     def get(self, sid: str):
         return self.sessions.get(sid)
+
+    async def close(self, sid: str) -> bool:
+        self.closed.append(sid)
+        return self.sessions.pop(sid, None) is not None
 
 
 @pytest.fixture
@@ -807,3 +812,152 @@ def test_schedules_survive_an_app_rebuild(http, tmp_path):
     tc.post("/schedules", json={"name": "keep", "task": "t", "every": "1h"})
     tc2, _, _ = http()
     assert [s["name"] for s in tc2.get("/schedules").json()["schedules"]] == ["keep"]
+
+
+# =============================================================================
+# Work schedules — each firing takes the next assigned issue (fake gh)
+# =============================================================================
+class WorkGh:
+    """A fake `gh` for work schedules: search results, per-issue views, clones."""
+
+    def __init__(self, issues: list[dict], *, closed: tuple[int, ...] = (), fail: str | None = None):
+        self.issues = issues
+        self.closed = closed
+        self.fail = fail
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str]) -> str:
+        from relife.workitems import WorkItemError
+
+        self.calls.append(args)
+        if self.fail:
+            raise WorkItemError(self.fail)
+        if args[:2] == ["search", "issues"]:
+            return json.dumps([
+                {"number": i["number"], "title": i["title"], "labels": [{"name": x} for x in i.get("labels", [])],
+                 "repository": {"nameWithOwner": i.get("repo", "acme/web")}, "url": "u"}
+                for i in self.issues
+            ])
+        if args[:2] == ["issue", "view"]:
+            n = int(args[2])
+            i = next(x for x in self.issues if x["number"] == n)
+            return json.dumps({"number": n, "title": i["title"], "body": f"body of {n}",
+                               "state": "CLOSED" if n in self.closed else "OPEN"})
+        if args[:2] == ["repo", "clone"]:
+            (Path(args[3]) / ".git").mkdir(parents=True)
+            return ""
+        raise AssertionError(args)
+
+
+def _work_gh(monkeypatch, *a, **kw) -> WorkGh:
+    from relife import workitems
+
+    gh = WorkGh(*a, **kw)
+    monkeypatch.setattr(workitems, "run_gh", gh)
+    return gh
+
+
+def test_work_schedule_needs_no_task_and_validates_work():
+    s = Schedule.new(name="w", task="", spec={"every": "1h"}, work={"repo": "acme/web"}, now=0.0)
+    assert s.work == {"repo": "acme/web"} and s.task == ""
+    assert "acme/web" in s.to_dict()["work_text"]
+    assert Schedule.new(name="w", task="", spec={"every": "1h"}, work=True, now=0.0).work == {}
+    with pytest.raises(ValueError, match="task is required"):
+        Schedule.new(name="w", task="", spec={"every": "1h"}, now=0.0)
+    with pytest.raises(ValueError, match="owner/name"):
+        Schedule.new(name="w", task="", spec={"every": "1h"}, work={"repo": "nope"}, now=0.0)
+    # A hand-edited, broken work spec on disk disables rather than firing blank.
+    d = s.to_dict() | {"work": {"repo": "bad repo"}}
+    loaded = Schedule.from_dict(d)
+    assert loaded.work is None and loaded.enabled is False
+
+
+def test_work_schedule_takes_the_next_issue_each_firing(sched, monkeypatch):
+    scheduler, store, manager, root = sched
+    _work_gh(monkeypatch, [{"number": 3, "title": "Fix login"}, {"number": 5, "title": "Add docs"}])
+    s = store.add(Schedule.new(name="issues", task="keep PRs small", spec={"every": "1h"},
+                               workspace="gh", work={}, now=0.0))
+
+    async def flow():
+        assert await scheduler.fire(s, now=10.0) == "submitted"
+        checkout = root / "gh" / "acme__web"
+        assert manager.created == [checkout] and (checkout / ".git").is_dir()
+        prompt = manager.sessions[s.session_id].submitted[0]
+        assert prompt.startswith("[Scheduled run: issues]")
+        assert "<<<ISSUE acme/web#3" in prompt and "relife/issue-3-fix-login" in prompt
+        assert prompt.rstrip().endswith("keep PRs small")
+        assert s.worked == ["acme/web#3"] and s.runs[-1]["item"] == "acme/web#3"
+        await _complete(scheduler, manager, s)
+        first = s.session_id
+
+        # Next firing: the next issue, in a fresh session (the old one is closed).
+        assert await scheduler.fire(s, now=20.0) == "submitted"
+        assert manager.closed == [first] and s.session_id != first
+        assert "<<<ISSUE acme/web#5" in manager.sessions[s.session_id].submitted[0]
+        await _complete(scheduler, manager, s)
+
+        # Nothing new: skipped before any session exists — no budget spent.
+        n = len(manager.created)
+        assert await scheduler.fire(s, now=30.0) == "skipped: no new assigned issues"
+        assert len(manager.created) == n
+        assert ScheduleStore(store.path).get(s.id).worked == ["acme/web#3", "acme/web#5"]
+
+    anyio.run(flow)
+
+
+def test_work_schedule_label_filter_and_closed_issue(sched, monkeypatch):
+    scheduler, store, manager, _root = sched
+    _work_gh(monkeypatch, [
+        {"number": 1, "title": "untagged"},
+        {"number": 2, "title": "tagged but closed", "labels": ["relife"]},
+        {"number": 4, "title": "tagged", "labels": ["relife", "bug"]},
+    ], closed=(2,))
+    s = store.add(Schedule.new(name="w", task="", spec={"every": "1h"}, work={"label": "relife"}, now=0.0))
+
+    async def flow():
+        assert await scheduler.fire(s, now=1.0) == "skipped: acme/web#2 is closed"
+        assert s.worked == ["acme/web#2"] and not manager.created
+        assert await scheduler.fire(s, now=2.0) == "submitted"
+        assert "<<<ISSUE acme/web#4" in manager.sessions[s.session_id].submitted[0]
+        await _complete(scheduler, manager, s)
+
+    anyio.run(flow)
+
+
+def test_work_schedule_failures_dont_burn_the_issue(sched, monkeypatch):
+    scheduler, store, manager, _root = sched
+    gh = _work_gh(monkeypatch, [{"number": 3, "title": "Fix login"}], fail="HTTP 401: Bad credentials")
+    s = store.add(Schedule.new(name="w", task="", spec={"every": "1h"}, work={}, now=0.0))
+
+    async def flow():
+        assert await scheduler.fire(s, now=1.0) == "error: HTTP 401: Bad credentials"
+        assert s.worked == []
+        gh.fail = None
+        manager.limit = 0  # no session slot: skipped, and the issue stays available
+        assert (await scheduler.fire(s, now=2.0)).startswith("skipped: at most")
+        assert s.worked == []
+        manager.limit = 8
+        assert await scheduler.fire(s, now=3.0) == "submitted"
+        assert s.worked == ["acme/web#3"]
+        await _complete(scheduler, manager, s)
+
+    anyio.run(flow)
+
+
+def test_work_schedule_over_http(http, monkeypatch):
+    tc, created, _app = http()
+    _work_gh(monkeypatch, [{"number": 7, "title": "Bump deps"}])
+    r = tc.post("/schedules", json={"name": "w", "every": "1h", "work": {"repo": "acme/web"}})
+    assert r.status_code == 201, r.text
+    rec = r.json()
+    assert rec["work"] == {"repo": "acme/web"} and "acme/web" in rec["work_text"]
+    assert tc.post("/schedules", json={"name": "w", "every": "1h", "work": {"repo": "x"}}).status_code == 400
+
+    # Turning work off without giving a task is refused — and changes nothing.
+    assert tc.patch(f"/schedules/{rec['id']}", json={"work": None}).status_code == 400
+    assert tc.get(f"/schedules/{rec['id']}").json()["work"] == {"repo": "acme/web"}
+
+    body = tc.post(f"/schedules/{rec['id']}/run").json()
+    assert body["status"] == "submitted"
+    assert created[0].workspace.name == "acme__web"
+    assert body["schedule"]["runs"][-1]["item"] == "acme/web#7"

@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 319 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** 324 passing (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
@@ -503,9 +503,19 @@ relife chat
   call. All plumbing in `relife/workitems.py`, tested against a fake `gh` (22 tests). Smoke:
   `relife work` against the real account (read-only) returned cleanly. A live end-to-end run on
   a real issue is pending budget. 319 tests (was 297).
+- **MVP pass 13 — work schedules — ✅ DONE (this phase).** A schedule can now *be* `relife work`
+  on a cadence: `work: {}` (or `{"repo"}`/`{"label"}`) makes each firing take the next open
+  assigned issue it hasn't attempted, check it out under the schedule's workspace, and run the
+  issue prompt in a fresh session in that checkout. Selection/fetch/clone are deterministic and
+  run on a worker thread; an empty poll is `skipped` **before** a session is created (no budget
+  spent). An issue counts as attempted only once its turn is submitted. Unattended, the PR
+  creation is denied by timeout and shows up in the run's "needed you" list — the branch is
+  pushed. Web UI: a "work my assigned GitHub issues" toggle (repo/label, task becomes optional)
+  and a `⑂` line on the card. Verified in Chrome against an isolated server (fake sessions, temp
+  files). 324 tests (was 319).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
-  async caller off the loop via `off_loop`); remaining: work items from the web UI / schedules
-  (a schedule can already triage via `gh search`, but not open the branch+PR flow) — Anthropic **Managed Agents** is the natural host (hosted memory
+  async caller off the loop via `off_loop`); remaining: a narrow, opt-in grant for `gh pr create`
+  on a work schedule's own branch (today an unattended run can push but not open the PR) — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember

@@ -36,6 +36,8 @@ _AT_RE = re.compile(r"^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$")
 _DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 MAX_NAME_CHARS = 80
+MAX_WORKED = 200  # issue refs a work schedule remembers having attempted
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 # --- spec -------------------------------------------------------------------
@@ -141,6 +143,40 @@ def next_run(spec: dict[str, Any], now: float) -> float:
     raise ValueError("no next run within a week")  # pragma: no cover - days non-empty guarantees one
 
 
+# --- work items -------------------------------------------------------------
+def normalize_work(raw: Any) -> dict[str, Any] | None:
+    """A work schedule's source of issues, canonical form, or None.
+
+    ``{}`` = any open issue assigned to the user; ``{"repo": "o/r"}`` narrows
+    it to one repo, ``{"label": "relife"}`` to issues carrying that label —
+    the user's way to say *which* of their issues an unattended agent may take.
+    """
+    if raw in (None, False, ""):
+        return None
+    if raw is True:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("work must be an object like {\"repo\": \"owner/name\"}")
+    out: dict[str, Any] = {}
+    repo = str(raw.get("repo") or "").strip()
+    if repo:
+        if not _REPO_RE.match(repo):
+            raise ValueError("work.repo must look like owner/name")
+        out["repo"] = repo
+    label = str(raw.get("label") or "").strip()
+    if label:
+        if len(label) > 50:
+            raise ValueError("work.label is too long")
+        out["label"] = label
+    return out
+
+
+def describe_work(work: dict[str, Any]) -> str:
+    where = f" in {work['repo']}" if work.get("repo") else ""
+    label = f" labelled {work['label']}" if work.get("label") else ""
+    return f"works your assigned issues{where}{label} → branch + PR"
+
+
 # --- record -----------------------------------------------------------------
 @dataclass
 class Schedule:
@@ -159,6 +195,11 @@ class Schedule:
     # Pre-authorized outward actions for this schedule's runs (see
     # ``permissions.grant_allows``) — e.g. [{"kind": "email", "addresses": [me]}].
     grants: list[dict[str, Any]] = field(default_factory=list)
+    # A *work schedule* (``work`` set): each firing takes the next assigned
+    # GitHub issue not in ``worked`` and runs the `relife work` flow on it;
+    # ``task`` becomes optional extra instructions.
+    work: dict[str, Any] | None = None
+    worked: list[str] = field(default_factory=list)  # issue refs attempted, newest last
 
     @classmethod
     def new(
@@ -170,11 +211,13 @@ class Schedule:
         workspace: str = "",
         enabled: bool = True,
         grants: list[dict[str, Any]] | None = None,
+        work: Any = None,
         now: float | None = None,
     ) -> "Schedule":
         t = time.time() if now is None else now
         name = validate_name(name)
-        task = validate_task(task)
+        work = normalize_work(work)
+        task = validate_task(task, required=work is None)
         spec = normalize_spec(spec)
         grants = normalize_grants(grants)
         return cls(
@@ -187,7 +230,13 @@ class Schedule:
             created_at=t,
             next_run_at=next_run(spec, t),
             grants=grants,
+            work=work,
         )
+
+    def mark_worked(self, ref: str) -> None:
+        if ref not in self.worked:
+            self.worked.append(ref)
+            del self.worked[:-MAX_WORKED]
 
     def is_due(self, now: float) -> bool:
         return self.enabled and self.next_run_at <= now
@@ -226,6 +275,7 @@ class Schedule:
         d = asdict(self)
         d["spec_text"] = describe_spec(self.spec)
         d["grants_text"] = [describe_grant(g) for g in self.grants]
+        d["work_text"] = describe_work(self.work) if self.work is not None else None
         return d
 
     @classmethod
@@ -235,6 +285,11 @@ class Schedule:
             known["grants"] = normalize_grants(known.get("grants"))
         except ValueError:
             known["grants"] = []  # a hand-edited, invalid grant is dropped, never widened
+        try:
+            known["work"] = normalize_work(known.get("work"))
+        except ValueError:
+            known["work"] = None
+            known["enabled"] = False  # half a work schedule must not fire as a blank task
         return cls(**known)
 
 
@@ -247,9 +302,9 @@ def validate_name(name: Any) -> str:
     return s
 
 
-def validate_task(task: Any) -> str:
+def validate_task(task: Any, *, required: bool = True) -> str:
     s = str(task or "").strip()
-    if not s:
+    if not s and required:
         raise ValueError("task is required")
     if len(s) > config.AGENT_MAX_MESSAGE_CHARS:
         raise ValueError(f"task exceeds {config.AGENT_MAX_MESSAGE_CHARS} characters")

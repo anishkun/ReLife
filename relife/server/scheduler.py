@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from .. import workitems
 from .runs import RunRecord, RunStore
 from ..permissions import describe_grant
 from .schedules import Schedule, ScheduleStore
@@ -43,17 +44,31 @@ from .security import resolve_workspace
 from .session import SessionLimitReached, SessionManager, TooManySubscribers, TurnQueueFull
 
 
-def scheduled_prompt(schedule: Schedule) -> str:
+def scheduled_prompt(schedule: Schedule, body: str | None = None) -> str:
     """The turn text a firing submits. Tells the agent the run is automatic and
-    possibly unattended, so a denied approval is reported, not fought."""
+    possibly unattended, so a denied approval is reported, not fought.
+    ``body`` replaces the schedule's task (a work schedule's issue prompt)."""
     return (
         f"[Scheduled run: {schedule.name}] This turn was triggered automatically by a "
         "schedule, not typed by the user, and may be unattended — an action that needs "
         "approval can be denied by timeout; if that happens, say so and stop rather than "
         "retrying. Do the task, then finish with a short summary of what you did and "
         f"anything that needs the user.{_grants_note(schedule)}\n\n"
-        f"{schedule.task}"
+        f"{schedule.task if body is None else body}"
     )
+
+
+def pick_issue(schedule: Schedule, items: list[workitems.WorkItem]) -> workitems.WorkItem | None:
+    """The next issue a work schedule should take: newest-updated first, not
+    attempted before, carrying the schedule's label if it names one."""
+    label = (schedule.work or {}).get("label")
+    for item in items:
+        if item.ref in schedule.worked:
+            continue
+        if label and label not in item.labels:
+            continue
+        return item
+    return None
 
 
 def _grants_note(schedule: Schedule) -> str:
@@ -87,6 +102,7 @@ class Scheduler:
         self.tick_seconds = config.AGENT_SCHEDULER_TICK if tick is None else tick
         self.run_timeout = config.AGENT_SCHEDULE_RUN_TIMEOUT if run_timeout is None else run_timeout
         self._recorders: set[asyncio.Task[None]] = set()
+        self._item: dict[str, str] = {}  # schedule id → issue ref being started
 
     async def run(self) -> None:
         """Background loop: tick forever. Upkeep must never kill the server."""
@@ -124,15 +140,77 @@ class Scheduler:
         """Run one schedule now (due or not) and record the outcome."""
         t = time.time() if now is None else now
         run_id = RunRecord.new_id(t)
-        status = await self._submit(schedule, run_id, t)
+        status, item = await self._submit(schedule, run_id, t)
         schedule.record_run(t, status, run_id=run_id if status == "submitted" else None)
+        if item:
+            schedule.runs[-1]["item"] = item  # which issue a work schedule took
         self.store.save()
         return status
 
-    async def _submit(self, schedule: Schedule, run_id: str, now: float) -> str:
+    async def _prepare_work(self, schedule: Schedule) -> tuple[str, Path, str] | str:
+        """Pick, fetch and check out the next issue → (prompt body, checkout, ref),
+        or a status string when there's nothing to do. All ``gh``/git work is a
+        blocking subprocess, so it runs on a worker thread, never on the loop
+        every session shares."""
+        try:
+            base = resolve_workspace(schedule.workspace, self.root)
+        except ValueError as e:
+            return f"error: {e}"
+        work = schedule.work or {}
+        try:
+            items = await asyncio.to_thread(
+                workitems.list_assigned, repo=work.get("repo"), limit=50
+            )
+            item = pick_issue(schedule, items)
+            if item is None:
+                return "skipped: no new assigned issues"
+            full = await asyncio.to_thread(workitems.fetch, item.repo, item.number)
+            if full.state != "OPEN":
+                schedule.mark_worked(item.ref)
+                return f"skipped: {item.ref} is {full.state.lower()}"
+            checkout, _cloned = await asyncio.to_thread(
+                workitems.ensure_checkout, base, item.repo
+            )
+        except workitems.WorkItemError as e:
+            return f"error: {e}"
+        body = workitems.task_prompt(full, workitems.branch_name(full))
+        if schedule.task:
+            body += f"\nAdditional instructions from the user for these runs:\n{schedule.task}\n"
+        return body, checkout, full.ref
+
+    async def _submit(self, schedule: Schedule, run_id: str, now: float) -> tuple[str, str | None]:
+        status = await self._start(schedule, run_id, now)
+        item = self._item.pop(schedule.id, None)
+        if item and status.startswith("submitted"):
+            # Attempted, whatever the run's outcome: an unattended schedule must
+            # not grind on one issue every slot. `relife work REF` is how the
+            # user sends it back in.
+            schedule.mark_worked(item)
+        return status, item
+
+    async def _start(self, schedule: Schedule, run_id: str, now: float) -> str:
         session: Any = self.manager.get(schedule.session_id) if schedule.session_id else None
         if session is not None and getattr(session, "busy", False):
             return "skipped: previous run still in progress"
+        body: str | None = None
+        if schedule.work is not None:
+            prepared = await self._prepare_work(schedule)
+            if isinstance(prepared, str):
+                return prepared
+            body, checkout, self._item[schedule.id] = prepared
+            # Each issue runs in its own checkout, and a session's cwd is fixed
+            # at creation — so a work schedule gets a fresh session per firing
+            # (the previous one is idle: `busy` was checked above).
+            if session is not None:
+                await self.manager.close(session.id)
+                session = None
+            try:
+                session = await self.manager.create(checkout)
+            except SessionLimitReached as e:
+                return f"skipped: {e}"
+            except Exception as e:  # noqa: BLE001
+                return f"error: {e}"
+            schedule.session_id = session.id
         if session is None:
             try:
                 ws = resolve_workspace(schedule.workspace, self.root)
@@ -146,7 +224,7 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - a bad workspace/subprocess must not kill the tick
                 return f"error: {e}"
             schedule.session_id = session.id
-        prompt = scheduled_prompt(schedule)
+        prompt = scheduled_prompt(schedule, body)
         # Subscribe *before* submitting so the turn's first event can't be missed.
         try:
             queue, _backlog = session.subscribe()

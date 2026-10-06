@@ -196,7 +196,7 @@
   .addform .split { display: flex; gap: 8px; }
   .addform .split > * { flex: 1; min-width: 0; }
   .addform .days { display: flex; gap: 4px; flex-wrap: wrap; }
-  .addform .days[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
+  .addform .days[hidden], .addform .split[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
   .addform .days label { font-family: var(--mono); font-size: 11px; color: var(--muted);
     border: 1px solid var(--line); border-radius: 5px; padding: 3px 7px; cursor: pointer; user-select: none; }
   .addform .days input { display: none; }
@@ -254,6 +254,11 @@
     <div id="schedList"></div>
     <form class="addform" id="addForm" autocomplete="off">
       <input id="schName" placeholder="name (e.g. inbox triage)" maxlength="80" required />
+      <label class="check" title="Each run takes the next open GitHub issue assigned to you that it hasn't tried: branch → fix → test → push → PR (asks)"><input id="schWork" type="checkbox" /> work my assigned GitHub issues</label>
+      <div class="split" id="schWorkOpts" hidden>
+        <input id="schRepo" placeholder="repo: owner/name (optional)" />
+        <input id="schLabel" placeholder="only label (optional)" />
+      </div>
       <textarea id="schTask" placeholder="what should the agent do each time?" required></textarea>
       <div class="split">
         <select id="schKind">
@@ -672,7 +677,8 @@
       const outcome = lastRun && lastRun.summary ? `<div class="outcome" title="last run's closing summary">${esc(lastRun.summary)}</div>` : "";
       el.innerHTML = `
         <div class="top"><span class="name">${esc(sc.name)}</span><span class="cadence">${esc(sc.spec_text)}</span></div>
-        <div class="task">${esc(sc.task)}</div>
+        ${sc.task ? `<div class="task">${esc(sc.task)}</div>` : ""}
+        ${sc.work_text ? `<div class="grants" title="A work schedule: each run takes one new assigned issue">⑂ ${esc(sc.work_text)}</div>` : ""}
         ${(sc.grants_text || []).length ? `<div class="grants" title="Pre-approved: runs may do this without asking">✓ may ${sc.grants_text.map(esc).join(" · ")}</div>` : ""}
         <div class="meta">${sc.enabled ? "next " + esc(rel(sc.next_run_at)) : "paused"} · last: ${last}</div>
         ${outcome}
@@ -795,6 +801,15 @@
     schDays.hidden = !at;
     schValue.placeholder = at ? "09:00" : "30m, 2h, 1d";
   });
+  const schWork = document.getElementById("schWork");
+  const schTaskEl = document.getElementById("schTask");
+  const syncWork = () => {
+    const on = schWork.checked;
+    document.getElementById("schWorkOpts").hidden = !on;
+    schTaskEl.required = !on;
+    schTaskEl.placeholder = on ? "extra instructions for each run (optional)" : "what should the agent do each time?";
+  };
+  schWork.addEventListener("change", syncWork);
   addForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     schErr.textContent = "";
@@ -808,6 +823,13 @@
     if (addrs.length) grants.push({ kind: "email", addresses: addrs });
     if (document.getElementById("schCal").checked) grants.push({ kind: "calendar", addresses: addrs });
     if (grants.length) body.grants = grants;
+    if (schWork.checked) {
+      body.work = {};
+      const repo = document.getElementById("schRepo").value.trim();
+      const label = document.getElementById("schLabel").value.trim();
+      if (repo) body.work.repo = repo;
+      if (label) body.work.label = label;
+    }
     if (schKind.value === "at") {
       body.at = schValue.value;
       body.days = [...schDays.querySelectorAll("input:checked")].map(i => i.value);
@@ -822,7 +844,7 @@
         try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
         schErr.textContent = msg; return;
       }
-      addForm.reset(); schDays.hidden = true; schValue.placeholder = "30m, 2h, 1d";
+      addForm.reset(); syncWork(); schDays.hidden = true; schValue.placeholder = "30m, 2h, 1d";
       await loadSchedules();
     } catch (_) {
       schErr.textContent = "could not reach the server";

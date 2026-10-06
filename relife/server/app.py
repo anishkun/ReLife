@@ -68,6 +68,7 @@ from .schedules import (
     ScheduleStore,
     next_run,
     normalize_spec,
+    normalize_work,
     validate_name,
     validate_task,
 )
@@ -367,6 +368,7 @@ def create_app(
                 workspace=ws,
                 enabled=body.get("enabled", True),
                 grants=body.get("grants"),
+                work=body.get("work"),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -383,8 +385,11 @@ def create_app(
         try:
             if "name" in body:
                 schedule.name = validate_name(body["name"])
-            if "task" in body:
-                schedule.task = validate_task(body["task"])
+            # Validate work + task together before assigning either: turning
+            # work off must leave a task behind, never a blank schedule.
+            work = normalize_work(body["work"]) if "work" in body else schedule.work
+            task = validate_task(body.get("task", schedule.task), required=work is None)
+            schedule.work, schedule.task = work, task
             if "workspace" in body:
                 schedule.workspace = _check_workspace(body["workspace"])
             spec = _spec_from(body)
