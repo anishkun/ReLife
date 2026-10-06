@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 297 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** 319 passing (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
@@ -491,9 +491,21 @@ relife chat
   variants without a second client surface. Tests drive the real hooks/tools against a
   blocking fake client with a 10ms ticker on the same loop (fail on the old code: 6/6).
   297 tests (was 291).
+- **MVP pass 12 — work items: GitHub issues end-to-end — ✅ DONE (this phase).** The vision's
+  "complete assigned work items" now exists: `relife work` lists open issues assigned to the
+  user; `relife work owner/repo#12` (or an issue URL, or `12 --repo …`) fetches the issue,
+  clones the repo once into `<workspace>/<owner>__<name>`, and runs the agent *in that checkout*
+  (the auto-allow radius is one repo) on a branch `relife/issue-12-<slug>` → implement → test →
+  commit → `git push` (autonomous) → `gh pr create` with "Closes #12" (asks). The issue text is
+  third-party input, so the prompt fences it as untrusted data and bounds it; the policy is the
+  backstop. An existing checkout is never reset by our code (uncommitted work → the agent stops
+  and says so); a closed issue exits before cloning; `--dry-run` prints the task without a model
+  call. All plumbing in `relife/workitems.py`, tested against a fake `gh` (22 tests). Smoke:
+  `relife work` against the real account (read-only) returned cleanly. A live end-to-end run on
+  a real issue is pending budget. 319 tests (was 297).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
-  async caller off the loop via `off_loop`); remaining: more outward capabilities
-  (work-items) — Anthropic **Managed Agents** is the natural host (hosted memory
+  async caller off the loop via `off_loop`); remaining: work items from the web UI / schedules
+  (a schedule can already triage via `gh search`, but not open the branch+PR flow) — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember

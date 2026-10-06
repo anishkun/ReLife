@@ -2,6 +2,7 @@
 
     relife do "<task>"   [--workspace PATH]
     relife chat          [--workspace PATH]
+    relife work          [REF] [--repo R] [--dry-run]
 """
 
 from __future__ import annotations
@@ -66,6 +67,69 @@ def chat(
     anyio.run(
         lambda: run_chat(
             cwd=ws, can_use_tool=can_use_tool, mcp_servers=mcp_servers, hooks=hooks
+        )
+    )
+
+
+@app.command("work")
+def work(
+    ref: Optional[str] = typer.Argument(
+        None,
+        help="Issue to work on: owner/repo#12, an issue URL, or 12 with --repo. "
+        "Omit to list your open assigned issues.",
+    ),
+    repo: Optional[str] = typer.Option(None, "--repo", "-R", help="owner/repo (filter or default)."),
+    workspace: Optional[Path] = typer.Option(
+        None, "--workspace", "-w", help="Directory repos are cloned into."
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max issues to list."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Fetch and clone, print the agent's task, but don't run it."
+    ),
+) -> None:
+    """Work a GitHub issue end-to-end: branch → fix → test → push → PR (asks first)."""
+    from . import workitems as wi
+
+    try:
+        if ref is None:
+            items = wi.list_assigned(repo=repo, limit=limit)
+            if not items:
+                typer.echo("No open issues assigned to you" + (f" in {repo}." if repo else "."))
+                return
+            for it in items:
+                labels = f"  [{', '.join(it.labels)}]" if it.labels else ""
+                typer.echo(f"{it.ref:<32} {it.title[:70]}{labels}")
+            typer.secho(f"\nrelife work {items[0].ref}   — to work one", fg=typer.colors.BRIGHT_BLACK)
+            return
+
+        repo_name, number = wi.parse_ref(ref, repo)
+        item = wi.fetch(repo_name, number)
+        if item.state != "OPEN":
+            typer.secho(f"{item.ref} is {item.state.lower()} — nothing to do.", fg=typer.colors.YELLOW)
+            raise typer.Exit(code=1)
+        ws = _resolve_workspace(workspace)
+        checkout, cloned = wi.ensure_checkout(ws, repo_name)
+    except wi.WorkItemError as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1) from e
+
+    branch = wi.branch_name(item)
+    prompt = wi.task_prompt(item, branch)
+    typer.secho(
+        f"{item.ref}: {item.title}\ncheckout: {checkout}" + (" (cloned)" if cloned else "")
+        + f"\nbranch:   {branch}",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+    if dry_run:
+        typer.echo("\n" + prompt)
+        return
+    # The checkout *is* the workspace: auto-allowed writes stay inside this repo.
+    can_use_tool = make_permission_callback(checkout)
+    mcp_servers = config.default_mcp_servers()
+    hooks = memory_hooks()
+    anyio.run(
+        lambda: run_task(
+            prompt, cwd=checkout, can_use_tool=can_use_tool, mcp_servers=mcp_servers, hooks=hooks
         )
     )
 

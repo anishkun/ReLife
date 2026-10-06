@@ -13,7 +13,7 @@ pip install -e .                  # install (editable); creates the `relife` ent
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
 pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
 pip install -e ".[server]"        # + optional always-on agent server + web UI (fastapi/uvicorn)
-python -m pytest tests/           # run all tests (297: 293 deterministic + 4 semantic) — use the interpreter
+python -m pytest tests/           # run all tests (319: 315 deterministic + 4 semantic) — use the interpreter
                                   #   ReLife is installed into (plain `python` may lack the SDK; `py -3` here)
 python -m ruff check relife tests scripts   # lint baseline ([tool.ruff] in pyproject); kept at zero findings
 python -m pytest tests/test_permissions.py::test_name -v   # single test
@@ -21,6 +21,8 @@ python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memor
 
 relife do "<task>"                # one-shot: run a task to completion
 relife chat                       # interactive multi-turn session
+relife work [REF] [--repo R] [--dry-run]   # no REF: list your open assigned GitHub issues; with REF
+                                  #   (owner/repo#12 | issue URL | 12 --repo R): clone → branch → fix → test → push → PR (asks)
 relife build "<spec>"             # orchestrated large build (decompose → delegate → resume)
 relife build --resume [ID]        # continue a build (most recent for the workspace if no ID)
 relife doctor [--json]            # check CLI+login, model, node, gh, FTS5, data/workspace dirs, extras, memory daemon,
@@ -76,6 +78,9 @@ Memory behaves like a brain: each item's relevance **rises when used** and **fad
 - `_text.py` — shared stopword tokenizer used by every keyword path.
 
 The system prompt uses the **`claude_code` preset** with `prompts/system.md` appended (persona + safety + memory/skill/workflow instructions). `setting_sources=None` deliberately prevents inheriting the surrounding repo's Claude Code settings.
+
+### Work items (`relife/workitems.py`)
+`relife work` works a GitHub issue end-to-end. Everything *around* the agent is deterministic and lives in `workitems.py` (unit-tested against a fake `gh` runner, zero model calls): `parse_ref` (`owner/repo#N`, issue URL, or `N` + `--repo`; a PR URL is rejected), `list_assigned` (`gh search issues --assignee @me`), `fetch` (body + last `MAX_COMMENTS` comments), `ensure_checkout` (clones to `<workspace>/<owner>__<name>` once; an existing checkout is **left untouched** — it may hold uncommitted work, so syncing is the agent's first, visible step), `branch_name` (`relife/issue-N-<slug>`, stable per title so a rerun resumes the branch), and `task_prompt`. **The checkout is the agent's workspace**, so the auto-allow write radius is that one repo. Issue text is written by third parties, so the prompt **fences it as untrusted data** (`<<<ISSUE … ISSUE>>>`, bounded by `BODY_LIMIT`/`COMMENT_LIMIT`); the permission policy is the backstop — branch + commit + `git push` are autonomous, `gh pr create` and any issue comment/close/edit ask. A closed issue exits 1 before anything is cloned. `run_gh` is looked up at call time (`run or run_gh`) so tests monkeypatch it.
 
 ### Build orchestration (`relife/build/`)
 `relife build` scales to large projects the single-context `do` loop can't: it **decomposes → delegates → resumes**.
