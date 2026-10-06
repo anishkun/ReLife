@@ -196,7 +196,7 @@
   .addform .split { display: flex; gap: 8px; }
   .addform .split > * { flex: 1; min-width: 0; }
   .addform .days { display: flex; gap: 4px; flex-wrap: wrap; }
-  .addform .days[hidden], .addform .split[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
+  .addform .days[hidden], .addform .split[hidden], .addform .check[hidden] { display: none; }   /* author `display:flex` beats the UA [hidden] rule */
   .addform .days label { font-family: var(--mono); font-size: 11px; color: var(--muted);
     border: 1px solid var(--line); border-radius: 5px; padding: 3px 7px; cursor: pointer; user-select: none; }
   .addform .days input { display: none; }
@@ -259,6 +259,7 @@
         <input id="schRepo" placeholder="repo: owner/name (optional)" />
         <input id="schLabel" placeholder="only label (optional)" />
       </div>
+      <label class="check" id="schPrWrap" hidden title="Only a plain gh pr create for that run's own repo and issue branch — anything else still asks"><input id="schPr" type="checkbox" /> may open the PR without asking</label>
       <textarea id="schTask" placeholder="what should the agent do each time?" required></textarea>
       <div class="split">
         <select id="schKind">
@@ -806,6 +807,7 @@
   const syncWork = () => {
     const on = schWork.checked;
     document.getElementById("schWorkOpts").hidden = !on;
+    document.getElementById("schPrWrap").hidden = !on;
     schTaskEl.required = !on;
     schTaskEl.placeholder = on ? "extra instructions for each run (optional)" : "what should the agent do each time?";
   };
@@ -824,6 +826,8 @@
     if (document.getElementById("schCal").checked) grants.push({ kind: "calendar", addresses: addrs });
     if (grants.length) body.grants = grants;
     if (schWork.checked) {
+      if (document.getElementById("schPr").checked) grants.push({ kind: "pull_request" });
+      if (grants.length) body.grants = grants;
       body.work = {};
       const repo = document.getElementById("schRepo").value.trim();
       const label = document.getElementById("schLabel").value.trim();

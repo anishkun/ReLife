@@ -66,6 +66,7 @@ from .scheduler import Scheduler
 from .schedules import (
     Schedule,
     ScheduleStore,
+    check_grants_fit,
     next_run,
     normalize_spec,
     normalize_work,
@@ -389,7 +390,9 @@ def create_app(
             # work off must leave a task behind, never a blank schedule.
             work = normalize_work(body["work"]) if "work" in body else schedule.work
             task = validate_task(body.get("task", schedule.task), required=work is None)
-            schedule.work, schedule.task = work, task
+            grants = normalize_grants(body["grants"]) if "grants" in body else schedule.grants
+            check_grants_fit(grants, work)
+            schedule.work, schedule.task, schedule.grants = work, task, grants
             if "workspace" in body:
                 schedule.workspace = _check_workspace(body["workspace"])
             spec = _spec_from(body)
@@ -398,8 +401,6 @@ def create_app(
                 schedule.next_run_at = next_run(schedule.spec, time.time())
             if "enabled" in body:
                 schedule.enabled = bool(body["enabled"])
-            if "grants" in body:
-                schedule.grants = normalize_grants(body["grants"])
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         store.save()

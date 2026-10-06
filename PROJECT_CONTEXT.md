@@ -62,7 +62,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 324 passing (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** 360 passing (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome and doctor suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
@@ -513,9 +513,20 @@ relife chat
   pushed. Web UI: a "work my assigned GitHub issues" toggle (repo/label, task becomes optional)
   and a `⑂` line on the card. Verified in Chrome against an isolated server (fake sessions, temp
   files). 324 tests (was 319).
+- **MVP pass 14 — the pull-request grant — ✅ DONE (this phase).** An unattended work schedule
+  could push its branch but not open the PR (the ask timed out to deny). A new grant kind,
+  `pull_request`, is the first (and only) grant that touches the shell, so it is the narrowest:
+  allowed only on a work schedule, stored *unbound*, bound per turn by the scheduler to that
+  issue's repo + branch, and then it pre-approves one exact shape — a single `gh pr create` with
+  matching `--repo`/`--head`, only title/body/base/draft/fill flags, no `$`/backtick, no operator,
+  no extra argument (no `--body-file`, reviewers, labels, `--web`). Everything else still asks;
+  the per-turn use cap and `approval_auto` journaling apply as for email/calendar. The agent is
+  told the exact shape in the scheduled preamble. UI: "may open the PR without asking" under the
+  work toggle. 36 new tests, mostly bypass attempts (chains, newlines, `$(…)`, `$env:`, backticks,
+  `--body-file`, wrong repo/head, `bash -c` wrapping). 360 tests (was 324).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
-  async caller off the loop via `off_loop`); remaining: a narrow, opt-in grant for `gh pr create`
-  on a work schedule's own branch (today an unattended run can push but not open the PR) — Anthropic **Managed Agents** is the natural host (hosted memory
+  async caller off the loop via `off_loop`); remaining: a first live end-to-end `relife work` on
+  a real issue (budget), and the deferred live skills round-trip / `relife dream` smoke — Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember

@@ -44,7 +44,9 @@ from .security import resolve_workspace
 from .session import SessionLimitReached, SessionManager, TooManySubscribers, TurnQueueFull
 
 
-def scheduled_prompt(schedule: Schedule, body: str | None = None) -> str:
+def scheduled_prompt(
+    schedule: Schedule, body: str | None = None, grants: list[dict[str, Any]] | None = None
+) -> str:
     """The turn text a firing submits. Tells the agent the run is automatic and
     possibly unattended, so a denied approval is reported, not fought.
     ``body`` replaces the schedule's task (a work schedule's issue prompt)."""
@@ -53,7 +55,7 @@ def scheduled_prompt(schedule: Schedule, body: str | None = None) -> str:
         "schedule, not typed by the user, and may be unattended — an action that needs "
         "approval can be denied by timeout; if that happens, say so and stop rather than "
         "retrying. Do the task, then finish with a short summary of what you did and "
-        f"anything that needs the user.{_grants_note(schedule)}\n\n"
+        f"anything that needs the user.{_grants_note(schedule, grants)}\n\n"
         f"{schedule.task if body is None else body}"
     )
 
@@ -71,17 +73,40 @@ def pick_issue(schedule: Schedule, items: list[workitems.WorkItem]) -> workitems
     return None
 
 
-def _grants_note(schedule: Schedule) -> str:
+def _grants_note(schedule: Schedule, grants: list[dict[str, Any]] | None = None) -> str:
     """One sentence (same paragraph — the UI splits the preamble at the first
     blank line) telling the agent what it may do without an approval."""
-    if not schedule.grants:
+    grants = schedule.grants if grants is None else grants
+    if not grants:
         return ""
-    allowed = "; ".join(describe_grant(g) for g in schedule.grants)
+    allowed = "; ".join(describe_grant(g) for g in grants)
+    pr = next((g for g in grants if g.get("kind") == "pull_request" and g.get("repo")), None)
+    how = (
+        f" For the pull request that means one plain `gh pr create --repo {pr['repo']} "
+        f"--head {pr['branch']} --title \"…\" --body \"…\"` call (optionally --base/--draft) "
+        "with no `$` or backticks in it and nothing chained — any other shape asks."
+        if pr else ""
+    )
     return (
         f" The user pre-approved these actions for this run, so they need no approval: "
-        f"{allowed} (at most {config.AGENT_GRANT_MAX_USES} uses). Anything else still "
+        f"{allowed} (at most {config.AGENT_GRANT_MAX_USES} uses).{how} Anything else still "
         "needs approval."
     )
+
+
+def bind_grants(
+    grants: list[dict[str, Any]], repo: str | None, branch: str | None
+) -> list[dict[str, Any]]:
+    """The grants one turn runs with: a stored ``pull_request`` grant is bound
+    to this issue's repo + branch, or dropped when there's no issue to bind."""
+    out = []
+    for g in grants:
+        if g.get("kind") == "pull_request":
+            if repo and branch:
+                out.append({"kind": "pull_request", "repo": repo, "branch": branch})
+            continue
+        out.append(g)
+    return out
 
 
 class Scheduler:
@@ -147,8 +172,8 @@ class Scheduler:
         self.store.save()
         return status
 
-    async def _prepare_work(self, schedule: Schedule) -> tuple[str, Path, str] | str:
-        """Pick, fetch and check out the next issue → (prompt body, checkout, ref),
+    async def _prepare_work(self, schedule: Schedule) -> tuple[str, Path, str, str] | str:
+        """Pick, fetch and check out the next issue → (body, checkout, ref, branch),
         or a status string when there's nothing to do. All ``gh``/git work is a
         blocking subprocess, so it runs on a worker thread, never on the loop
         every session shares."""
@@ -173,10 +198,11 @@ class Scheduler:
             )
         except workitems.WorkItemError as e:
             return f"error: {e}"
-        body = workitems.task_prompt(full, workitems.branch_name(full))
+        branch = workitems.branch_name(full)
+        body = workitems.task_prompt(full, branch)
         if schedule.task:
             body += f"\nAdditional instructions from the user for these runs:\n{schedule.task}\n"
-        return body, checkout, full.ref
+        return body, checkout, full.ref, branch
 
     async def _submit(self, schedule: Schedule, run_id: str, now: float) -> tuple[str, str | None]:
         status = await self._start(schedule, run_id, now)
@@ -193,11 +219,14 @@ class Scheduler:
         if session is not None and getattr(session, "busy", False):
             return "skipped: previous run still in progress"
         body: str | None = None
+        repo = branch = None
         if schedule.work is not None:
             prepared = await self._prepare_work(schedule)
             if isinstance(prepared, str):
                 return prepared
-            body, checkout, self._item[schedule.id] = prepared
+            body, checkout, ref, branch = prepared
+            self._item[schedule.id] = ref
+            repo = ref.split("#", 1)[0]
             # Each issue runs in its own checkout, and a session's cwd is fixed
             # at creation — so a work schedule gets a fresh session per firing
             # (the previous one is idle: `busy` was checked above).
@@ -224,7 +253,8 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - a bad workspace/subprocess must not kill the tick
                 return f"error: {e}"
             schedule.session_id = session.id
-        prompt = scheduled_prompt(schedule, body)
+        grants = bind_grants(schedule.grants, repo, branch)
+        prompt = scheduled_prompt(schedule, body, grants)
         # Subscribe *before* submitting so the turn's first event can't be missed.
         try:
             queue, _backlog = session.subscribe()
@@ -236,7 +266,7 @@ class Scheduler:
             queue = None
             unrecorded = f"submitted (unrecorded: {e})"
         try:
-            await session.submit(prompt, grants=schedule.grants)
+            await session.submit(prompt, grants=grants)
         except TurnQueueFull as e:
             if queue is not None:
                 session.unsubscribe(queue)

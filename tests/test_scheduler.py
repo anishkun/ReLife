@@ -961,3 +961,38 @@ def test_work_schedule_over_http(http, monkeypatch):
     assert body["status"] == "submitted"
     assert created[0].workspace.name == "acme__web"
     assert body["schedule"]["runs"][-1]["item"] == "acme/web#7"
+
+
+def test_work_schedule_binds_the_pr_grant_to_its_issue(sched, monkeypatch):
+    scheduler, store, manager, _root = sched
+    _work_gh(monkeypatch, [{"number": 3, "title": "Fix login"}])
+    s = store.add(Schedule.new(name="w", task="", spec={"every": "1h"}, work={},
+                               grants=[{"kind": "pull_request"}], now=0.0))
+
+    async def flow():
+        assert await scheduler.fire(s, now=1.0) == "submitted"
+        sess = manager.sessions[s.session_id]
+        bound = {"kind": "pull_request", "repo": "acme/web", "branch": "relife/issue-3-fix-login"}
+        assert sess.grants == [[bound]]
+        assert "gh pr create --repo acme/web --head relife/issue-3-fix-login" in sess.submitted[0]
+        assert s.grants == [{"kind": "pull_request"}]  # the stored grant stays unbound
+        await _complete(scheduler, manager, s)
+
+    anyio.run(flow)
+
+
+def test_pr_grant_over_http(http):
+    tc, _created, _app = http()
+    assert tc.post("/schedules", json={"name": "n", "task": "t", "every": "1h",
+                                       "grants": [{"kind": "pull_request"}]}).status_code == 400
+    rec = tc.post("/schedules", json={"name": "n", "every": "1h", "work": {},
+                                      "grants": [{"kind": "pull_request"}]}).json()
+    assert rec["grants"] == [{"kind": "pull_request"}] and rec["grants_text"]
+    # Turning work off while the PR grant remains is refused, atomically.
+    r = tc.patch(f"/schedules/{rec['id']}", json={"work": None, "task": "plain task"})
+    assert r.status_code == 400
+    after = tc.get(f"/schedules/{rec['id']}").json()
+    assert after["work"] == {} and after["task"] == ""
+    # Dropping both together is fine.
+    r = tc.patch(f"/schedules/{rec['id']}", json={"work": None, "task": "plain", "grants": []})
+    assert r.status_code == 200 and r.json()["work"] is None

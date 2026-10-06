@@ -171,6 +171,14 @@ def normalize_work(raw: Any) -> dict[str, Any] | None:
     return out
 
 
+def check_grants_fit(grants: list[dict[str, Any]], work: dict[str, Any] | None) -> None:
+    """A ``pull_request`` grant only means something on a work schedule (the
+    scheduler binds it to the issue's repo + branch); elsewhere it's refused
+    rather than silently kept as a grant that can never apply."""
+    if work is None and any(g.get("kind") == "pull_request" for g in grants):
+        raise ValueError("a pull_request grant needs a work schedule")
+
+
 def describe_work(work: dict[str, Any]) -> str:
     where = f" in {work['repo']}" if work.get("repo") else ""
     label = f" labelled {work['label']}" if work.get("label") else ""
@@ -220,6 +228,7 @@ class Schedule:
         task = validate_task(task, required=work is None)
         spec = normalize_spec(spec)
         grants = normalize_grants(grants)
+        check_grants_fit(grants, work)
         return cls(
             id=uuid.uuid4().hex[:12],
             name=name,

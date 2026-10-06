@@ -14,6 +14,7 @@ wraps it with an interactive terminal y/n prompt for the ask cases.
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -440,7 +441,15 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
 #     allowlisted address (a group alias, garbage) fails the check;
 #   * email must name at least one recipient we can see (a reply that infers
 #     its recipient from the thread, or a raw MIME blob, falls back to asking).
-GRANT_KINDS = ("email", "calendar")
+#
+# The one exception to "connectors only" is ``pull_request``, and it is the
+# narrowest grant there is: stored on a *work schedule* as a bare
+# ``{"kind": "pull_request"}`` that matches nothing; the scheduler binds it per
+# turn to the issue's repo and branch, and only then does it allow exactly one
+# command shape — a single ``gh pr create`` whose ``--repo``/``--head`` are
+# that repo and branch, with only title/body/base/draft/fill flags, and no
+# ``$``, backtick, redirect, pipe, chain or extra argument anywhere.
+GRANT_KINDS = ("email", "calendar", "pull_request")
 GRANT_MAX_ADDRESSES = 5
 _EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _EMAIL_FULL = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -487,6 +496,11 @@ def normalize_grants(raw: Any) -> list[dict[str, Any]]:
             raise ValueError(f"unknown grant kind {kind!r} (expected one of {', '.join(GRANT_KINDS)})")
         if kind in out:
             raise ValueError(f"duplicate {kind} grant")
+        if kind == "pull_request":
+            # Stored unbound: repo/branch are the scheduler's to fill per turn,
+            # never the caller's — anything else in the object is dropped.
+            out[kind] = {"kind": kind}
+            continue
         addrs = g.get("addresses", [])
         if isinstance(addrs, str):
             addrs = [a for a in re.split(r"[,;\s]+", addrs) if a]
@@ -508,6 +522,10 @@ def normalize_grants(raw: Any) -> list[dict[str, Any]]:
 
 
 def describe_grant(grant: dict[str, Any]) -> str:
+    if grant.get("kind") == "pull_request":
+        if grant.get("repo") and grant.get("branch"):
+            return f"open one pull request in {grant['repo']} from {grant['branch']}"
+        return "open the pull request for the issue branch it pushed"
     addrs = ", ".join(grant.get("addresses") or [])
     if grant.get("kind") == "email":
         return f"send email only to {addrs}"
@@ -542,13 +560,82 @@ def _addresses_in(value: Any, key: str = "") -> tuple[set[str], bool]:
     return found, junk
 
 
+# `gh pr create` flags a bound pull_request grant tolerates → takes a value?
+_PR_FLAGS: dict[str, bool] = {
+    "--repo": True, "-R": True, "--head": True, "-H": True, "--base": True, "-B": True,
+    "--title": True, "-t": True, "--body": True, "-b": True, "--draft": False, "-d": False,
+    "--fill": False, "-f": False,
+}
+_PR_ALIASES = {"-R": "--repo", "-H": "--head", "-B": "--base", "-t": "--title",
+               "-b": "--body", "-d": "--draft", "-f": "--fill"}
+_PR_FORBIDDEN_CHARS = re.compile(r"[$`]")  # expansion/substitution in bash *and* PowerShell
+_PR_OPERATOR = re.compile(r"^[;&|<>()]+$")
+
+
+def _pr_create_matches(grant: dict[str, Any], tool_input: dict[str, Any]) -> bool:
+    """Pure: is this shell call exactly one bound-safe ``gh pr create``?"""
+    repo, branch = str(grant.get("repo") or ""), str(grant.get("branch") or "")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not repo or not branch or not isinstance(command, str):
+        return False  # an unbound grant matches nothing
+    if _PR_FORBIDDEN_CHARS.search(command):
+        return False
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""  # a `#` must not hide the rest of the line from us
+        tokens = list(lex)
+    except ValueError:
+        return False  # unbalanced quotes
+    if any(_PR_OPERATOR.match(t) for t in tokens):
+        return False  # ; | & && || > < ( ) — a second command or a redirect
+    if len(tokens) < 3 or Path(tokens[0]).name.lower() not in ("gh", "gh.exe"):
+        return False
+    if [t.lower() for t in tokens[1:3]] != ["pr", "create"]:
+        return False
+    seen: dict[str, str] = {}
+    i = 3
+    while i < len(tokens):
+        tok = tokens[i]
+        flag, eq, val = tok.partition("=") if tok.startswith("--") else (tok, "", "")
+        if flag not in _PR_FLAGS:
+            return False  # positional args, --body-file, --reviewer, --label, --web, …
+        name = _PR_ALIASES.get(flag, flag)
+        if name in seen:
+            return False
+        if _PR_FLAGS[flag]:
+            if not eq:
+                if i + 1 >= len(tokens):
+                    return False
+                i += 1
+                val = tokens[i]
+            seen[name] = val
+        elif eq:
+            return False
+        else:
+            seen[name] = ""
+        i += 1
+    return (
+        seen.get("--repo", "").lower() == repo.lower()
+        and seen.get("--head") == branch
+        and not seen.get("--base", "").startswith("-")
+    )
+
+
 def grant_allows(
     grants: list[dict[str, Any]], tool_name: str, tool_input: dict[str, Any]
 ) -> str | None:
     """Pure: the description of the grant that pre-authorizes this call, or
     ``None`` (→ the normal ask path). Never consulted for a call ``classify``
     already allows, and never widens anything but connector actions."""
-    if not grants or not tool_name.startswith(_CONNECTOR_PREFIX):
+    if not grants:
+        return None
+    if tool_name in _SHELL_TOOLS:
+        for grant in grants:
+            if grant.get("kind") == "pull_request" and _pr_create_matches(grant, tool_input):
+                return describe_grant(grant)
+        return None
+    if not tool_name.startswith(_CONNECTOR_PREFIX):
         return None
     service = tool_name[len(_CONNECTOR_PREFIX):].split("__", 1)[0].lower()
     op = _connector_tool(tool_name)
