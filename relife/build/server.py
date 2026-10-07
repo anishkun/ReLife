@@ -94,6 +94,6 @@ def build_server(ledger: BuildLedger):
     """Return the MCP server config bound to ``ledger``."""
     return create_sdk_mcp_server(
         name="relife_build",
-        version="0.1.0",
+        version="1.0.0",
         tools=build_tools(ledger),
     )

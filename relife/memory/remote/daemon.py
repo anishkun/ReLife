@@ -88,7 +88,7 @@ def create_app(
     _bind_db(db_path)
     _bind_dirs(skills_dir, workflows_dir)
     svc = MemoryService()  # default: follows the _DB_PATH we just bound
-    app = FastAPI(title="ReLife memory daemon", version="0.1.0")
+    app = FastAPI(title="ReLife memory daemon", version="1.0.0")
 
     def require_token(authorization: str | None = Header(default=None)) -> None:
         if token is None:
