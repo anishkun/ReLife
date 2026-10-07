@@ -42,7 +42,7 @@ server = [
 ]
 
 [project.scripts]
-relife = "relife.cli:app"
+relife = "relife.cli:main"
 
 [build-system]
 requires = ["hatchling"]

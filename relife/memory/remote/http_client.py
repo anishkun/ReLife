@@ -73,13 +73,14 @@ class HttpMemoryClient:
         """POST a write, translating the daemon's 400 (invalid input) back into
         the ``ValueError`` the in-process path raises, so both transports fail
         identically for consumers (and the conformance suite stays parametrizable)."""
-        try:
-            return self._post(path, json)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:
-                detail = e.response.json().get("detail", str(e))
-                raise ValueError(detail) from None
-            raise
+        # Checked on the response, not by catching ``httpx.HTTPStatusError``: an
+        # injected client (Starlette's TestClient now rides ``httpx2``) raises
+        # its own library's exception class.
+        r = self._client.post(path, json=json)
+        if r.status_code == 400:
+            raise ValueError(r.json().get("detail", "invalid request"))
+        r.raise_for_status()
+        return r.json()
 
     # --- MemoryClient protocol ---------------------------------------------
     def save(self, text, kind="fact", tags="", importance=None) -> int:

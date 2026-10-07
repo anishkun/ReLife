@@ -22,6 +22,8 @@ from .permissions import make_permission_callback
 app = typer.Typer(
     add_completion=False,
     help="ReLife — a personal agent that acts through MCP and learns over time.",
+    # Locals in a traceback can hold a token, a memory's text, an email body.
+    pretty_exceptions_show_locals=False,
 )
 
 
@@ -524,5 +526,34 @@ def memory_ping() -> None:
     typer.secho(f"ok — {base} {r.json()}", fg=typer.colors.GREEN)
 
 
+def _friendly_error(e: BaseException) -> str | None:
+    """A one-line explanation for failures that are the environment's, not a bug."""
+    import sqlite3
+
+    if isinstance(e, sqlite3.DatabaseError):
+        return (
+            f"memory database is unreadable ({e}): {config.MEMORY_DB_PATH}\n"
+            "  move it aside (or restore a backup) and ReLife will start a fresh one"
+        )
+    if type(e).__name__ in {"ConnectError", "ConnectTimeout"} and config.MEMORY_URL:
+        return (
+            f"memory daemon not reachable at {config.MEMORY_URL} ({e})\n"
+            "  start it with `relife memory serve`, or unset RELIFE_MEMORY_URL to use in-process memory"
+        )
+    return None
+
+
+def main() -> None:
+    """Console entry point: ``app()`` with environment failures made readable."""
+    try:
+        app()
+    except Exception as e:  # noqa: BLE001
+        msg = _friendly_error(e)
+        if msg is None:
+            raise
+        typer.secho(f"error: {msg}", fg=typer.colors.RED, err=True)
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    app()
+    main()

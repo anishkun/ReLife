@@ -13,11 +13,13 @@ pip install -e .                  # install (editable); creates the `relife` ent
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
 pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
 pip install -e ".[server]"        # + optional always-on agent server + web UI (fastapi/uvicorn)
-python -m pytest tests/           # run all tests (360: 356 deterministic + 4 semantic) — use the interpreter
+python -m pytest tests/           # run all tests (648: deterministic + 4 semantic) — use the interpreter
                                   #   ReLife is installed into (plain `python` may lack the SDK; `py -3` here)
 python -m ruff check relife tests scripts   # lint baseline ([tool.ruff] in pyproject); kept at zero findings
 python -m pytest tests/test_permissions.py::test_name -v   # single test
 python scripts/bench_recall.py    # non-CI: recall scaling benchmark (10k+ memories)
+# CI: .github/workflows/ci.yml (lint; tests on Win+Linux × py3.11-3.13 × base/all-extras; wheel smoke; pip-audit)
+# release checklist (incl. the budget-spending live smokes): RELEASE_TESTING.md
 
 relife do "<task>"                # one-shot: run a task to completion
 relife chat                       # interactive multi-turn session
@@ -37,7 +39,11 @@ relife memory forget <id>... | --query "<q>"  [--yes]   # archive (reversible); 
 relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra)
 relife memory ping                # check the daemon is reachable (GET /health)
 relife serve [--host --port]      # always-on agent server + web UI (needs [server] extra; default :8600)
+# RELIFE_HOME: where data/ and workspace/ live. Default: beside the code in a source checkout, ~/.relife for an
+#   installed wheel (never site-packages — an upgrade would wipe memory)
 # RELIFE_AGENT_TOKEN gates the server (required for any non-loopback bind — it refuses otherwise);
+# WITHOUT a token the server answers only to loopback Host names (DNS-rebinding guard);
+#   RELIFE_AGENT_ALLOWED_HOSTS=a,b admits extra names
 # RELIFE_AGENT_WORKSPACE_ROOT confines server-created session workspaces (default ./workspace)
 # schedules (autonomous triggers) are managed from the web UI or the /schedules API; persisted at
 # data/schedules.json; RELIFE_AGENT_SCHEDULER=0 disables the tick loop; RELIFE_AGENT_SCHEDULE_MIN_INTERVAL
@@ -119,3 +125,7 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - **The agent server's auth must work for `EventSource`.** A browser cannot set an `Authorization` header on an SSE connection, so the agent server accepts a cookie *as well as* a bearer token, and `GET /sessions/{id}/events` is gated like every other route. Don't "simplify" auth back to header-only — that silently reopens the transcript + approval stream to anything that can reach the port. Conversely, don't drop the `Origin` check on mutating routes: cookie auth is ambient, so a cross-site page could otherwise drive the agent.
 - **The server's workspace root is a privilege boundary, not a convenience.** `POST /sessions` may name a workspace only *inside* `AGENT_WORKSPACE_ROOT`, because `permissions.classify()` auto-allows writes inside the session workspace. Widening it (or accepting the raw path again) hands the caller the auto-allow radius.
 - **The auto-consolidate throttle decides + runs in one place.** `agent.maybe_consolidate` (CLI: `_maybe_consolidate`; server: `maybe_consolidate_off_loop`) calls `client.maybe_consolidate()`, which checks `should_auto_run()` (event-count vs. watermark) **and** runs the pass together on the memory side. Do **not** re-split this into a client-side `should_auto_run()` gate + a separate `consolidate()` call: under a daemon the gate would read the caller's (empty) local event log while the pass runs server-side, so auto-consolidation would silently never fire. Any "has enough accrued?" decision about server-side work belongs server-side — the same rule that keeps `consolidate`/`dream` mining module-level defaults.
+- **The shell gate is a denylist, not a sandbox.** Any shell command not matched as outward / escaping / global-install is auto-allowed; inline interpreter code (`python -c`) or a script the agent writes can do anything the user can. `tests/test_permissions_corpus.py` holds the adversarial (`SHOULD_ASK`) and everyday (`SHOULD_ALLOW`) corpora — extend both when touching `permissions.py`, and nested shells (`bash -c`, `cmd /c`, `pwsh -Command`, `Start-Process -ArgumentList`) are re-classified on their inner command line.
+- **Package installs outside the workspace ask.** A bare `pip install` / `python -m pip install` lands in the user's global site-packages (a release smoke run did exactly that); only a workspace venv interpreter, an activation in the same command, or `--target/--prefix` stays autonomous. `npm -g`, `cargo/go/pipx install` and OS package managers ask too. The system prompt tells the agent to use a project `.venv`.
+- **Recall needs real relevance, not just activation.** Activation + importance alone clear `RECALL_FLOOR`, so the keyword gate is the only relevance check: a memory sharing ONE word with the query surfaces only if that word is distinctive (in ≤ `RECALL_COMMON_TERM_FRACTION` of active memories). Generic words ("write", "test") also name tools inside episode/pattern text, and the hook reinforces what it surfaces — without the gate, noise fed itself. Same reason consolidation treats the generic edit→test→commit loop as low-signal.
+- **The claude.ai Gmail connector cannot send.** It exposes search/read/label/trash and `create_draft` — no send tool. An `email` grant therefore pre-approves *drafts* to the listed addresses in practice; nothing in ReLife can deliver mail on its own. Calendar has `create_event`.

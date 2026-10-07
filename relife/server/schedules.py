@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -328,11 +329,17 @@ class ScheduleStore:
     written until the first change, so building the app stays side-effect
     free). Every mutation rewrites the file atomically (tmp + ``os.replace``),
     so a crash mid-write can't leave a torn file behind.
+
+    A file that can't be read (or holds records that can't be) is never
+    silently overwritten: ``problem`` says what went wrong (``relife doctor``
+    shows it), and the first save copies the original aside to
+    ``schedules.json.corrupt-<time>`` before replacing it.
     """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path is not None else config.AGENT_SCHEDULES_PATH
         self._items: dict[str, Schedule] = {}
+        self.problem: str | None = None
         self._load()
 
     def _load(self) -> None:
@@ -340,17 +347,40 @@ class ScheduleStore:
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            self.problem = f"unreadable ({type(e).__name__}: {e})"
             return
-        for d in raw.get("schedules", []):
+        records = raw.get("schedules", []) if isinstance(raw, dict) else None
+        if not isinstance(records, list):
+            self.problem = "unexpected format (no schedules list)"
+            return
+        dropped = 0
+        for d in records:
             try:
                 s = Schedule.from_dict(d)
-            except TypeError:
+            except (TypeError, ValueError, AttributeError, KeyError):
+                dropped += 1
                 continue
             self._items[s.id] = s
+        if dropped:
+            self.problem = f"{dropped} unreadable schedule record(s) skipped"
+
+    def _preserve_original(self) -> None:
+        """Copy a file we couldn't fully read aside, once, before overwriting it."""
+        if self.problem is None or not self.path.exists():
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+        try:
+            shutil.copy2(self.path, backup)
+        except OSError:
+            return  # best effort; still better than refusing to save
+        self.problem = f"{self.problem} — original kept as {backup.name}"
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.problem and "original kept as" not in self.problem:
+            self._preserve_original()
         payload = {"version": 1, "schedules": [asdict(s) for s in self._items.values()]}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -11,6 +11,7 @@ MCP servers, and memory hooks are layered in by later build stages via the
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
 from pathlib import Path
@@ -274,13 +275,33 @@ def _tool_brief(inp: dict[str, Any], limit: int = 80) -> str:
     for key in ("command", "file_path", "path", "pattern", "url", "query"):
         if key in inp:
             return _clip(str(inp[key]), limit)
-    pairs = []
-    for key, val in inp.items():
+    # WHO it goes to comes first, whatever order the schema lists it in: Gmail's
+    # create_draft puts `to` (a list) after subject/body, so a brief built from
+    # leading scalars showed the subject and never the recipient.
+    def show(val: Any) -> str | None:
+        if isinstance(val, (list, tuple)):
+            items = [show(v) for v in val]
+            text = ", ".join(i for i in items if i)
+            return text or None
+        if isinstance(val, dict):
+            v = val.get("email") or val.get("address")
+            return str(v) if v else None
         if isinstance(val, (str, int, float, bool)) and str(val).strip():
-            pairs.append(f"{key}={_clip(' '.join(str(val).split()), 60)}")
+            return " ".join(str(val).split())
+        return None
+
+    keys = sorted(inp, key=lambda k: 0 if _RECIPIENT_KEY.search(k) else 1)
+    pairs = []
+    for key in keys:
+        text = show(inp[key])
+        if text:
+            pairs.append(f"{key}={_clip(text, 60)}")
         if len(pairs) == 4:
             break
     return _clip("  ".join(pairs), limit)
+
+
+_RECIPIENT_KEY = re.compile(r"^(?:to|cc|bcc|recipients?|attendees?|guests?|emails?)$", re.I)
 
 
 def _clip(text: str, limit: int) -> str:

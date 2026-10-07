@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.18  # pinned: new ruff releases add default rules
+      - run: ruff check relife tests scripts
+
+  test:
+    # The deterministic suite: zero model calls, no claude login needed.
+    # "base" proves every optional extra really is optional (those tests skip);
+    # "full" exercises the daemon/server/semantic/sqlite-vec paths.
+    name: test (${{ matrix.os }}, py${{ matrix.python }}, ${{ matrix.deps }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+        deps: [base, full]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install (base)
+        if: matrix.deps == 'base'
+        run: pip install -e . pytest
+      - name: Install (all extras)
+        if: matrix.deps == 'full'
+        run: pip install -e ".[embeddings,vector,daemon,server]" pytest pytest-cov
+      - name: Cache embedding model
+        if: matrix.deps == 'full'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-bge-small-en-v1.5
+      - run: python -m pytest tests -q -p no:cacheprovider
+
+  package:
+    # Catch what an editable install hides: non-Python files missing from the
+    # wheel, imports that only resolve from the source tree, state paths that
+    # land in site-packages.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --outdir dist .
+      - name: Check wheel contents
+        shell: python
+        run: |
+          import glob, zipfile
+          names = set(zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist())
+          need = {"relife/prompts/system.md", "relife/prompts/rem.md",
+                  "relife/build/prompts/orchestrator.md", "relife/web/index.html"}
+          missing = need - names
+          assert not missing, f"missing from wheel: {missing}"
+          junk = [n for n in names if n.startswith(("data/", "workspace/", "tests/"))]
+          assert not junk, f"unexpected files in wheel: {junk}"
+      - name: Install wheel into a clean venv and run the suite against it
+        shell: bash
+        run: |
+          python -m venv /tmp/v
+          if [ -f /tmp/v/Scripts/python.exe ]; then PY=/tmp/v/Scripts/python; else PY=/tmp/v/bin/python; fi
+          WHL=$(ls dist/*.whl)
+          $PY -m pip install "$WHL[daemon,server]" pytest
+          mkdir /tmp/t && cp -r tests /tmp/t/
+          cd /tmp/t
+          $PY -m relife.cli --help > /dev/null
+          $PY -c "from relife import config; assert 'site-packages' not in str(config.DATA_DIR), config.DATA_DIR"
+          $PY -m pytest tests -q -p no:cacheprovider
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install ".[embeddings,vector,daemon,server]" pip-audit
+      - run: pip-audit --skip-editable

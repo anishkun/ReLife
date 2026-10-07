@@ -58,8 +58,11 @@ def test_bruteforce_limit_and_archived(tmp_path):
     assert 2 in [mid for mid, _ in witharch]              # …unless requested
 
 
-def test_get_index_falls_back_to_bruteforce(tmp_path):
-    # sqlite-vec isn't installed in CI; the factory must degrade gracefully.
+def test_get_index_falls_back_to_bruteforce(tmp_path, monkeypatch):
+    # Whether or not sqlite-vec is installed, a failing self-test (missing or
+    # misbehaving extension) must degrade to the brute-force scan.
+    monkeypatch.setattr(vector_index, "_cached", None)
+    monkeypatch.setattr(vector_index, "_self_test", lambda dim: False)
     assert isinstance(vector_index.get_index(None), vector_index.BruteForceIndex)
     assert isinstance(vector_index.get_index(384), vector_index.BruteForceIndex)
 

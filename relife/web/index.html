@@ -116,6 +116,9 @@
   .approval button:disabled { opacity: .5; cursor: default; filter: none; }
   .approval .outcome { font-family: var(--mono); font-size: 12px; margin-top: 4px; }
   .approval.settled { border-color: var(--line); background: transparent; }
+  /* Decided: the outcome line says what happened; leftover buttons (an amber
+     Approve at half opacity) read as if approval were still pending. */
+  .approval.settled .actions { display: none; }
 
   /* Composer */
   footer { border-top: 1px solid var(--line); background: var(--surface); padding: 14px 20px; }
@@ -651,12 +654,21 @@
     return d >= 0 ? `in ${u[0]}${u[1]}` : `${u[0]}${u[1]} ago`;
   };
 
-  async function loadSchedules() {
+  // `background` = the 15s poll. Rebuilding the list swaps every button out, so
+  // the poll leaves it alone while the pointer is over it (a click landing
+  // mid-rebuild hit a detached button and was lost) or when nothing changed;
+  // user actions and opening the panel always redraw.
+  let schedSig = "";
+  async function loadSchedules(background = false) {
     try {
       const r = await fetch("/schedules");
       if (r.status === 401) { showGate("session expired — enter the token again"); return; }
       if (!r.ok) throw new Error(await r.text());
-      renderSchedules((await r.json()).schedules);
+      const items = (await r.json()).schedules;
+      const sig = JSON.stringify(items) + "|" + Math.floor(Date.now() / 60e3);
+      if (background && (schedList.matches(":hover") || sig === schedSig)) return;
+      schedSig = sig;
+      renderSchedules(items);
     } catch (e) {
       schedList.innerHTML = `<p class="note">could not load schedules</p>`;
     }
@@ -794,7 +806,7 @@
     schedulesPanel.hidden = !show;
     schedulesBtn.setAttribute("aria-pressed", String(show));
     if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
-    if (show) { loadSchedules(); schedTimer = setInterval(loadSchedules, 15000); }
+    if (show) { loadSchedules(); schedTimer = setInterval(() => loadSchedules(true), 15000); }
   }
   schedulesBtn.addEventListener("click", () => toggleSchedules());
   schKind.addEventListener("change", () => {

@@ -393,6 +393,32 @@ class MemoryStore:
 
         return list(rows.values())
 
+    def _doc_freq(self, conn, terms: set[str], include_archived: bool) -> tuple[int, dict[str, int]]:
+        """How many memories contain each query term (and how many there are).
+
+        One indexed COUNT per term with FTS5 — query terms are few — or a scan
+        on builds without it (recall already scans there anyway).
+        """
+        status = "" if include_archived else "WHERE status = 'active'"
+        n = conn.execute(f"SELECT COUNT(*) FROM memories {status}").fetchone()[0]
+        df: dict[str, int] = {}
+        if self._fts_ok:
+            active_only = "" if include_archived else "AND m.status = 'active'"
+            sql = (
+                "SELECT COUNT(*) FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+                f"WHERE memories_fts MATCH ? {active_only}"
+            )
+            for t in terms:
+                try:
+                    df[t] = conn.execute(sql, (f'"{t}"',)).fetchone()[0]
+                except sqlite3.OperationalError:
+                    df[t] = 0
+        else:
+            for r in conn.execute(f"SELECT text, tags FROM memories {status}"):
+                for t in _tokens(r["text"] + " " + r["tags"]) & terms:
+                    df[t] = df.get(t, 0) + 1
+        return n, df
+
     def recall(
         self,
         query: str,
@@ -418,12 +444,27 @@ class MemoryStore:
         scored: list[tuple[float, Memory]] = []
         with self._connect() as conn:
             cands = self._candidates(conn, q_terms, q_vec, include_archived)
+            n_rows, df = self._doc_freq(conn, q_terms, include_archived) if cands else (0, {})
+            # A term in a large share of the store ("write", "test" — words
+            # that also name tools in episode/pattern text) is weak evidence.
+            common_at = max(config.RECALL_COMMON_MIN_DOCS, config.RECALL_COMMON_TERM_FRACTION * n_rows)
             for r in cands:
                 hay = _tokens(r["text"] + " " + r["tags"])
-                overlap = len(q_terms & hay)
+                shared = q_terms & hay
+                overlap = len(shared)
                 sem = embeddings.cosine(q_vec, _unpack(r["embedding"])) if q_vec else 0.0
                 # Candidate gate: keep the "unrelated query → nothing" guarantee.
                 if overlap == 0 and sem < config.SEM_CANDIDATE_THRESHOLD:
+                    continue
+                # Activation + importance alone clear RECALL_FLOOR, so the gate
+                # is the only relevance check: one shared word must at least be
+                # a distinctive one, or a single "write" in a long prompt
+                # surfaces (and then reinforces) unrelated memories.
+                if (
+                    overlap == 1
+                    and sem < config.SEM_CANDIDATE_THRESHOLD
+                    and df.get(next(iter(shared)), 0) > common_at
+                ):
                     continue
                 kw = overlap / max(1, len(q_terms))
                 m = _row_to_memory(r)

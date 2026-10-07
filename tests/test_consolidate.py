@@ -97,3 +97,28 @@ def test_recurring_episodes_become_pattern(tmp_path):
     report = consolidate.run_consolidation()
     assert report.patterns, "expected a recurring-episode pattern"
     assert any(m.kind == "pattern" for m in store.all_memories())
+
+
+def test_generic_dev_loop_is_not_a_workflow(tmp_path):
+    # Edit → test → commit (and the orchestrator's own bookkeeping) recurs in
+    # almost every task. A workflow of just those steps carries no task
+    # knowledge and its labels ("write", "test") match unrelated prompts.
+    _isolate(tmp_path)
+    for t in ("task1", "task2", "task3", "task4"):
+        events.log_event("Edit", task_id=t)
+        events.log_event("Bash", "pytest -q", task_id=t)
+        events.log_event("Bash", "git commit -am wip", task_id=t)
+        events.log_event("mcp__relife_build__build_milestone_update", task_id=t)
+        events.log_event("Bash", "ls", task_id=t)
+    report = consolidate.run_consolidation()
+    assert not report.workflows_created
+    assert not [m for m in store.all_memories() if m.kind == "pattern" and "→" in m.text]
+
+
+def test_distinctive_action_still_promotes_the_loop_around_it(tmp_path):
+    _isolate(tmp_path)
+    for t in ("task1", "task2", "task3"):
+        events.log_event("Bash", "docker compose up -d", task_id=t)
+        events.log_event("Bash", "pytest -q", task_id=t)
+    report = consolidate.run_consolidation()
+    assert any("docker" in name for name in report.workflows_created)

@@ -33,3 +33,13 @@ def _embeddings_off(request, monkeypatch):
     monkeypatch.setattr(embeddings, "available", lambda: False)
     monkeypatch.setattr(embeddings, "embed", lambda texts: None)
     monkeypatch.setattr(embeddings, "embed_one", lambda text: None)
+
+
+@pytest.fixture(autouse=True)
+def _testclient_host(monkeypatch):
+    """Starlette's TestClient sends ``Host: testserver``; a tokenless agent
+    server refuses non-loopback Host names (DNS-rebinding guard), so admit that
+    one name in tests. ``test_release`` checks the guard with it removed."""
+    from relife import config
+
+    monkeypatch.setattr(config, "AGENT_ALLOWED_HOSTS", frozenset({"testserver"}))
