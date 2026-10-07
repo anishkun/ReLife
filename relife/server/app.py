@@ -76,6 +76,7 @@ from .schedules import (
 from .security import (
     AttemptLimiter,
     guard_bind,
+    host_allowed,
     presented_token,
     resolve_workspace,
     same_origin,
@@ -110,6 +111,7 @@ def create_app(
     schedules_path: Path | None = None,
     runs_dir: Path | None = None,
     run_scheduler: bool | None = None,
+    allowed_hosts: frozenset[str] | None = None,
 ) -> FastAPI:
     """Build the agent server app.
 
@@ -121,6 +123,8 @@ def create_app(
     ``schedules_path`` is where schedules persist and ``runs_dir`` where run
     outcomes go (tests point both at tmp); ``run_scheduler=False`` keeps the
     tick loop off so tests drive ``app.state.scheduler.tick(now)`` by hand.
+    ``allowed_hosts`` are non-loopback ``Host`` names a tokenless server may
+    answer to (default ``RELIFE_AGENT_ALLOWED_HOSTS``) — see ``host_allowed``.
     """
     manager = SessionManager(session_factory=session_factory)
     root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
@@ -153,7 +157,21 @@ def create_app(
             # server down must not orphan them.
             await manager.aclose()
 
-    app = FastAPI(title="ReLife agent server", version="0.1.0", lifespan=lifespan)
+    extra_hosts = frozenset(
+        h.lower() for h in (config.AGENT_ALLOWED_HOSTS if allowed_hosts is None else allowed_hosts)
+    )
+
+    def require_known_host(request: Request) -> None:
+        """DNS-rebinding guard, on every route (the UI and SSE included)."""
+        if not host_allowed(request.headers.get("host"), token, extra_hosts):
+            raise HTTPException(status_code=403, detail="unrecognized Host header")
+
+    app = FastAPI(
+        title="ReLife agent server",
+        version="0.1.0",
+        lifespan=lifespan,
+        dependencies=[Depends(require_known_host)],
+    )
     app.state.manager = manager
     app.state.workspace_root = root
     app.state.schedules = store

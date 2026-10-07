@@ -59,6 +59,27 @@ def same_origin(origin: str | None, host: str | None) -> bool:
     return urlsplit(origin).netloc.lower() == host.lower()
 
 
+# --- DNS rebinding ----------------------------------------------------------
+def host_allowed(host: str | None, token: str | None, extra: frozenset[str] = frozenset()) -> bool:
+    """Whether to serve a request carrying this ``Host`` header.
+
+    A page on ``evil.example`` can re-point its DNS at ``127.0.0.1``: the browser
+    then sends ``Origin: http://evil.example:8600`` *and* ``Host:
+    evil.example:8600``, which ``same_origin`` happily matches. With no token
+    (the loopback default) that page could create sessions, send tasks, read
+    the SSE transcript and approve its own approval cards. So a tokenless server
+    answers only to loopback names (plus explicitly configured ``extra`` ones).
+    With a token, rebinding gets nowhere — the cookie is scoped to the real
+    host and a bearer header is never ambient — so any ``Host`` is fine.
+    """
+    if token is not None:
+        return True
+    if not host:
+        return False
+    name = urlsplit(f"//{host}").hostname or ""
+    return is_loopback(name) or name.lower() in extra
+
+
 # --- bind address -----------------------------------------------------------
 def is_loopback(host: str) -> bool:
     h = (host or "").strip().strip("[]").lower()

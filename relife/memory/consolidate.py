@@ -185,6 +185,12 @@ _LOW_SIGNAL_LABELS = {
     "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead",
     "Glob", "Grep", "LS", "TodoWrite", "TaskCreate", "TaskUpdate",
     "BashOutput", "KillShell", "KillBash", "shell",
+    # The generic edit → test → commit loop is in nearly every coding task, so
+    # a sequence made only of it says nothing reusable — and its labels collide
+    # with ordinary prompt words ("write", "test"), dragging the workflow into
+    # unrelated tasks' recall. Same for the agent's own bookkeeping tools.
+    "test", "git", "git-commit", "ToolSearch", "Task", "Agent",
+    "build_status", "build_milestone_update", "build_plan_set",
 }
 
 

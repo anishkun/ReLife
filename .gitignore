@@ -19,3 +19,9 @@ dist/
 
 # Workspaces the agent builds in (override per-project as needed)
 /workspace/
+
+# Test/coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/

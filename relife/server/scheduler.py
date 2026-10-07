@@ -84,7 +84,9 @@ def _grants_note(schedule: Schedule, grants: list[dict[str, Any]] | None = None)
     how = (
         f" For the pull request that means one plain `gh pr create --repo {pr['repo']} "
         f"--head {pr['branch']} --title \"…\" --body \"…\"` call (optionally --base/--draft) "
-        "with no `$` or backticks in it and nothing chained — any other shape asks."
+        "with no `$` or backticks anywhere in it — write the title and body as plain "
+        "text, without Markdown code spans — and nothing chained; any other shape asks "
+        "and, unattended, waits out the approval timeout before it is denied."
         if pr else ""
     )
     return (

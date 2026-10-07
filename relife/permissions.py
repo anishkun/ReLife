@@ -85,26 +85,52 @@ _OUTWARD_SHELL = re.compile(
     | \bSend-MailMessage\b
     # (GitHub CLI is verb-based — see ``_gh_outward``.)
     # --- HTTP writes / uploads / downloads-to-disk -------------------------
-    | \bcurl\b[^|;&]*\s(?:-d|--data\S*|-T|--upload-file|-X\s*(?:POST|PUT|DELETE|PATCH))\b
+    | \bcurl\b[^|;&]*\s(?:-d|--data\S*|-F|--form\S*|-T|--upload-file|-X\s*(?:POST|PUT|DELETE|PATCH))\b
     | \bwget\b[^|;&]*--post
     | \b(?:Invoke-RestMethod|Invoke-WebRequest|irm|iwr)\b[^|;&]*
         (?:-Method\s*(?:POST|PUT|DELETE|PATCH)|-InFile|-OutFile)\b
     | \bStart-BitsTransfer\b
-    # --- a download piped straight into an interpreter ---------------------
-    | \b(?:curl|wget|Invoke-WebRequest|iwr)\b[^;&]*\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b
+    | \.(?:Upload(?:File|String|Data|Values)|Download(?:String|File|Data))\w*\s*\(
+    # --- text evaluated as code (download cradles, decoded payloads) --------
     | \b(?:curl|wget|Invoke-WebRequest|iwr)\b[^;&]*\|\s*(?:pwsh|powershell|python3?|node|perl|ruby)\b
-    # --- remote shells / copies --------------------------------------------
-    | \b(?:scp|sftp|rsync|ssh)\b
+    | \|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b(?![.\w-])
+    | \|\s*(?:pwsh|powershell)(?:\.exe)?\b
+    | \b(?:Invoke-Expression|iex)\b
+    | \b(?:ba|z|da)?sh\s+-c\s+["']?\$\(
+    | \bbase64\b[^|;&]*\s(?:-d|--decode)\b[^;&]*\|
+    | \s-(?:EncodedCommand|enc|ec)\s
+    # --- remote shells / copies / raw sockets -------------------------------
+    | \b(?:scp|sftp|rsync|ssh|telnet|socat|netcat|ncat)\b
+    | (?:^|[;&|(]\s*)nc(?:\.exe)?\s
+    | /dev/(?:tcp|udp)/
+    | \bgit\s+push\b[^|;&]*\s(?:https?://|ssh://|git@)
+    | \bgit\s+remote\s+(?:add|set-url)\b(?![^|;&\n]*github\.com[:/])
     | \b(?:New-PSSession|Enter-PSSession|Enable-PSRemoting)\b
     | \bInvoke-Command\b[^|;&]*-ComputerName\b
     # --- package publish ----------------------------------------------------
-    | \b(?:twine\s+upload|npm\s+publish|yarn\s+publish|poetry\s+publish)\b
+    | \b(?:twine\s+upload|(?:npm|pnpm|yarn|poetry|cargo|uv|hatch|flit)\s+publish)\b
+    | \b(?:docker|podman|helm)\s+push\b
+    | \bgem\s+push\b
+    | \bmvn\b[^|;&]*\bdeploy\b
     | \b(?:Publish-Module|Publish-Script)\b
     | \bdotnet\s+nuget\s+push\b
     # --- privilege escalation / policy tampering ---------------------------
-    | \bsudo\b
+    | \b(?:sudo|doas|pkexec|gsudo|runas)\b
+    | (?:^|[;&|(]\s*)su(?:\s|$)
     | \bStart-Process\b[^|;&]*-Verb\s+RunAs\b
     | \bSet-ExecutionPolicy\b
+    # --- persistence / machine-wide config outside the workspace ------------
+    | \b(?:crontab|schtasks|setx)\b
+    | \b(?:Register|New|Set)-ScheduledTask\w*\b
+    | \breg(?:\.exe)?\s+(?:add|delete|import|load|restore|copy)\b
+    | \b(?:Set|New|Remove)-ItemProperty\b[^|;&]*(?:HK(?:CU|LM|CR|U)|Registry::)
+    | \bSetEnvironmentVariable\b
+    | \b(?:systemctl|launchctl)\s+(?:enable|disable|mask|stop|load|bootstrap)\b
+    | \bNew-Service\b
+    | \bsc(?:\.exe)?\s+(?:create|config|delete)\b
+    | \bgit\s+config\b[^|;&]*--(?:global|system)\b
+    | \b(?:npm|pnpm|yarn|pip3?|uv)\s+config\s+set\b
+    | \b(?:Stop-Computer|Restart-Computer|shutdown|reboot|poweroff|Clear-RecycleBin)\b
     # --- catastrophic or device-level, i.e. unrecoverable ------------------
     | \brm\s+-[rRf]*\s*/(?:\s|$)
     | \b(?:mkfs(?:\.\w+)?|fdisk|diskpart)\b
@@ -113,6 +139,47 @@ _OUTWARD_SHELL = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# Package installs that land outside the workspace: the user's global Python,
+# a global npm prefix, ~/.cargo, ~/go, the OS package manager. A release smoke
+# run caught `python -m pip install -e .` silently installing into the user's
+# global site-packages. Installs through a workspace venv (an explicit
+# `.venv/…/python`, or a venv activated in the same command) or into an explicit
+# `--target`/`--prefix` (checked by the write-target rule) stay autonomous.
+_GLOBAL_INSTALL = re.compile(
+    r"""
+      (?:^|[;&|(]\s*|(?<!uv)\s)(?:pip3?|pip3?\.exe|(?:python3?|py)(?:\.exe)?(?:\s+-3[\d.]*)?\s+-m\s+pip)
+        \s+install\b
+    | \buv\s+pip\s+install\b[^|;&]*--system\b
+    | \b(?:npm|pnpm)\s+(?:i|install|add)\b[^|;&]*\s(?:-g|--global)\b
+    | \byarn\s+global\s+add\b
+    | \b(?:cargo|go|gem|pipx)\s+install\b
+    | \buv\s+tool\s+install\b
+    | \bdotnet\s+tool\s+install\b[^|;&]*\s(?:-g|--global)\b
+    | \b(?:winget|choco|scoop|brew)\s+install\b
+    | \b(?:apt|apt-get|dnf|yum|pacman|zypper|apk)\s+(?:install|add|-S)\b
+    | \bInstall-(?:Module|Package|Script)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+# A workspace-local interpreter or activation in the same command line.
+_VENV_HINT = re.compile(
+    r"""(?:^|[\s"'/\\;&(])\.?venv[/\\](?:bin|Scripts)[/\\]
+      | \b(?:source|\.)\s+\S*activate\b | \bactivate(?:\.ps1|\.bat)?\b
+      | \s(?:--target|-t|--prefix|--root)[\s=]""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _global_install(command: str) -> bool:
+    """True if ``command`` installs packages somewhere outside the workspace."""
+    for segment in re.split(r"\|\||&&|[;\n]", command):
+        if _GLOBAL_INSTALL.search(segment) and not (
+            re.search(r"pip", segment, re.IGNORECASE) and _VENV_HINT.search(command)
+        ):
+            return True
+    return False
+
 
 # --- GitHub CLI ------------------------------------------------------------
 # `gh` used to be gated by group (`gh pr|issue|release|api|gist` → ask), which
@@ -256,19 +323,53 @@ _NULL_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr", "nul", "nul:", "con", 
 # Commands that delete. Recursion/force changes the blast radius, not whether
 # the containment rule applies, so plain `rm` belongs here too.
 _DELETE_VERBS = {
-    "rm", "rmdir", "unlink", "shred", "srm",
+    "rm", "rmdir", "unlink", "shred", "srm", "truncate",
     "del", "erase", "rd",
-    "remove-item", "ri", "clear-content",
+    "remove-item", "ri", "clear-content", "clc",
 }
 # Commands that write a file named as an argument (rather than via `>`).
 _WRITE_VERBS = {
     "tee", "out-file", "set-content", "add-content", "tee-object",
     "new-item", "export-csv", "export-clixml",
+    "touch", "mkdir", "md", "ni", "sc", "ac", "ln",
+    "chmod", "chown", "chgrp", "icacls", "attrib",
 }
+# In-place editors (`sed -i 's/a/b/' f`): every operand counts — the script
+# itself is harmless, it resolves as a relative path inside the workspace.
+_INPLACE_VERBS = {"sed", "perl"}
 # Same, but the destination is the LAST positional argument.
 _COPY_VERBS = {"cp", "copy", "copy-item", "mv", "move", "move-item", "install"}
 # Named parameters whose value is a destination path.
-_DEST_PARAMS = {"-path", "-filepath", "-literalpath", "-destination", "-outfile"}
+_DEST_PARAMS = {
+    "-path", "-filepath", "-literalpath", "-destination", "-outfile", "-destinationpath",
+    "-o", "--output", "--output-document", "--directory-prefix", "--target",
+    "--directory", "--prefix", "--root",
+}
+# Destination switches that mean "output file/dir" only for one command.
+_VERB_DEST_PARAMS = {
+    "wget": {"-O", "-P"}, "tar": {"-C"}, "unzip": {"-d"}, "pip": {"-t"}, "pip3": {"-t"},
+}
+# Wrappers that run the next word as the command (`time rm …`, `xargs rm`, `& { … }`).
+_PREFIX_WORDS = {
+    "time", "env", "command", "exec", "nohup", "nice", "builtin", "xargs",
+    "{", "(", "&", ".", "call",
+}
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Shells that take a whole command line as one argument.
+_NESTED_SHELL = re.compile(
+    r"""(?:^|[\s;&|(])(?:
+          (?:ba|z|da|k)?sh(?:\.exe)?\s+(?:-\w+\s+)*-c
+        | cmd(?:\.exe)?\s+(?:/[a-zA-Z]\s+)*/[cCkK]
+        | (?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-(?:c|Command)
+        | Start-Process\b[^|;&]*-ArgumentList
+    )\s+(?P<rest>.+)$""",
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+# .NET file APIs called from PowerShell with a literal path.
+_DOTNET_FILE = re.compile(
+    r"::(?:(?:Write|Append)All\w*|Delete|Move|Copy|Replace|Create\w*)\(\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 
 
 def _unquote(tok: str) -> str:
@@ -289,12 +390,27 @@ def _unresolvable(path_str: str) -> bool:
 
 
 def _segments(command: str) -> list[list[str]]:
-    """Split a command line into rough token segments (quotes respected)."""
+    """Split a command line into rough token segments (quotes respected).
+
+    Wrapper words (`time`, `env`, `VAR=x`, `xargs`, a PowerShell `& {`) are
+    dropped so the real command comes first. `xargs` feeds operands we can't
+    see, so its command gets an unresolvable one — a delete then asks.
+    """
     out: list[list[str]] = []
     for part in _SEPARATOR.split(command):
         toks = [_unquote(t) for t in _TOKEN.findall(part)]
+        fed = False
+        while toks and (_verb(toks[0]) in _PREFIX_WORDS or _ENV_ASSIGN.match(toks[0])):
+            if _verb(toks[0]) == "xargs":
+                fed = True
+                toks = toks[1:]
+                while toks and toks[0].startswith("-"):
+                    toks = toks[1:]  # xargs' own switches
+                continue
+            toks = toks[1:]
+        toks = [t.strip("{}") for t in toks if t.strip("{}")]
         if toks:
-            out.append(toks)
+            out.append(toks + (["$XARGS"] if fed else []))
     return out
 
 
@@ -304,14 +420,58 @@ def _positionals(tokens: list[str]) -> list[str]:
 
 
 def _named_dests(tokens: list[str]) -> list[str]:
-    """Values of destination-style named parameters (`-OutFile x`, `-Path x`)."""
+    """Values of destination-style named parameters (`-OutFile x`, `-o x`,
+    `--target=x`, `dd of=x`)."""
     dests: list[str] = []
+    verb = _verb(tokens[0]) if tokens else ""
+    verb_params = _VERB_DEST_PARAMS.get(verb, set())
     for i, tok in enumerate(tokens):
-        if tok.lower() in _DEST_PARAMS and i + 1 < len(tokens):
+        name, eq, val = tok.partition("=") if tok.startswith("--") else (tok, "", "")
+        if eq and name.lower() in _DEST_PARAMS:
+            dests.append(val)
+        elif (tok.lower() in _DEST_PARAMS or tok in verb_params) and i + 1 < len(tokens):
             nxt = tokens[i + 1]
             if nxt and not _FLAG.match(nxt):
                 dests.append(nxt)
+        elif verb == "dd" and tok.startswith("of="):
+            dests.append(tok[3:])
     return dests
+
+
+def _find_targets(tokens: list[str]) -> list[str]:
+    """`find ROOTS… -delete` / `-exec rm …`: the roots are what gets deleted."""
+    low = [t.lower() for t in tokens]
+    deletes = "-delete" in low or any(
+        low[i] in ("-exec", "-execdir", "-ok") and i + 1 < len(low)
+        and _verb(low[i + 1]) in _DELETE_VERBS
+        for i in range(len(low))
+    )
+    if not deletes:
+        return []
+    roots = []
+    for t in tokens[1:]:
+        if t.startswith(("-", "(", "!")):
+            break
+        roots.append(t)
+    return roots or ["."]
+
+
+def _inner_commands(command: str) -> list[str]:
+    """Command lines handed to a nested shell (`bash -c "…"`, `cmd /c …`,
+    `powershell -Command …`, `Start-Process … -ArgumentList …`), outermost first."""
+    out: list[str] = []
+    m = _NESTED_SHELL.search(command)
+    while m and len(out) < 8:
+        rest = m.group("rest").strip()
+        if len(rest) >= 2 and rest[0] in "\"'" and rest[-1] == rest[0]:
+            rest = rest[1:-1]
+        elif rest[:1] in "\"'":
+            rest = rest[1:]
+        # `Start-Process cmd -ArgumentList '/c del …'`: the args still carry the switch.
+        rest = re.sub(r"^(?:/[cCkK]|-c|-Command)\s+", "", rest)
+        out.append(rest)
+        m = _NESTED_SHELL.search(rest)
+    return out
 
 
 def _write_targets(command: str) -> list[str]:
@@ -321,10 +481,17 @@ def _write_targets(command: str) -> list[str]:
         for t in (_unquote(m) for m in _REDIRECT.findall(command))
         if t and not t.startswith("&") and t.lower() not in _NULL_SINKS
     ]
+    targets += _DOTNET_FILE.findall(command)
     for tokens in _segments(command):
         verb = _verb(tokens[0])
         if verb in _WRITE_VERBS:
             targets += _positionals(tokens) + _named_dests(tokens)
+        elif verb in _INPLACE_VERBS and any(t.startswith("-i") for t in tokens[1:]):
+            targets += _positionals(tokens)
+        elif verb == "git" and len(tokens) > 1 and tokens[1].lower() == "clone":
+            operands = _positionals(tokens[1:])
+            if len(operands) >= 2:
+                targets.append(operands[-1])  # explicit clone destination
         elif verb in _COPY_VERBS:
             positional = _positionals(tokens)
             if positional:
@@ -340,8 +507,11 @@ def _delete_targets(command: str) -> list[str]:
     """Paths this command plausibly deletes."""
     targets: list[str] = []
     for tokens in _segments(command):
-        if _verb(tokens[0]) in _DELETE_VERBS:
+        verb = _verb(tokens[0])
+        if verb in _DELETE_VERBS:
             targets += _positionals(tokens) + _named_dests(tokens)
+        elif verb == "find":
+            targets += _find_targets(tokens)
     return targets
 
 
@@ -394,8 +564,16 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
 
     if tool_name in _SHELL_TOOLS:
         command = str(tool_input.get("command", ""))
+        # A nested shell (`cmd /c "del C:\\x"`, `pwsh -Command …`) hides its
+        # command line inside one quoted token; judge that line on its own too.
+        for inner in _inner_commands(command):
+            decision, reason = classify(tool_name, {"command": inner}, workspace)
+            if decision == "ask":
+                return decision, f"{reason} (nested shell)"
         if _OUTWARD_SHELL.search(command):
             return "ask", "shell command looks outward-facing or destructive"
+        if _global_install(command):
+            return "ask", "installs packages outside the workspace (global environment)"
         gh = _gh_outward(command)
         if gh:
             return "ask", f"GitHub CLI action changes the outside world: {gh}"

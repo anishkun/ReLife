@@ -43,7 +43,9 @@ def test_bash_outward_asks():
 
 
 def test_powershell_treated_like_bash():
-    assert d("PowerShell", {"command": "python -m pip install -e ."}) == "allow"
+    assert d("PowerShell", {"command": r".venv\Scripts\python -m pip install -e ."}) == "allow"
+    # A bare interpreter installs into the user's global environment → ask.
+    assert d("PowerShell", {"command": "python -m pip install -e ."}) == "ask"
     assert d("PowerShell", {"command": "Invoke-Item x; scp f user@host:/p"}) == "ask"
     assert d("BashOutput", {"bash_id": "1"}) == "allow"
 

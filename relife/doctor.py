@@ -67,6 +67,7 @@ class Probes:
     agent_token: str | None = None
     workspace_root: Path | None = None
     schedules: list[dict] = field(default_factory=list)  # raw records from data/schedules.json
+    schedules_problem: str | None = None  # the store couldn't fully read the file
     sidecar_exists: bool = False
 
 
@@ -121,14 +122,17 @@ def default_probes() -> Probes:
         with urllib.request.urlopen(url, timeout=3) as r:  # noqa: S310
             return r.status, r.read().decode("utf-8", "replace")
 
-    def schedules() -> list[dict]:
+    def schedules() -> tuple[list[dict], str | None]:
         # Raw records, read the same way the server does (no fastapi needed).
         try:
             from .server.schedules import ScheduleStore
 
-            return [s.to_dict() for s in ScheduleStore(config.AGENT_SCHEDULES_PATH).list()]
-        except Exception:  # noqa: BLE001 - a torn file is the store's problem, not doctor's
-            return []
+            store = ScheduleStore(config.AGENT_SCHEDULES_PATH)
+            return [s.to_dict() for s in store.list()], store.problem
+        except Exception as e:  # noqa: BLE001
+            return [], f"could not load ({e})"
+
+    schedule_records, schedule_problem = schedules()
 
     return Probes(
         which=shutil.which,
@@ -149,7 +153,8 @@ def default_probes() -> Probes:
         agent_port=config.AGENT_PORT,
         agent_token=config.AGENT_TOKEN,
         workspace_root=config.AGENT_WORKSPACE_ROOT,
-        schedules=schedules(),
+        schedules=schedule_records,
+        schedules_problem=schedule_problem,
         sidecar_exists=config.MEMORY_SIDECAR_PATH.exists(),
     )
 
@@ -449,6 +454,12 @@ def _check_agent_server(p: Probes, enabled_schedules: int) -> Check:
 def _check_schedules(p: Probes) -> Check:
     """What the schedules did last time, in one line — the panel shows it too,
     but doctor is where someone looks when \"nothing seems to happen\"."""
+    if p.schedules_problem:
+        return Check(
+            "schedules", "warn", f"{config.AGENT_SCHEDULES_PATH.name}: {p.schedules_problem}",
+            "fix or restore the file before adding schedules — the next save rewrites it "
+            "(a copy of the original is kept beside it as .corrupt-<time>)",
+        )
     if not p.schedules:
         return Check("schedules", "skip", "none defined (add one in the web console)")
     enabled = [s for s in p.schedules if s.get("enabled", True)]

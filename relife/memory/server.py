@@ -16,6 +16,18 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from .client import default_client, off_loop
 
 
+def _k(args: dict[str, Any], default: int) -> int:
+    """The model-supplied result cap, tolerating junk (``"five"``, ``null``)."""
+    try:
+        return max(1, min(int(args.get("k") or default), 50))
+    except (TypeError, ValueError):
+        return default
+
+
+def _err(what: str, e: Exception) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": f"Error {what}: {e}"}], "is_error": True}
+
+
 @tool(
     "memory_save",
     "Save a durable fact, user preference, or task lesson to long-term memory so "
@@ -75,7 +87,10 @@ async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
-    hits = await off_loop(default_client().recall, args["query"], k=int(args.get("k", 5)), reinforce=True)
+    try:
+        hits = await off_loop(default_client().recall, args["query"], k=_k(args, 5), reinforce=True)
+    except Exception as e:  # noqa: BLE001 - surface to the model
+        return _err("recalling memory", e)
     if not hits:
         return {"content": [{"type": "text", "text": "(no relevant memories)"}]}
     lines = [f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "") for m in hits]
@@ -124,7 +139,10 @@ async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = await off_loop(default_client().skill_find, args["query"], k=int(args.get("k", 3)))
+    try:
+        hits = await off_loop(default_client().skill_find, args["query"], k=_k(args, 3))
+    except Exception as e:  # noqa: BLE001
+        return _err("finding skills", e)
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching skills yet)"}]}
     blocks = [f"## {s.name}\nWhen to use: {s.when_to_use}\n\n{s.body}" for s in hits]
@@ -146,7 +164,10 @@ async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
-    forgotten = await off_loop(default_client().forget, args["query"])
+    try:
+        forgotten = await off_loop(default_client().forget, args["query"])
+    except Exception as e:  # noqa: BLE001
+        return _err("forgetting memory", e)
     if forgotten is None:
         return {"content": [{"type": "text", "text": "(nothing matched; nothing forgotten)"}]}
     return {"content": [{"type": "text", "text": f"Archived: {forgotten.text}"}]}
@@ -194,7 +215,10 @@ async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
     },
 )
 async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
-    hits = await off_loop(default_client().workflow_find, args["query"], k=int(args.get("k", 3)))
+    try:
+        hits = await off_loop(default_client().workflow_find, args["query"], k=_k(args, 3))
+    except Exception as e:  # noqa: BLE001
+        return _err("finding workflows", e)
     if not hits:
         return {"content": [{"type": "text", "text": "(no matching workflows yet)"}]}
     blocks = [

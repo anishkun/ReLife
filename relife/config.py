@@ -18,7 +18,26 @@ EFFORT = os.environ.get("RELIFE_EFFORT", "high")  # low | medium | high | xhigh 
 
 # --- Paths -----------------------------------------------------------------
 PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_DIR.parent
+
+
+def resolve_home(package_dir: Path, env: dict[str, str] | os._Environ = os.environ) -> Path:
+    """Pure: where ReLife keeps its runtime state (``data/``, ``workspace/``).
+
+    ``RELIFE_HOME`` wins. Otherwise a source checkout (the package sits next to
+    its ``pyproject.toml`` — the editable-install layout) keeps state beside the
+    code, as it always has. An installed wheel must NOT: there the package's
+    parent is ``site-packages``, which may be read-only and is wiped by an
+    upgrade — taking every memory with it — so state goes to ``~/.relife``.
+    """
+    explicit = env.get("RELIFE_HOME")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if (package_dir.parent / "pyproject.toml").is_file():
+        return package_dir.parent
+    return Path.home() / ".relife"
+
+
+PROJECT_ROOT = resolve_home(PACKAGE_DIR)
 DATA_DIR = PROJECT_ROOT / "data"          # gitignored: db + logs
 BUILDS_DIR = DATA_DIR / "builds"          # one subdir per orchestrated `relife build`
 SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
@@ -82,6 +101,14 @@ KIND_RECALL_BOOST = {"preference": 0.05, "pattern": 0.02}
 # long tail of barely-relevant ones.
 RECALL_FLOOR = float(os.environ.get("RELIFE_RECALL_FLOOR", "0.12"))
 
+# A memory sharing just ONE word with the query (and no strong semantic match)
+# surfaces only if that word is distinctive: present in at most this fraction of
+# active memories (and never judged "common" below RECALL_COMMON_MIN_DOCS
+# memories, so a small store isn't starved). Two or more shared words always
+# qualify. Without this, activation + importance alone clear RECALL_FLOOR.
+RECALL_COMMON_TERM_FRACTION = float(os.environ.get("RELIFE_RECALL_COMMON_TERM_FRACTION", "0.2"))
+RECALL_COMMON_MIN_DOCS = int(os.environ.get("RELIFE_RECALL_COMMON_MIN_DOCS", "3"))
+
 # Max characters of recalled context the auto-recall hook injects per prompt, so
 # memory never floods the agent's window. Sections are added highest-priority
 # first (memory → skills → workflow) until the budget is reached.
@@ -92,7 +119,7 @@ RECALL_DEDUP_JACCARD = 0.8
 
 # Stage-1 candidate generation (keeps recall cheap on large stores).
 CANDIDATE_TOPN = 50        # max candidates pulled before fuse-ranking
-SEM_CANDIDATE_THRESHOLD = 0.60  # a zero-keyword row is a candidate only above this
+SEM_CANDIDATE_THRESHOLD = float(os.environ.get("RELIFE_SEM_CANDIDATE_THRESHOLD", "0.65"))  # zero-keyword rows need this (bge-small: unrelated text sits ~0.45-0.55, paraphrases ~0.65+)
 
 # Semantic de-duplication thresholds (only used when embeddings are available).
 # Calibrated for the local bge-small model: near-identical rewordings score
@@ -160,6 +187,11 @@ AGENT_APPROVAL_TIMEOUT = float(os.environ.get("RELIFE_AGENT_APPROVAL_TIMEOUT", "
 # bearer header (programmatic clients) or the cookie (the UI). Strict SameSite +
 # an Origin check on mutating routes is the CSRF story.
 AGENT_COOKIE = "relife_agent_token"
+# Without a token the server answers only to loopback Host names (DNS-rebinding
+# guard). Comma-separated extra names to accept anyway, e.g. a hosts-file alias.
+AGENT_ALLOWED_HOSTS = frozenset(
+    h.strip().lower() for h in os.environ.get("RELIFE_AGENT_ALLOWED_HOSTS", "").split(",") if h.strip()
+)
 AGENT_COOKIE_MAX_AGE = int(os.environ.get("RELIFE_AGENT_COOKIE_MAX_AGE", str(30 * 24 * 3600)))
 # Failed POST /auth attempts allowed per client address per window (token guess
 # throttle; the server is single-user, so this can be tight).
