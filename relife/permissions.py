@@ -13,6 +13,7 @@ wraps it with an interactive terminal y/n prompt for the ask cases.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import sys
@@ -536,6 +537,14 @@ def _escapes(targets: list[str], workspace: Path, *, strict: bool) -> str | None
 def _under(path_str: str, workspace: Path) -> bool:
     """True if ``path_str`` resolves to a location inside ``workspace``."""
     try:
+        if os.name != "nt":
+            # A Windows path on POSIX (`C:\Users\…`, `\\server\share`) isn't
+            # absolute to pathlib, so it would resolve *inside* the workspace;
+            # it can never be inside a POSIX workspace. And `..\..` still means
+            # "up two" to whatever shell a Windows-minded command targets.
+            if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", path_str):
+                return False
+            path_str = path_str.replace("\\", "/")
         # `~` must expand before the containment test, or `rm -rf ~/Documents`
         # looks like a relative path *inside* the workspace.
         target = Path(path_str).expanduser()
