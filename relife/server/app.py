@@ -168,7 +168,7 @@ def create_app(
 
     app = FastAPI(
         title="ReLife agent server",
-        version="0.1.0",
+        version="1.0.0",
         lifespan=lifespan,
         dependencies=[Depends(require_known_host)],
     )
