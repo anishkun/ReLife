@@ -135,6 +135,67 @@ def test_no_grants_no_widening():
     assert grant_allows([], GMAIL_SEND, {"to": ME}) is None
 
 
+# --- the real claude.ai connector schemas (captured 2026-10-09) --------------
+# Tool names and field shapes as Google ships them: recipients are lists of
+# plain addresses, content fields are camelCase, attendees are {email, …}.
+G = "mcp__claude_ai_Gmail__"
+REAL_CAL_CREATE = "mcp__claude_ai_Google_Calendar__create_event"
+
+
+@pytest.mark.parametrize(
+    "tool, inp",
+    [
+        ("send_message", {"to": [ME], "subject": "digest", "body": "3 new", "htmlBody": "<p>boss@corp.com</p>"}),
+        ("send_message", {"to": [ME], "body": "x", "replyThreadId": "t1"}),
+        ("create_draft", {"to": [ME], "subject": "s", "htmlBody": "<b>from a@b.com</b>"}),
+        ("reply", {"messageId": "m1", "to": [ME], "body": "noted"}),
+        ("reply", {"messageId": "m1", "to": [ME], "body": "noted", "replyAll": False}),
+        ("forward", {"messageId": "m1", "to": [ME], "forwardText": "fyi from x@y.com"}),
+    ],
+)
+def test_real_gmail_calls_to_me_are_preauthorized(tool, inp):
+    assert classify(G + tool, inp, Path("."))[0] == "ask"
+    assert grant_allows(EMAIL, G + tool, inp) == f"send email only to {ME}"
+
+
+@pytest.mark.parametrize(
+    "tool, inp",
+    [
+        # sends the stored draft as-is: the to/cc/bcc in the call are ignored
+        ("send_message", {"draftId": "d1", "to": [ME]}),
+        ("send_message", {"draftId": "d1"}),
+        # reply-all keeps the thread's CC list, whatever `to` says
+        ("reply", {"messageId": "m1", "to": [ME], "body": "x", "replyAll": True}),
+        ("reply", {"messageId": "m1", "body": "x"}),  # recipient inferred from the thread
+        ("forward", {"messageId": "m1"}),  # no recipient at all
+        ("forward", {"messageId": "m1", "to": [ME], "bcc": ["leak@else.com"]}),
+        ("update_draft", {"draftId": "d1", "to": [ME]}),  # editing a draft is not covered
+        ("delete_draft", {"draftId": "d1"}),
+        ("trash_message", {"messageId": "m1"}),
+        ("mark_thread_spam", {"threadId": "t1"}),
+    ],
+)
+def test_real_gmail_calls_the_grant_cannot_vouch_for(tool, inp):
+    assert grant_allows(EMAIL, G + tool, inp) is None
+
+
+def test_real_calendar_create_event():
+    guests = [{"kind": "calendar", "addresses": [ME]}]
+    solo = {"summary": "focus", "startTime": "2026-10-10T09:00:00", "endTime": "2026-10-10T10:00:00"}
+    assert grant_allows(CAL, REAL_CAL_CREATE, solo) == describe_grant(CAL[0])
+    with_me = {**solo, "attendees": [{"email": ME, "displayName": "Me"}], "description": "ask x@y.com"}
+    assert grant_allows(guests, REAL_CAL_CREATE, with_me)
+    for bad in (
+        {**solo, "attendees": [{"email": "x@y.com"}]},
+        {**solo, "attendees": [{"email": "ops-team"}]},  # not an address ⇒ junk
+        {**solo, "attendeeEmails": ["x@y.com"]},  # the deprecated field still counts
+        {**solo, "calendarId": "someone@else.com"},  # someone else's calendar
+    ):
+        assert grant_allows(guests, REAL_CAL_CREATE, bad) is None, bad
+    for op in ("update_event", "delete_event", "respond_to_event"):
+        assert grant_allows(guests, f"mcp__claude_ai_Google_Calendar__{op}", {"eventId": "e1"}) is None, op
+
+
 # =============================================================================
 # Layer 2 — the approval callback
 # =============================================================================

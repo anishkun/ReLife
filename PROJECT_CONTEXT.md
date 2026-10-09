@@ -524,9 +524,28 @@ relife chat
   told the exact shape in the scheduled preamble. UI: "may open the PR without asking" under the
   work toggle. 36 new tests, mostly bypass attempts (chains, newlines, `$(…)`, `$env:`, backticks,
   `--body-file`, wrong repo/head, `bash -c` wrapping). 360 tests (was 324).
+- **Post-1.0 — grants checked against the real Google connectors — ✅ DONE.** Linking Gmail +
+  Calendar in a Claude Code session (same account connectors ReLife gets) exposed the real tool
+  names and schemas without a ReLife turn. Findings: Gmail **can** send (`send_message`, `reply`,
+  `forward` — the "drafts only" note was stale), and two real grant bypasses: `send_message(draftId=…)`
+  sends a stored draft ignoring the call's `to`, and `reply(replyAll=true)` keeps the thread's CC —
+  both passed the address check with `to=[me]`. Both now ask. Also fixed false asks: camelCase
+  content fields (`htmlBody`, `forwardText`) were scanned as recipients, `get_draft`/`suggest_time`
+  asked; and an attendee `{email: "ops-team"}` is now junk. The scheduled preamble names the
+  covered email shape. Tests pin every real tool name and shape (fail 7/18 on the old code).
+- **Post-1.0 — live budget smokes (2026-10-09), all in scratch `RELIFE_HOME`s — ✅ PASSED.**
+  (1) Email grant on a schedule via `relife serve` + `POST /schedules/{id}/run`: draft to the
+  listed address created with no card (`acted`), draft to another address asked → timed out →
+  `denied`; Gmail shows only the first draft ($0.39). (2) `relife dream --max 10` on a copy of real
+  data: 2 duplicate patterns archived + journaled ($0.21). (3) Skills round-trip: run 1 scaffolded a
+  CLI and wrote `scaffold-python-cli` ($0.92); run 2 found and followed it ($0.37). (4) `relife
+  build` killed after milestone 1, `--resume` (no persisted session yet → fresh-session path)
+  finished 2–3 without redoing 1, 39 tests ($0.76). The smokes surfaced a real shell-gate hole:
+  `rm -rf /d` was auto-allowed (`_FLAG` read `/d` as a cmd switch for every verb; in Git Bash it is
+  drive D:) — fixed, slash switches only for cmd built-ins; plus a false ask: Git Bash `/d/…` paths
+  inside the workspace now translate (`_msys_to_windows`, `Bash` tool on Windows only).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
-  async caller off the loop via `off_loop`); remaining: a first live end-to-end `relife work` on
-  a real issue (budget), and the deferred live skills round-trip / `relife dream` smoke — Anthropic **Managed Agents** is the natural host (hosted memory
+  async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
 
 ## 9. Key facts to remember

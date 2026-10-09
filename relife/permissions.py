@@ -58,9 +58,11 @@ _TRUSTED_MCP_PREFIXES = ("mcp__relife", "mcp__browser")
 _CONNECTOR_PREFIX = "mcp__claude_ai_"
 _CONNECTOR_READ = re.compile(
     r"(?:^|_)(?:search|list|get|read|fetch|find|query|lookup|show|view|count|"
-    r"authenticate|complete_authentication)(?:_|$)",
+    r"suggest|authenticate|complete_authentication)(?:_|$)",
     re.IGNORECASE,
 )
+# "draft" is a write verb (create_draft) *and* a noun: reading one is still a read.
+_CONNECTOR_READ_DRAFT = re.compile(r"^(?:get|list|search|read|find)_drafts?$", re.IGNORECASE)
 _CONNECTOR_WRITE = re.compile(
     r"(?:^|_)(?:send|create|delete|trash|untrash|modify|update|patch|move|archive|"
     r"reply|forward|draft|label|mark|insert|batch|write|remove|upload|share|"
@@ -415,9 +417,19 @@ def _segments(command: str) -> list[list[str]]:
     return out
 
 
+# `/s` `/q` are switches only to cmd built-ins. To rm/cp/mv/tee… a token like
+# `/d` is a path — in Git Bash the root of drive D: — so reading it as a
+# switch auto-allowed `rm -rf /d`.
+_SLASH_SWITCH_VERBS = {"del", "erase", "rd", "rmdir", "copy", "move", "xcopy", "md", "mkdir", "attrib", "icacls"}
+
+
 def _positionals(tokens: list[str]) -> list[str]:
     """Argument tokens that look like operands rather than switches."""
-    return [t for t in tokens[1:] if t and not _FLAG.match(t)]
+    slash_switches = bool(tokens) and _verb(tokens[0]) in _SLASH_SWITCH_VERBS
+    return [
+        t for t in tokens[1:]
+        if t and not t.startswith("-") and not (slash_switches and _FLAG.match(t))
+    ]
 
 
 def _named_dests(tokens: list[str]) -> list[str]:
@@ -516,20 +528,32 @@ def _delete_targets(command: str) -> list[str]:
     return targets
 
 
-def _escapes(targets: list[str], workspace: Path, *, strict: bool) -> str | None:
+_MSYS_DRIVE = re.compile(r"^/([A-Za-z])(?:/|$)")
+
+
+def _msys_to_windows(path_str: str) -> str:
+    """``/d/relife/x`` → ``D:/relife/x``: how Git Bash (the ``Bash`` tool on
+    Windows) spells a drive path — the agent's own ``pwd`` prints it that way.
+    Only the drive form is translated; ``/tmp``, ``/usr`` … stay as they are
+    (they map to install-specific places, so they keep asking)."""
+    return _MSYS_DRIVE.sub(lambda m: f"{m.group(1).upper()}:/", path_str, count=1)  # bare /d → D:/, never drive-relative D:
+
+
+def _escapes(targets: list[str], workspace: Path, *, strict: bool, msys: bool = False) -> str | None:
     """The first target not provably inside ``workspace``, else None.
 
     ``strict`` rejects *every* target we can't resolve (shell variables) — the
     right default for deletes, which are irreversible. Without it, only an
     unresolvable target that also names a path (`$HOME/.ssh/x`) is rejected, so
     an ordinary `… > $LOG` in the workspace doesn't start prompting.
+    ``msys`` reads Git Bash drive paths (``/d/…``) as the Windows paths they are.
     """
     for target in targets:
         if _unresolvable(target):
             if strict or "/" in target or "\\" in target:
                 return target
             continue
-        if not _under(target, workspace):
+        if not _under(_msys_to_windows(target) if msys else target, workspace):
             return target
     return None
 
@@ -588,10 +612,12 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
             return "ask", f"GitHub CLI action changes the outside world: {gh}"
         # The workspace is a boundary for the shell too, not just for Write/Edit
         # — otherwise a single redirect walks around the whole file-write policy.
-        escaped = _escapes(_write_targets(command), workspace, strict=False)
+        # Git Bash on Windows spells D:\x as /d/x; PowerShell doesn't.
+        msys = tool_name == "Bash" and os.name == "nt"
+        escaped = _escapes(_write_targets(command), workspace, strict=False, msys=msys)
         if escaped:
             return "ask", f"shell writes outside the workspace: {escaped}"
-        escaped = _escapes(_delete_targets(command), workspace, strict=True)
+        escaped = _escapes(_delete_targets(command), workspace, strict=True, msys=msys)
         if escaped:
             return "ask", f"shell deletes outside the workspace: {escaped}"
         return "allow", "build/test/git shell command"
@@ -601,6 +627,8 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
 
     if tool_name.startswith(_CONNECTOR_PREFIX):
         op = _connector_tool(tool_name)
+        if _CONNECTOR_READ_DRAFT.match(op):
+            return "allow", f"connector read: {op}"
         if _CONNECTOR_WRITE.search(op):
             return "ask", f"connector action changes the outside world: {op}"
         if _CONNECTOR_READ.search(op):
@@ -646,7 +674,25 @@ _CONTENT_KEY = re.compile(
     r"title|notes?|location)(?:_|$)",
     re.IGNORECASE,
 )
-_RECIPIENT_KEY = re.compile(r"^(?:to|cc|bcc|recipients?|attendees?|guests?|invitees?)$", re.IGNORECASE)
+_RECIPIENT_KEY = re.compile(
+    r"^(?:to|cc|bcc|recipients?|attendees?|guests?|invitees?|email|(?:added_)?attendee_emails)$",
+    re.IGNORECASE,
+)
+# Fields that make an email call reach people its visible recipients don't
+# name (checked against the real Gmail connector schema): `draftId` sends a
+# stored draft as-is and ignores to/cc/bcc, and `replyAll` keeps the thread's
+# CC list. Either one ⇒ the grant can't vouch for the call ⇒ ask.
+_EMAIL_HIDDEN_RECIPIENTS = ("draft_id", "reply_all")
+
+
+def _snake(key: str) -> str:
+    """``htmlBody`` → ``html_body``: the connectors use camelCase field names."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
+
+
+def _is_content_key(key: str) -> bool:
+    k = _snake(key)
+    return bool(_CONTENT_KEY.match(k) or k == "forward_text") and not k.endswith("_id")
 _GRANT_OPS: dict[str, tuple[str, re.Pattern[str]]] = {
     # kind → (service substring in the tool name, op shape)
     "email": ("gmail", re.compile(r"(?:^|_)(?:send|reply|forward|draft)(?:_|$)", re.IGNORECASE)),
@@ -735,10 +781,10 @@ def _addresses_in(value: Any, key: str = "") -> tuple[set[str], bool]:
             found |= f
             junk |= j
     elif isinstance(value, str):
-        if key and _CONTENT_KEY.match(key):
+        if key and _is_content_key(key):
             return found, junk
         found |= {a.lower() for a in _EMAIL.findall(value)}
-        if key and _RECIPIENT_KEY.match(key):
+        if key and _RECIPIENT_KEY.match(_snake(key)):
             # "Me <me@x.com>, ops-team" — every token must be an address.
             for part in re.split(r"[,;]", value):
                 part = part.strip()
@@ -832,7 +878,12 @@ def grant_allows(
         needle, shape = _GRANT_OPS.get(grant.get("kind", ""), ("", None))
         if not needle or needle not in service or shape is None or not shape.search(op):
             continue
-        found, junk = _addresses_in(tool_input if isinstance(tool_input, dict) else {})
+        inp = tool_input if isinstance(tool_input, dict) else {}
+        if grant["kind"] == "email" and any(
+            _snake(k) in _EMAIL_HIDDEN_RECIPIENTS and v not in (None, False, "") for k, v in inp.items()
+        ):
+            continue  # draft sent as stored / reply-all ⇒ recipients we can't see ⇒ ask
+        found, junk = _addresses_in(inp)
         allowed = {a.lower() for a in grant.get("addresses") or []}
         if junk or not found <= allowed:
             continue

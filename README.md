@@ -26,9 +26,10 @@ running on the **Claude Code Max subscription** (no metered API key).
 - **Email / calendar / files** — the claude.ai **Gmail, Google Calendar and Google Drive**
   connectors ride the subscription (no keys, no setup beyond enabling them at claude.ai).
   Reads run on their own; anything that changes something asks you first, in the
-  terminal or the web console. `relife doctor` shows whether they're enabled. Note: the
-  Gmail connector can read, label and **draft** — it has no send tool, so ReLife never
-  sends mail by itself.
+  terminal or the web console. `relife doctor` shows whether they're enabled. The Gmail
+  connector can send, reply and forward as well as draft — every one of those asks unless a
+  schedule pre-approved it — and what actually goes through also depends on the Google
+  permissions you granted when linking the account.
 - **Memory that grows (like a brain)** — facts/skills/workflows recalled automatically
   before each task; relevance **rises with use and fades when ignored**; an automatic
   LLM-free **"sleep" pass** forgets stale notes, merges duplicates, and learns workflows
@@ -40,7 +41,7 @@ running on the **Claude Code Max subscription** (no metered API key).
   tasks that fire on a cadence in their own session, with each run's outcome — summary,
   cost, and anything it needed you for — recorded durably. A **work schedule** runs
   `relife work` on your newest assigned issue each time; a schedule may carry narrow
-  pre-approvals (draft email / create calendar events to listed addresses, or open the
+  pre-approvals (email / create calendar events to listed addresses, or open the
   one PR for the issue it worked) so an unattended run can finish.
 - **Memory as a service (optional)** — `relife memory serve` runs the memory layer as a
   standalone daemon so several ReLife processes share one brain (`RELIFE_MEMORY_URL`).
