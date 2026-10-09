@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- Email grants no longer cover `send_message` with a `draftId` (sends a stored draft whose
+  recipients the grant never saw) or `reply` with `replyAll` (keeps the thread's CC list) — both
+  were pre-approved when `to` named a listed address. Found against the live Gmail connector schema.
+- `rm -rf /d` (and `cp x /d`, `mv x /c`) auto-allowed: a single-letter `/x` token was read as a
+  cmd switch (`del /s /q`) for every verb, but to `rm`/`cp`/`mv`/`tee`… in Git Bash it is the root
+  of a drive. Slash switches are now only recognised for cmd built-ins.
+
+### Fixed
+- Grants checked against the real Gmail/Calendar connector schemas: camelCase content fields
+  (`htmlBody`, `forwardText`) no longer read as recipients; a non-address calendar attendee fails
+  the grant; `get_draft` and `suggest_time` are reads.
+- The `Bash` tool on Windows (Git Bash) spells `D:\relife\workspace` as `/d/relife/workspace`;
+  shell writes/deletes to that form inside the workspace no longer ask (PowerShell is unchanged).
+
 ## 1.0.0 — 2026-10-08
 
 First release. A personal agent on the Claude Agent SDK, running on the Claude Code Max

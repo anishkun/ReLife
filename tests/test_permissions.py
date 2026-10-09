@@ -1,6 +1,9 @@
 """Unit tests for the permission classifier."""
 
+import os
 from pathlib import Path
+
+import pytest
 
 from relife.permissions import classify
 
@@ -159,6 +162,30 @@ def test_connector_writes_ask():
     assert d("mcp__claude_ai_Google_Drive__share_file", {}) == "ask"
 
 
+def test_real_connector_tool_names():
+    """Every tool the claude.ai Gmail/Calendar connectors actually ship
+    (captured 2026-10-09) lands on the right side of the line."""
+    reads = [
+        "Gmail__get_message", "Gmail__get_thread", "Gmail__search_threads", "Gmail__list_labels",
+        "Gmail__list_drafts", "Gmail__get_draft",
+        "Google_Calendar__list_events", "Google_Calendar__get_event", "Google_Calendar__search_events",
+        "Google_Calendar__list_calendars", "Google_Calendar__suggest_time",
+    ]
+    writes = [
+        "Gmail__send_message", "Gmail__reply", "Gmail__forward", "Gmail__create_draft",
+        "Gmail__update_draft", "Gmail__delete_draft", "Gmail__trash_message", "Gmail__untrash_thread",
+        "Gmail__label_message", "Gmail__unlabel_thread", "Gmail__update_message_labels",
+        "Gmail__create_label", "Gmail__delete_label", "Gmail__update_label",
+        "Gmail__mark_message_spam", "Gmail__unmark_thread_spam", "Gmail__apply_sensitive_message_label",
+        "Google_Calendar__create_event", "Google_Calendar__update_event", "Google_Calendar__delete_event",
+        "Google_Calendar__respond_to_event",
+    ]
+    for t in reads:
+        assert d(f"mcp__claude_ai_{t}", {}) == "allow", t
+    for t in writes:
+        assert d(f"mcp__claude_ai_{t}", {}) == "ask", t
+
+
 def test_connector_write_verb_beats_read_verb():
     """A name with both a read and a write verb is a write (fail closed)."""
     assert d("mcp__claude_ai_Gmail__get_and_send", {}) == "ask"
@@ -269,3 +296,26 @@ def test_gh_write_hidden_behind_a_read_or_wrapper_asks():
     assert gh("echo 42 | xargs gh issue close") == "ask"
     assert gh("$(gh pr merge 7)") == "ask"
     assert gh("gh -R o/r issue delete 1") == "ask"
+
+
+def test_msys_drive_paths_translate():
+    """Git Bash spells D:/x as /d/x; only that drive form is rewritten."""
+    from relife.permissions import _msys_to_windows
+
+    assert _msys_to_windows("/d/relife/x") == "D:/relife/x"
+    assert _msys_to_windows("/d") == "D:/"  # the drive root, never drive-relative `D:`
+    for keep in ("/tmp/x", "/dev/null", "/usr/bin", "rel/d", "D:/x"):
+        assert _msys_to_windows(keep) == keep
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Git Bash drive paths exist only on Windows")
+def test_bash_msys_paths_inside_workspace_stay_autonomous(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    drive, rest = str(ws.resolve()).split(":", 1)
+    msys = f"/{drive.lower()}{rest.replace(chr(92), '/')}"
+    assert classify("Bash", {"command": f"echo hi > {msys}/out.txt"}, ws)[0] == "allow"
+    assert classify("Bash", {"command": f"rm -rf {msys}/build"}, ws)[0] == "allow"
+    # PowerShell reads `/d/…` as a path under the current drive's root: no translation.
+    assert classify("PowerShell", {"command": f"echo hi > {msys}/out.txt"}, ws)[0] == "ask"
+    assert classify("Bash", {"command": f"rm -rf /{drive.lower()}"}, ws)[0] == "ask"

@@ -89,6 +89,11 @@ def _grants_note(schedule: Schedule, grants: list[dict[str, Any]] | None = None)
         "and, unattended, waits out the approval timeout before it is denied."
         if pr else ""
     )
+    if any(g.get("kind") == "email" for g in grants):
+        how += (
+            " For email that means a message that lists its recipients in `to`/`cc`/`bcc` "
+            "— not sending a saved draft by `draftId`, and not reply-all."
+        )
     return (
         f" The user pre-approved these actions for this run, so they need no approval: "
         f"{allowed} (at most {config.AGENT_GRANT_MAX_USES} uses).{how} Anything else still "
