@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,7 +25,7 @@ from ..agents import AgentStore, attach, create_agent
 from ..memory.client import ScopedMemoryClient
 from ..memory.context import build_context
 from .agent import OnOutcome, ReLifeAgent, TurnRunner
-from .native import LlmFactory, default_llm, llm_agent
+from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
 from .spec import CrewSpec
 from .turns import OnEvent
 
@@ -67,7 +68,10 @@ def build_crew(
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     on_outcome: OnOutcome | None = None,
     on_step: Callable[[str, Any], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Crew:
+    """``should_stop`` is checked after every task (any member kind): once it
+    says so, the next task never starts and ``kickoff()`` raises."""
     llm_factory = llm_factory or default_llm
     members: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
@@ -120,12 +124,22 @@ def build_crew(
         from .llm import ClaudeMaxLLM
 
         manager_llm = ClaudeMaxLLM()
-    return Crew(
-        agents=list(members.values()),
-        tasks=list(tasks.values()),
-        process=Process.hierarchical if hierarchical else Process.sequential,
-        manager_llm=manager_llm if hierarchical else None,
-        memory=False,
-        planning=False,
-        verbose=False,
-    )
+
+    def stop_check(_output: Any) -> None:
+        if should_stop is not None and should_stop():
+            raise RuntimeError("crew stopped by the user")
+
+    # A closure again (it carries this run's stop flag): same unserializable-
+    # callback warning as the step callback, same reason it is noise here.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_UNSERIALIZABLE_CALLBACK, category=UserWarning)
+        return Crew(
+            agents=list(members.values()),
+            tasks=list(tasks.values()),
+            process=Process.hierarchical if hierarchical else Process.sequential,
+            manager_llm=manager_llm if hierarchical else None,
+            memory=False,
+            planning=False,
+            verbose=False,
+            task_callback=stop_check if should_stop is not None else None,
+        )

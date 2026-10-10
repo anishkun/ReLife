@@ -26,6 +26,13 @@ Policy, all deterministic and unit-tested with a fake manager:
     is recorded as ``skipped: …`` / ``error: …`` and the schedule still
     advances — the failure is visible in its history, and nothing retries in a
     tight loop against the same wall.
+
+A **crew schedule** (``crew`` set) fires its crew instead of a turn: the plan
+is re-validated against the live agent registry (no model call — the plan is
+the schedule's), recorded as a crew run, and hosted by ``server/crews.py``.
+The host streams like a session, so the same recorder follows it from its
+``user`` echo to the crew's single ``result``/``error``, and the history entry
+links the crew run (``crew_id``).
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from typing import Any
 
 from .. import config
 from .. import workitems
+from .crews import CrewLimitReached, CrewService, CrewUnavailable
 from .runs import RunRecord, RunStore
 from ..permissions import describe_grant
 from .schedules import Schedule, ScheduleStore
@@ -57,6 +65,17 @@ def scheduled_prompt(
         "retrying. Do the task, then finish with a short summary of what you did and "
         f"anything that needs the user.{_grants_note(schedule, grants)}\n\n"
         f"{schedule.task if body is None else body}"
+    )
+
+
+def scheduled_crew_prompt(schedule: Schedule, goal: str) -> str:
+    """What a crew firing shows as its opening line (the members never see it —
+    each gets its own task). Same ``[Scheduled run: …]`` shape the UI folds."""
+    return (
+        f"[Scheduled run: {schedule.name}] This crew run was triggered automatically by a "
+        "schedule and may be unattended — a member's action that needs approval is denied "
+        "when the approval times out.\n\n"
+        f"{schedule.task or goal}"
     )
 
 
@@ -126,15 +145,18 @@ class Scheduler:
         tick: float | None = None,
         runs: RunStore | None = None,
         run_timeout: float | None = None,
+        crews: CrewService | None = None,
     ) -> None:
         self.store = store
         self.manager = manager
+        self.crews = crews
         self.runs = runs if runs is not None else RunStore()
         self.root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
         self.tick_seconds = config.AGENT_SCHEDULER_TICK if tick is None else tick
         self.run_timeout = config.AGENT_SCHEDULE_RUN_TIMEOUT if run_timeout is None else run_timeout
         self._recorders: set[asyncio.Task[None]] = set()
         self._item: dict[str, str] = {}  # schedule id → issue ref being started
+        self._crew: dict[str, str] = {}  # schedule id → crew run id just started
 
     async def run(self) -> None:
         """Background loop: tick forever. Upkeep must never kill the server."""
@@ -176,6 +198,9 @@ class Scheduler:
         schedule.record_run(t, status, run_id=run_id if status == "submitted" else None)
         if item:
             schedule.runs[-1]["item"] = item  # which issue a work schedule took
+        crew_id = self._crew.pop(schedule.id, None)
+        if crew_id:
+            schedule.runs[-1]["crew_id"] = crew_id
         self.store.save()
         return status
 
@@ -225,6 +250,8 @@ class Scheduler:
         session: Any = self.manager.get(schedule.session_id) if schedule.session_id else None
         if session is not None and getattr(session, "busy", False):
             return "skipped: previous run still in progress"
+        if schedule.crew is not None:
+            return await self._start_crew(schedule, run_id, now)
         body: str | None = None
         repo = branch = None
         if schedule.work is not None:
@@ -280,12 +307,48 @@ class Scheduler:
             return f"skipped: {e}"
         if queue is None:
             return unrecorded
+        self._follow(schedule, run_id, now, session, queue, prompt)
+        return "submitted"
+
+    def _follow(
+        self, schedule: Schedule, run_id: str, now: float, session: Any, queue: asyncio.Queue, prompt: str
+    ) -> None:
         record = RunRecord(
             schedule_id=schedule.id, run_id=run_id, started_at=now, session_id=session.id
         )
         task = asyncio.create_task(self._record(schedule, record, session, queue, prompt))
         self._recorders.add(task)
         task.add_done_callback(self._recorders.discard)
+
+    async def _start_crew(self, schedule: Schedule, run_id: str, now: float) -> str:
+        if self.crews is None:
+            return "error: crews are not available on this server"
+        try:
+            # Validated again against the registry as it is now (an agent the
+            # plan inherits from may have been deleted since).
+            crew_rec, _spec = await self.crews.plan(task=schedule.task or None, spec_raw=schedule.crew)
+        except ValueError as e:
+            return f"error: {e}"
+        prompt = scheduled_crew_prompt(schedule, crew_rec.task)
+        try:
+            host = self.crews.build_host(crew_rec, prompt=prompt)
+        except CrewUnavailable as e:
+            return f"error: {e}"
+        except CrewLimitReached as e:
+            return f"skipped: {e}"
+        # Subscribe before it starts, as for a turn: its first event is ours.
+        queue, _backlog = host.subscribe()
+        try:
+            await self.crews.launch(host)
+        except SessionLimitReached as e:
+            host.unsubscribe(queue)
+            crew_rec.status = "cancelled"
+            crew_rec.error = f"not started: {e}"
+            self.crews.records.save(crew_rec)
+            return f"skipped: {e}"
+        schedule.session_id = host.id
+        self._crew[schedule.id] = crew_rec.id
+        self._follow(schedule, run_id, now, host, queue, prompt)
         return "submitted"
 
     async def _record(

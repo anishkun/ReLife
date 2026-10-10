@@ -216,6 +216,9 @@ AGENT_MAX_SUBSCRIBERS = int(os.environ.get("RELIFE_AGENT_MAX_SUBSCRIBERS", "8"))
 AGENT_SCHEDULER = os.environ.get("RELIFE_AGENT_SCHEDULER", "1") != "0"
 AGENT_SCHEDULER_TICK = float(os.environ.get("RELIFE_AGENT_SCHEDULER_TICK", "30"))
 AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
+# Crews running at once inside `relife serve` (each member turn is a CLI
+# subprocess and spends Max budget; a crew is also one session slot).
+AGENT_MAX_CREWS = int(os.environ.get("RELIFE_AGENT_MAX_CREWS", "1"))
 # Floor on the interval form ("every 30m"): every run spends Max budget, so a
 # one-minute schedule is a mistake to refuse, not a wish to honour.
 AGENT_SCHEDULE_MIN_INTERVAL = float(os.environ.get("RELIFE_AGENT_SCHEDULE_MIN_INTERVAL", "300"))

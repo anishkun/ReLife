@@ -636,6 +636,19 @@ environment (`py -3.12 -m venv .venv`, then `.venv\Scripts\pip install -e ".[cre
 and `.venv\Scripts\relife crew …`). `relife doctor` tells you this if you're on
 3.14.
 
+**From the web console.** Run `relife serve` from that same venv and the console gets
+two more panels. **Agents** lists each agent, how many memories it holds and whose
+memory it reads; you can add one (inheriting from or forking another), let it read
+another agent's memory or stop it, promote what it learned into yours, or delete it.
+**Crews** takes a task, plans the team (one model call) and shows you the plan; **run**
+starts it, and the console switches to the crew's live stream — every member's tool
+calls, labelled with its name. When a ReLife member wants to do something outward, you
+get the same approval card as in a chat; if nobody answers in time, it's denied and the
+crew carries on. **stop** denies anything waiting and starts no new task (the one in
+progress finishes first). A crew's card can also put it on a schedule; a scheduled crew
+runs unattended, so anything that needs approval is denied and listed in the run's
+outcome.
+
 ---
 
 ## 7. Where things live on disk

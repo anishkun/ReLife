@@ -25,6 +25,12 @@ background task under the lifespan fires each due schedule as a turn in its own
 session, so an unattended run goes through the very same approval path (and
 times out to deny when no one is watching).
 
+Agents, memory spaces and crews (the platform pass) are here too: the agent
+registry and its handoff operations (``relife/agents.py``) over HTTP, and
+crews planned and run under the server (``crews.py``) — a running crew is
+hosted like a session, so it streams on ``/sessions/{id}/events`` and its
+members' approvals resolve on the same approval route.
+
 Endpoints:
   GET    /                                    → the self-contained web UI
   GET    /health                              → status (no auth)
@@ -45,6 +51,19 @@ Endpoints:
   POST   /schedules/{id}/run                  → fire it now
   GET    /schedules/{id}/runs                 → recorded outcomes, newest first
   GET    /schedules/{id}/runs/{run_id}        → one outcome, with its event stream
+  GET    /spaces                              → memory spaces and their counts
+  GET    /agents                              → registered agents
+  POST   /agents                              → register one (inherit / fork)
+  GET    /agents/{name}                       → one agent
+  DELETE /agents/{name}                       → unregister (archives its memory)
+  POST   /agents/{name}/attach|detach         → read another agent's memory, or stop
+  POST   /agents/{name}/promote               → copy its memories into yours (default)
+  GET    /crews                               → recent crew runs
+  POST   /crews                               → plan a task (one model call) or record a spec
+  GET    /crews/{id}                          → one crew run, with its plan
+  POST   /crews/{id}/run                      → run a planned crew → {session_id}
+  POST   /crews/{id}/stop                     → stop a running crew
+  DELETE /crews/{id}                          → discard a planned crew
 """
 
 from __future__ import annotations
@@ -59,7 +78,12 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from .. import agents as agents_mod
 from .. import config
+from ..crew.record import CrewRunStore
+from ..crew.spec import CrewSpec
+from ..memory.client import off_loop
+from .crews import CREWAI_HINT, CrewLimitReached, CrewService, CrewUnavailable, crewai_available
 from .runs import RunStore
 from ..permissions import normalize_grants
 from .scheduler import Scheduler
@@ -68,6 +92,7 @@ from .schedules import (
     ScheduleStore,
     check_grants_fit,
     next_run,
+    normalize_crew,
     normalize_spec,
     normalize_work,
     validate_name,
@@ -86,6 +111,7 @@ from .session import (
     SessionFactory,
     SessionLimitReached,
     SessionManager,
+    SessionReadOnly,
     TooManySubscribers,
     TurnQueueFull,
 )
@@ -112,6 +138,13 @@ def create_app(
     runs_dir: Path | None = None,
     run_scheduler: bool | None = None,
     allowed_hosts: frozenset[str] | None = None,
+    agents_path: Path | None = None,
+    crews_dir: Path | None = None,
+    memory_client: Any = None,
+    crew_ask_model: Any = None,
+    crew_turn: Any = None,
+    crew_llm_factory: Any = None,
+    crew_approval_timeout: float | None = None,
 ) -> FastAPI:
     """Build the agent server app.
 
@@ -125,6 +158,8 @@ def create_app(
     tick loop off so tests drive ``app.state.scheduler.tick(now)`` by hand.
     ``allowed_hosts`` are non-loopback ``Host`` names a tokenless server may
     answer to (default ``RELIFE_AGENT_ALLOWED_HOSTS``) — see ``host_allowed``.
+    ``agents_path``/``crews_dir``/``memory_client`` and the ``crew_*`` hooks
+    point the platform routes at tmp state and stub models in tests.
     """
     manager = SessionManager(session_factory=session_factory)
     root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
@@ -132,7 +167,18 @@ def create_app(
     auth_limiter = AttemptLimiter(config.AGENT_AUTH_MAX_ATTEMPTS, config.AGENT_AUTH_WINDOW)
     store = ScheduleStore(schedules_path)
     runs = RunStore(runs_dir)
-    scheduler = Scheduler(store, manager, workspace_root=root, runs=runs)
+    crews = CrewService(
+        manager,
+        workspace_root=root,
+        records=CrewRunStore(crews_dir),
+        agents_path=agents_path,
+        client=memory_client,
+        ask_model=crew_ask_model,
+        turn=crew_turn,
+        llm_factory=crew_llm_factory,
+        approval_timeout=crew_approval_timeout,
+    )
+    scheduler = Scheduler(store, manager, workspace_root=root, runs=runs, crews=crews)
     tick = config.AGENT_SCHEDULER if run_scheduler is None else run_scheduler
 
     @asynccontextmanager
@@ -177,6 +223,7 @@ def create_app(
     app.state.schedules = store
     app.state.scheduler = scheduler
     app.state.runs = runs
+    app.state.crews = crews
 
     def _authenticated(request: Request) -> bool:
         return token_matches(
@@ -275,6 +322,8 @@ def create_app(
         return {
             "session_id": session.id,
             "workspace": str(getattr(session, "workspace", "")),
+            "kind": getattr(session, "kind", "chat"),
+            "busy": bool(getattr(session, "busy", False)),
         }
 
     @app.delete("/sessions/{session_id}", dependencies=mutate)
@@ -298,6 +347,8 @@ def create_app(
             await session.submit(text)
         except TurnQueueFull as e:
             raise HTTPException(status_code=429, detail=str(e)) from e
+        except SessionReadOnly as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return {"ok": True}
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}", dependencies=mutate)
@@ -388,6 +439,8 @@ def create_app(
                 enabled=body.get("enabled", True),
                 grants=body.get("grants"),
                 work=body.get("work"),
+                crew=body.get("crew"),
+                agents=_agent_names(),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -407,10 +460,15 @@ def create_app(
             # Validate work + task together before assigning either: turning
             # work off must leave a task behind, never a blank schedule.
             work = normalize_work(body["work"]) if "work" in body else schedule.work
-            task = validate_task(body.get("task", schedule.task), required=work is None)
+            crew = (
+                normalize_crew(body["crew"], agents=_agent_names()) if "crew" in body else schedule.crew
+            )
+            task = validate_task(
+                body.get("task", schedule.task), required=work is None and crew is None
+            )
             grants = normalize_grants(body["grants"]) if "grants" in body else schedule.grants
-            check_grants_fit(grants, work)
-            schedule.work, schedule.task, schedule.grants = work, task, grants
+            check_grants_fit(grants, work, crew)
+            schedule.work, schedule.crew, schedule.task, schedule.grants = work, crew, task, grants
             if "workspace" in body:
                 schedule.workspace = _check_workspace(body["workspace"])
             spec = _spec_from(body)
@@ -450,6 +508,202 @@ def create_app(
         if rec is None:
             raise HTTPException(status_code=404, detail="unknown run")
         return rec.to_dict(with_events=True)
+
+    # --- agents + memory spaces ---------------------------------------------
+    # Same operations as `relife agent …`: the registry is re-read per request
+    # (the CLI may change it), and every memory touch runs off the loop. Token
+    # minting stays CLI-only — this server's token holder is already the user,
+    # but a credential for the memory daemon is better printed once to a
+    # terminal than carried through a browser.
+    def _agent_store() -> agents_mod.AgentStore:
+        return agents_mod.AgentStore(agents_path)
+
+    def _agent_names() -> set[str]:
+        return {a.name for a in _agent_store().list()}
+
+    def _agent_view(a: agents_mod.AgentProfile, counts: dict[str, dict[str, int]]) -> dict[str, Any]:
+        d = a.public()
+        d["memories"] = counts.get(a.own_space, {}).get("memories", 0)
+        d["reads"] = list(a.scope().read)
+        return d
+
+    def _bad(e: Exception) -> HTTPException:
+        if isinstance(e, LookupError):
+            return HTTPException(status_code=404, detail=str(e).strip("'\""))
+        return HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/spaces", dependencies=auth)
+    async def list_spaces() -> dict[str, Any]:
+        return {"spaces": await off_loop(crews.client.spaces)}
+
+    @app.get("/agents", dependencies=auth)
+    async def list_agents() -> dict[str, Any]:
+        st = _agent_store()
+        counts = await off_loop(crews.client.spaces)
+        return {"agents": [_agent_view(a, counts) for a in st.list()], "problem": st.problem}
+
+    @app.post("/agents", dependencies=mutate, status_code=201)
+    async def create_agent_route(body: dict[str, Any]) -> dict[str, Any]:
+        inherit = body.get("inherit") or []
+        if not isinstance(inherit, list) or not all(isinstance(x, str) for x in inherit):
+            raise HTTPException(status_code=400, detail="inherit must be a list of agent names")
+
+        def make() -> tuple[agents_mod.AgentProfile, Any]:
+            return agents_mod.create_agent(
+                _agent_store(), crews.client, str(body.get("name") or ""),
+                runtime=str(body.get("runtime") or "relife"),
+                model=str(body.get("model") or ""),
+                description=str(body.get("description") or ""),
+                inherit=inherit,
+                fork=body.get("fork") or None,
+                isolated=bool(body.get("isolated", False)),
+            )
+
+        try:
+            profile, copied = await off_loop(make)
+        except (ValueError, LookupError, TypeError) as e:
+            raise _bad(e) from e
+        out = _agent_view(profile, await off_loop(crews.client.spaces))
+        out["copied"] = copied
+        return out
+
+    @app.get("/agents/{name}", dependencies=auth)
+    async def get_agent(name: str) -> dict[str, Any]:
+        try:
+            a = _agent_store().require(name)
+        except LookupError as e:
+            raise _bad(e) from e
+        return _agent_view(a, await off_loop(crews.client.spaces))
+
+    @app.delete("/agents/{name}", dependencies=mutate)
+    async def delete_agent_route(name: str, keep_memory: bool = False) -> dict[str, Any]:
+        try:
+            archived = await off_loop(
+                agents_mod.delete_agent, _agent_store(), crews.client, name, keep_memory=keep_memory
+            )
+        except LookupError as e:
+            raise _bad(e) from e
+        return {"removed": True, "archived": archived}
+
+    @app.post("/agents/{name}/attach", dependencies=mutate)
+    async def attach_route(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            a = agents_mod.attach(_agent_store(), name, str(body.get("other") or ""))
+        except (ValueError, LookupError) as e:
+            raise _bad(e) from e
+        return _agent_view(a, await off_loop(crews.client.spaces))
+
+    @app.post("/agents/{name}/detach", dependencies=mutate)
+    async def detach_route(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            a = agents_mod.detach(_agent_store(), name, str(body.get("other") or ""))
+        except (ValueError, LookupError) as e:
+            raise _bad(e) from e
+        return _agent_view(a, await off_loop(crews.client.spaces))
+
+    @app.post("/agents/{name}/promote", dependencies=mutate)
+    async def promote_route(name: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        ids = (body or {}).get("ids")
+        if ids is not None and (
+            not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+        ):
+            raise HTTPException(status_code=400, detail="ids must be a list of memory ids")
+        try:
+            copied = await off_loop(agents_mod.promote, _agent_store(), crews.client, name, ids=ids)
+        except (ValueError, LookupError) as e:
+            raise _bad(e) from e
+        return {"copied": copied}
+
+    # --- crews ------------------------------------------------------------------
+    def _crew_view(rec: Any, *, full: bool = False) -> dict[str, Any]:
+        from ..crew.runner import describe_plan
+
+        d = rec.to_dict()
+        try:
+            d["plan"] = describe_plan(CrewSpec.from_dict(rec.spec))
+        except (KeyError, TypeError):
+            d["plan"] = []
+        d["session_id"] = crews.session_id(rec.id)
+        host = crews.host(rec.id)
+        if host is not None and host.busy and d["status"] == "planned":
+            # Started, but the worker thread hasn't saved "running" yet: the
+            # host is the truth (otherwise the UI offers "run" on a live crew).
+            d["status"] = "running"
+        if not full:
+            for t in d["tasks"]:
+                t["output"] = t["output"][:600]
+            d["final_output"] = d["final_output"][:1200]
+        return d
+
+    def _crew_or_404(crew_id: str) -> Any:
+        rec = crews.records.get(crew_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown crew")
+        return rec
+
+    @app.get("/crews", dependencies=auth)
+    async def list_crews(limit: int = 20) -> dict[str, Any]:
+        recs = await off_loop(crews.records.list, max(1, min(limit, 100)))
+        return {
+            "crews": [_crew_view(r) for r in recs],
+            "crewai": crewai_available(),
+            "hint": None if crewai_available() else CREWAI_HINT,
+            "llms": [config.CREW_CLAUDE_LLM, *config.CREW_LLMS],
+        }
+
+    @app.post("/crews", dependencies=mutate, status_code=201)
+    async def plan_crew_route(body: dict[str, Any]) -> dict[str, Any]:
+        """Plan a task (spends one tool-less model call) or record a given spec
+        (no model call). Nothing runs until ``POST /crews/{id}/run``."""
+        task = body.get("task")
+        spec = body.get("spec")
+        if spec is None:
+            task = str(task or "").strip()
+            if not task:
+                raise HTTPException(status_code=400, detail="give a task or a spec")
+            if len(task) > config.AGENT_MAX_MESSAGE_CHARS:
+                raise HTTPException(status_code=413, detail="task is too long")
+        try:
+            rec, _spec = await crews.plan(task=task or None, spec_raw=spec)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return _crew_view(rec, full=True)
+
+    @app.get("/crews/{crew_id}", dependencies=auth)
+    async def get_crew(crew_id: str) -> dict[str, Any]:
+        return _crew_view(_crew_or_404(crew_id), full=True)
+
+    @app.post("/crews/{crew_id}/run", dependencies=mutate)
+    async def run_crew_route(crew_id: str) -> dict[str, Any]:
+        _crew_or_404(crew_id)
+        try:
+            host = await crews.start(crew_id)
+        except CrewUnavailable as e:
+            raise HTTPException(status_code=501, detail=str(e)) from e
+        except (CrewLimitReached, SessionLimitReached) as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"session_id": host.id, "crew_id": crew_id}
+
+    @app.post("/crews/{crew_id}/stop", dependencies=mutate)
+    async def stop_crew_route(crew_id: str) -> dict[str, Any]:
+        _crew_or_404(crew_id)
+        host = crews.host(crew_id)
+        if host is None or not host.busy:
+            raise HTTPException(status_code=409, detail="that crew isn't running here")
+        denied = host.stop()
+        return {"stopping": True, "denied": denied}
+
+    @app.delete("/crews/{crew_id}", dependencies=mutate)
+    async def discard_crew_route(crew_id: str) -> dict[str, Any]:
+        rec = _crew_or_404(crew_id)
+        if rec.status != "planned":
+            raise HTTPException(status_code=409, detail=f"crew is {rec.status}; only a plan can be discarded")
+        rec.status = "cancelled"
+        rec.finished_at = time.time()
+        crews.records.save(rec)
+        return {"discarded": True}
 
     return app
 

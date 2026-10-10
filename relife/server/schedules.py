@@ -172,12 +172,38 @@ def normalize_work(raw: Any) -> dict[str, Any] | None:
     return out
 
 
-def check_grants_fit(grants: list[dict[str, Any]], work: dict[str, Any] | None) -> None:
+def check_grants_fit(
+    grants: list[dict[str, Any]], work: dict[str, Any] | None, crew: dict[str, Any] | None = None
+) -> None:
     """A ``pull_request`` grant only means something on a work schedule (the
     scheduler binds it to the issue's repo + branch); elsewhere it's refused
-    rather than silently kept as a grant that can never apply."""
+    rather than silently kept as a grant that can never apply. A crew schedule
+    takes no grants at all: they pre-approve one agent's turn, and a crew's
+    members each ask (unattended, a timeout denies)."""
+    if crew is not None:
+        if grants:
+            raise ValueError("a crew schedule takes no pre-approvals; its members ask")
+        if work is not None:
+            raise ValueError("a schedule runs either a crew or work items, not both")
     if work is None and any(g.get("kind") == "pull_request" for g in grants):
         raise ValueError("a pull_request grant needs a work schedule")
+
+
+def normalize_crew(raw: Any, *, agents: set[str] | frozenset[str] = frozenset()) -> dict[str, Any] | None:
+    """A crew schedule's plan, validated like any untrusted crew spec (only the
+    configured non-Claude models; ``agents`` = registered names it may reuse or
+    inherit from), as a plain dict — or None."""
+    if raw in (None, False, ""):
+        return None
+    from ..crew.spec import normalize_spec as normalize_crew_spec
+
+    return normalize_crew_spec(raw, existing_agents=set(agents), allowed_llms=config.CREW_LLMS).to_dict()
+
+
+def describe_crew(crew: dict[str, Any]) -> str:
+    names = ", ".join(a.get("name", "?") for a in crew.get("agents", []))
+    n = len(crew.get("tasks", []))
+    return f"runs a crew ({names}) · {n} task{'' if n == 1 else 's'}"
 
 
 def describe_work(work: dict[str, Any]) -> str:
@@ -209,6 +235,9 @@ class Schedule:
     # ``task`` becomes optional extra instructions.
     work: dict[str, Any] | None = None
     worked: list[str] = field(default_factory=list)  # issue refs attempted, newest last
+    # A *crew schedule* (``crew`` set, a validated crew spec): each firing runs
+    # that crew under the server (``server/crews.py``); ``task`` is optional.
+    crew: dict[str, Any] | None = None
 
     @classmethod
     def new(
@@ -221,15 +250,18 @@ class Schedule:
         enabled: bool = True,
         grants: list[dict[str, Any]] | None = None,
         work: Any = None,
+        crew: Any = None,
+        agents: set[str] | frozenset[str] = frozenset(),
         now: float | None = None,
     ) -> "Schedule":
         t = time.time() if now is None else now
         name = validate_name(name)
         work = normalize_work(work)
-        task = validate_task(task, required=work is None)
+        crew = normalize_crew(crew, agents=agents)
+        task = validate_task(task, required=work is None and crew is None)
         spec = normalize_spec(spec)
         grants = normalize_grants(grants)
-        check_grants_fit(grants, work)
+        check_grants_fit(grants, work, crew)
         return cls(
             id=uuid.uuid4().hex[:12],
             name=name,
@@ -241,6 +273,7 @@ class Schedule:
             next_run_at=next_run(spec, t),
             grants=grants,
             work=work,
+            crew=crew,
         )
 
     def mark_worked(self, ref: str) -> None:
@@ -286,6 +319,7 @@ class Schedule:
         d["spec_text"] = describe_spec(self.spec)
         d["grants_text"] = [describe_grant(g) for g in self.grants]
         d["work_text"] = describe_work(self.work) if self.work is not None else None
+        d["crew_text"] = describe_crew(self.crew) if self.crew is not None else None
         return d
 
     @classmethod
@@ -300,6 +334,14 @@ class Schedule:
         except ValueError:
             known["work"] = None
             known["enabled"] = False  # half a work schedule must not fire as a blank task
+        crew = known.get("crew")
+        if crew is not None and not (
+            isinstance(crew, dict) and isinstance(crew.get("agents"), list) and isinstance(crew.get("tasks"), list)
+        ):
+            # Same rule: a broken crew must not fire as a blank task. (The full
+            # check, against the live agent registry, runs when it fires.)
+            known["crew"] = None
+            known["enabled"] = False
         return cls(**known)
 
 

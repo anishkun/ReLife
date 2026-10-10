@@ -21,6 +21,11 @@
   `claude-max`) with ReLife memory attached and no machine-touching tools. New agents inherit from
   experienced ones; outcomes are recorded in `data/crews/<id>/` (`relife crews [ID]`). Optional
   `[crewai]` extra — CrewAI needs Python ≤ 3.13; `relife doctor` explains.
+- **Agents and crews in the web console.** `relife serve` gains `/agents`, `/spaces` and `/crews`
+  routes and two panels: manage agents and their memory handoff, and plan → review → run crews
+  with every member's work streaming into the console and its outward actions arriving as approval
+  cards (denied on timeout when nobody is watching). A crew can be stopped, run again, or put on a
+  schedule (crew schedules take no pre-approvals). `RELIFE_AGENT_MAX_CREWS` (default 1).
 
 ### Changed
 - Consolidation dedupes and learns patterns/workflows within each space, never across.

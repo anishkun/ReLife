@@ -68,26 +68,24 @@ def describe_plan(spec: CrewSpec) -> list[str]:
     return lines
 
 
-def run_crew(
+def prepare_crew(
     task: str | None,
     *,
     workspace: Path,
     spec_raw: Any = None,
-    plan_only: bool = False,
-    yes: bool = False,
+    allowed_llms: tuple[str, ...] | None = None,
     echo: Echo = print,
-    confirm: Callable[[str], bool] | None = None,
     ask_model: Any = None,
-    runner: Any = None,
-    llm_factory: Any = None,
-    manager_llm: Any = None,
     store: AgentStore | None = None,
     client: Any = None,
     records: CrewRunStore | None = None,
-    quiet_events: bool = False,
-) -> CrewRunRecord:
-    """Plan (or load), confirm, and run a crew; return its durable record."""
-    _quiet_telemetry()
+) -> tuple[CrewRunRecord, CrewSpec]:
+    """Plan (one tool-less model call) or validate the user's spec, and record
+    it as ``planned``. Nothing runs and no agent is created yet.
+
+    ``allowed_llms`` limits a supplied spec's non-Claude models (``None`` = any:
+    the CLI's spec file is the user's own; the server passes the configured ones).
+    """
     from ..memory.client import default_client
 
     store = store or AgentStore()
@@ -96,8 +94,7 @@ def run_crew(
     existing = {a.name for a in store.list()}
 
     if spec_raw is not None:
-        # The user's own file: any model string is theirs to choose.
-        spec = normalize_spec(spec_raw, existing_agents=existing)
+        spec = normalize_spec(spec_raw, existing_agents=existing, allowed_llms=allowed_llms)
         notes: list[str] = []
         plan_cost = 0.0
     else:
@@ -119,19 +116,39 @@ def run_crew(
         plan_cost_usd=plan_cost,
     )
     records.save(record)
-    for n in notes:
-        echo(f"  · {n}")
-    for line in describe_plan(spec):
-        echo(line)
-    if plan_only:
-        echo(f"plan only — saved as crew {run_id}")
-        return record
-    if not yes and confirm is not None and not confirm("run this crew?"):
-        record.status = "cancelled"
-        record.finished_at = time.time()
-        records.save(record)
-        echo("left alone")
-        return record
+    return record, spec
+
+
+def execute_crew(
+    record: CrewRunRecord,
+    spec: CrewSpec,
+    *,
+    echo: Echo = print,
+    runner: Any = None,
+    llm_factory: Any = None,
+    manager_llm: Any = None,
+    store: AgentStore | None = None,
+    client: Any = None,
+    records: CrewRunStore | None = None,
+    on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    on_step: Callable[[str, Any], None] | None = None,
+    on_task: Callable[[str, str, TurnResult | None], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> CrewRunRecord:
+    """Run a recorded plan: agents and their memory, kickoff, per-task outcomes.
+
+    ``on_event(agent, event)`` sees each ReLife member's streamed events,
+    ``on_step(agent, step)`` each CrewAI-member step, and ``on_task(task, agent,
+    result)`` each finished ReLife task (``None`` result for a CrewAI member's).
+    The record is saved as it moves (``running`` → ``done`` | ``error``).
+    """
+    _quiet_telemetry()
+    from ..memory.client import default_client
+
+    store = store or AgentStore()
+    client = client or default_client()
+    records = records or CrewRunStore()
+    crew_ws = Path(record.workspace)
 
     from .build import build_crew, ensure_profiles
 
@@ -142,22 +159,12 @@ def run_crew(
     relife_results: dict[str, TurnResult] = {}
 
     def on_outcome(task_obj: Any, agent: Any, result: TurnResult) -> None:
-        relife_results[getattr(task_obj, "name", "") or ""] = result
+        name = getattr(task_obj, "name", "") or ""
+        relife_results[name] = result
         if result.denied:
             echo(f"  ! {agent.agent_name}: {len(result.denied)} action(s) denied")
-
-    def on_event(agent_name: str, ev: dict[str, Any]) -> None:
-        if quiet_events:
-            return
-        if ev.get("type") == "tool_use":
-            echo(f"  [{agent_name}] → {ev.get('name')} {ev.get('brief', '')}")
-
-    def on_step(agent_name: str, step: Any) -> None:
-        if quiet_events:
-            return
-        tool = getattr(step, "tool", None)
-        if tool:
-            echo(f"  [{agent_name}] → {tool}")
+        if on_task is not None:
+            on_task(name, agent.agent_name, result)
 
     record.status = "running"
     records.save(record)
@@ -167,15 +174,16 @@ def run_crew(
             store=store,
             client=client,
             workspace=crew_ws,
-            run_id=run_id,
+            run_id=record.id,
             runner=runner,
             llm_factory=llm_factory,
             manager_llm=manager_llm,
             on_event=on_event,
             on_outcome=on_outcome,
             on_step=on_step,
+            should_stop=should_stop,
         )
-        echo(f"running crew {run_id} in {crew_ws}")
+        echo(f"running crew {record.id} in {crew_ws}")
         out = crew.kickoff()
         record.final_output = str(getattr(out, "raw", out) or "")
         outputs = list(getattr(out, "tasks_output", []) or [])
@@ -220,3 +228,67 @@ def run_crew(
 
         maybe_consolidate()
     return record
+
+
+def run_crew(
+    task: str | None,
+    *,
+    workspace: Path,
+    spec_raw: Any = None,
+    plan_only: bool = False,
+    yes: bool = False,
+    echo: Echo = print,
+    confirm: Callable[[str], bool] | None = None,
+    ask_model: Any = None,
+    runner: Any = None,
+    llm_factory: Any = None,
+    manager_llm: Any = None,
+    store: AgentStore | None = None,
+    client: Any = None,
+    records: CrewRunStore | None = None,
+    quiet_events: bool = False,
+) -> CrewRunRecord:
+    """Plan (or load), confirm, and run a crew; return its durable record."""
+    _quiet_telemetry()
+    from ..memory.client import default_client
+
+    store = store or AgentStore()
+    client = client or default_client()
+    records = records or CrewRunStore()
+    # The user's own file: any model string is theirs to choose.
+    record, spec = prepare_crew(
+        task, workspace=workspace, spec_raw=spec_raw, echo=echo, ask_model=ask_model,
+        store=store, client=client, records=records,
+    )
+    for n in record.plan_notes:
+        echo(f"  · {n}")
+    for line in describe_plan(spec):
+        echo(line)
+    if plan_only:
+        echo(f"plan only — saved as crew {record.id}")
+        return record
+    if not yes and confirm is not None and not confirm("run this crew?"):
+        record.status = "cancelled"
+        record.finished_at = time.time()
+        records.save(record)
+        echo("left alone")
+        return record
+
+    def on_event(agent_name: str, ev: dict[str, Any]) -> None:
+        if quiet_events:
+            return
+        if ev.get("type") == "tool_use":
+            echo(f"  [{agent_name}] → {ev.get('name')} {ev.get('brief', '')}")
+
+    def on_step(agent_name: str, step: Any) -> None:
+        if quiet_events:
+            return
+        tool = getattr(step, "tool", None)
+        if tool:
+            echo(f"  [{agent_name}] → {tool}")
+
+    return execute_crew(
+        record, spec, echo=echo, runner=runner, llm_factory=llm_factory,
+        manager_llm=manager_llm, store=store, client=client, records=records,
+        on_event=on_event, on_step=on_step,
+    )

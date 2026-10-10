@@ -46,6 +46,7 @@ relife agent list|create|show|attach|detach|promote|token|connect|delete   # age
 relife mcp --agent NAME           # ReLife memory as a stdio MCP server, scoped to that agent (any MCP client)
 relife crew "<task>" [--spec F] [--plan-only] [--yes]   # CrewAI plans a team; ReLife staffs + runs it
 relife crews [ID]                 # recent crew runs / one run's per-task outcomes (data/crews/<id>/)
+                                  #   (also from the web console: /agents, /crews routes + panels under `relife serve`)
 relife serve [--host --port]      # always-on agent server + web UI (needs [server] extra; default :8600)
 # RELIFE_HOME: where data/ and workspace/ live. Default: beside the code in a source checkout, ~/.relife for an
 #   installed wheel (never site-packages — an upgrade would wipe memory)
@@ -64,6 +65,7 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 # RELIFE_CREW_LLMS=ollama/llama3.1,gpt-4.1 — non-Claude models a crew planner may staff (keys come from the
 #   env, read by CrewAI/LiteLLM; ReLife never stores them); `claude-max` (Claude via the CLI) is always available
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
+# RELIFE_AGENT_MAX_CREWS (default 1) caps crews running at once under `relife serve`
 ```
 
 Prereqs to actually *run* the agent (not needed for tests): Python ≥3.11, Node.js (`npx` for the browser MCP), a logged-in `claude` CLI on Max, and authenticated `gh`.
@@ -136,7 +138,21 @@ Claude via the CLI, no function calling ⇒ CrewAI's ReAct text, stop words appl
 in-process CrewAI tools (`memory_tools.py`, same specs) and the recall block prepended to its tasks — **no
 machine-touching tools** (classify() can't gate CrewAI's loop). `spec.py`/`planner.py`/`record.py` are pure (no
 CrewAI import); the turn runner and the LLM's model call are injected, so `tests/test_crew.py` runs a real
-`Crew.kickoff()` with zero model calls.
+`Crew.kickoff()` with zero model calls. `runner.py` is `prepare_crew` (plan/validate + record `planned`) and
+`execute_crew` (run a recorded plan), composed by `run_crew` for the CLI.
+
+**Under the server** (`relife/server/crews.py`): `/crews` plans and runs crews, `/agents` + `/spaces` expose the
+registry and handoff. A **`CrewHost`** is session-shaped — it shares the `EventStream` base with `AgentSession`
+and is `SessionManager.adopt`ed — so SSE, the approval route, the UI's watch and the scheduler's recorder work on a
+crew unchanged. `kickoff()` runs on a daemon thread; events hop back with `run_coroutine_threadsafe`; a member's
+`can_use_tool` is `make_approval_callback` over a **`LoopBroker`** that hands each ask to the server loop's
+`ApprovalBroker` (browser card; unattended ⇒ timeout ⇒ deny). Member `result`/`error` events are renamed
+`member_done`/`member_error` so a crew has exactly one `result`. Stop denies pending approvals and the crew's
+`task_callback` raises after the task in flight (covers CrewAI members too, not just ReLife turns).
+`CrewRunStore` retries `PermissionError` on read/replace — on Windows the worker's `os.replace` and a route's read
+of the same `record.json` collide. A schedule may carry a `crew` spec (re-validated
+against the live registry at each firing; no grants; not with `work`). `AGENT_MAX_CREWS` (default 1) caps running
+crews; a running crew is never idle-reaped. Over HTTP a spec may only name `RELIFE_CREW_LLMS` + `claude-max`.
 
 The system prompt uses the **`claude_code` preset** with `prompts/system.md` appended (persona + safety + memory/skill/workflow instructions). `setting_sources=None` deliberately prevents inheriting the surrounding repo's Claude Code settings.
 
@@ -191,6 +207,10 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - **`mcp` is a declared dependency, pinned `<2`.** ReLife imports it directly (`memory/mcp_server.py`), and the SDK
   alone allows `mcp<3`: a base install picked up mcp 2.3 (a restructured major) and the MCP tests failed to import
   in CI while every all-extras job — where CrewAI pins `mcp~=1.28.1` — passed. Porting to 2.x is a separate change.
+- **Don't `asyncio.to_thread` code that calls `anyio.run`.** `to_thread` copies context variables, so anyio
+  in the worker believes it is already inside the loop ("Already running asyncio in this thread"). The server's
+  crew planner uses `loop.run_in_executor`, the crew itself a plain `threading.Thread` (the crew paths call
+  `crew.turns.run_sync`, which is `anyio.run`).
 - **CrewAI requires Python < 3.14** (1.15.x). The `[crewai]` extra is marker-gated; crew code that imports CrewAI
   (`llm`, `agent`, `native`, `memory_tools`, `build`) is only imported after `_crewai_or_exit()`.
 

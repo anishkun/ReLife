@@ -19,7 +19,7 @@
 > is the synthesis — read it last, and re-read it whenever you make an architectural
 > change. Line references are to the code as of the platform pass (branch
 > `feat/platform-crewai`, commit `a53ef91`); the test suite is **~800 deterministic
-> tests** — 790 on Python 3.14, 797 in the 3.12 `.venv` where CrewAI is installed
+> tests** — 800 on Python 3.14, 811 in the 3.12 `.venv` where CrewAI is installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -2312,13 +2312,67 @@ everywhere. Crews run from a 3.12 `.venv`, where `tests/test_crew.py`
 turn runner and a CrewAI member on `ClaudeMaxLLM` with a stub model — with zero model
 calls.
 
+### Crews under the server (`server/crews.py`)
+
+The CLI runs a crew in the foreground: plan, `[y/N]`, kickoff, a TTY prompt for each ask.
+`relife serve` needs the same crew to be *watchable* and *answerable from a browser*, and to
+survive nobody watching. `runner.py` is therefore two halves — `prepare_crew` (plan or
+validate, record `planned`) and `execute_crew` (run a recorded plan) — and the server's
+`CrewService` calls them at different moments: `POST /crews` plans, `POST /crews/{id}/run`
+executes.
+
+The design choice is that a running crew **is a session** as far as the rest of the server
+knows. `CrewHost` extends the `EventStream` base that `AgentSession` now shares (ring, bounded
+subscribers, `touch`), exposes `resolve_approval`/`busy`/`aclose`, refuses `submit`
+(`SessionReadOnly` → 409), and is `SessionManager.adopt`ed. Everything already built for
+sessions then works unchanged: `GET /sessions/{id}/events` streams it, `POST
+/sessions/{id}/approvals/{a}` answers its members, the UI's watch attaches to it, the
+scheduler's recorder follows it from its `user` echo to its `result`, the ceiling counts it and
+shutdown closes it. The reaper is the one place that knows: a *running* crew is never idle-
+reaped, because closing the host can't stop the worker thread — only orphan the run from its
+stream and approvals.
+
+Threads are the hard part. `kickoff()` is synchronous and long, so it runs on a daemon
+`threading.Thread`, and each ReLife member's turn runs on that thread's own loop
+(`turns.run_sync`). Two bridges cross back to the server loop: events via
+`run_coroutine_threadsafe(self._publish(ev))` (FIFO, so order holds), and approvals via
+`LoopBroker`, the broker object `make_approval_callback` is given — its `request` schedules
+the server loop's `ApprovalBroker.request` and awaits the `concurrent.futures.Future` from the
+worker loop. `classify()` still decides; only the place the question is asked changed. A broken
+bridge denies. Two traps: `asyncio.to_thread` copies context variables, so `anyio.run` inside it
+thinks it is nested ("Already running asyncio in this thread") — planning uses
+`run_in_executor`; and the record says `running` only once the worker saved it, so a fast
+second `run` is refused by checking the live host first.
+
+A crew must end exactly once for a watcher, but every ReLife member's turn ends with its own
+`result`. `member_event` renames members' `result`/`error`/`user` to
+`member_done`/`member_error`/`member_prompt` and stamps `agent`; the host publishes the crew's
+final output as `text`, then one `result` (total cost) or `error`. That is what lets the
+unchanged recorder turn a scheduled crew into a `RunRecord` whose summary is the final output.
+Stop is cooperative (`threading.Event`): pending approvals are denied at once
+(`ApprovalBroker.deny_all`), a ReLife member's next turn refuses to start, and the crew's
+`task_callback` (`build_crew(should_stop=)`) raises after the task in flight so *no* member kind
+starts another — CrewAI has no cancel. (The first version only had the ReLife check; the live
+browser run caught a CrewAI reviewer still running after stop.) One more Windows trap: the worker
+`os.replace`s `record.json` while routes read it, and Windows lets neither happen during the
+other — `CrewRunStore` retries a `PermissionError` briefly on both sides.
+
+Crew schedules (`Schedule.crew`) hold a spec validated at creation against the registry and the
+configured models; a firing re-validates it (an inherited agent may be gone), records it, builds
+the host, **subscribes before launch**, and links the history entry (`crew_id`). They take no
+grants — a grant pre-approves one agent's turn; a crew's members each ask — and a schedule is
+never both crew and work. Over HTTP a spec may only name `RELIFE_CREW_LLMS` + `claude-max`
+(the CLI's spec file remains the user's own to choose).
+
 > M15 mastery check: CrewAI orchestrates, ReLife provides the members and the memory;
 > the plan is untrusted and validated (caps, backward-only context, known lineage), with
 > one retry and then a single-agent fallback; a ReLife member is one fresh, scoped
 > ReLife turn per task with context fenced; a CrewAI member gets memory but no
 > machine-touching tools, because `classify()` can't gate CrewAI's loop; Claude reaches
 > CrewAI only through the CLI; CrewAI memory/planning/telemetry stay off; `crew_tools`
-> falls to ask on purpose; handoff happens in `ensure_profiles`.
+> falls to ask on purpose; handoff happens in `ensure_profiles`; under the server a crew is a
+> session (`CrewHost`), its members' asks cross threads through `LoopBroker` to a browser card,
+> and it publishes exactly one `result`.
 
 ---
 
@@ -2682,6 +2736,7 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 | `server/session.py` | `ApprovalBroker` (future + timeout), `AgentSession` (one `ClaudeSDKClient`, ring buffer, subscribers, `busy`, per-turn grants + use cap), `SessionManager` (ceiling, idle reaper). |
 | `server/security.py` | Pure: `token_matches`, `presented_token`, `same_origin`, `is_loopback`, `guard_bind`, `resolve_workspace`, `AttemptLimiter`. |
 | `server/schedules.py` | `Schedule` record (grants, `work`, `worked`), `parse_every`/`parse_at`/`parse_days`/`normalize_spec`/`next_run` (explicit `now`), `normalize_work`, `check_grants_fit`, `ScheduleStore` (atomic JSON, corrupt file preserved). |
+| `server/crews.py` | `CrewHost` (a crew run as a session: `EventStream`, worker thread, `member_event`, cooperative stop), `LoopBroker` (cross-loop approvals), `CrewService` (plan / build_host / launch / start, `AGENT_MAX_CREWS`), `crewai_available`. |
 | `server/scheduler.py` | `Scheduler`: tick loop, `fire`/`_submit` (per-schedule session, skip-when-busy, advance-from-now), `_prepare_work` + `pick_issue` (work schedules), `bind_grants`, `_record` recorder, `scheduled_prompt`. |
 | `server/runs.py` | `summarize_events` (closing summary + denied + acted lists), `RunRecord`, `RunStore` (bounded per-schedule files). |
 | `crew/spec.py` | `AgentSpec`/`TaskSpec`/`CrewSpec`; `normalize_spec` (the plan's validator); `load_spec_file`; `single_agent_spec`. |
@@ -2754,7 +2809,7 @@ extra Host names a tokenless server answers to (DNS-rebinding guard).
 - `AGENT_WORKSPACE_ROOT = ./workspace` — containment root for server-created sessions.
 
 **Scheduler / runs:** `AGENT_SCHEDULER = on` (`RELIFE_AGENT_SCHEDULER=0` disables),
-`AGENT_SCHEDULER_TICK = 30s`, `AGENT_MAX_SCHEDULES = 32`,
+`AGENT_SCHEDULER_TICK = 30s`, `AGENT_MAX_SCHEDULES = 32`, `AGENT_MAX_CREWS = 1` (crews running at once),
 `AGENT_SCHEDULE_MIN_INTERVAL = 300s` (floor on the `every` form),
 `AGENT_SCHEDULE_HISTORY = 10` (inline entries), `AGENT_SCHEDULES_PATH =
 data/schedules.json`, `AGENT_RUNS_DIR = data/runs`, `AGENT_RUN_HISTORY = 50` records

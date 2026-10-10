@@ -70,6 +70,10 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
       shown and confirmed, the builder works in `workspace/crews/<id>/`, the reviewer sees its output,
       `relife crews <id>` shows both outcomes, and each agent's memories and events sit in its own space
       (`relife memory spaces`; `default` untouched); an episode names the task, not the crew role (~$0.50)
+- [ ] from the web console (`relife serve` in the 3.12 venv, scratch `RELIFE_HOME`): plan a small crew in the
+      crews panel, run it, and watch the members' events stream with their names; ask the builder for one
+      outward action (e.g. a POST with curl) and approve its card; `stop` on a second run denies a waiting
+      card; the crew's run record and per-task outcomes match the CLI's (~$0.75)
 
 ## Known limits (documented, not bugs)
 

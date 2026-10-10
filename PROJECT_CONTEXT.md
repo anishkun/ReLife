@@ -21,8 +21,10 @@ measurably better at recurring tasks.
 - **Platform pass (built 2026-10-10, unreleased):** agents with their own memory spaces,
   memory handoff (inherit/fork/promote/packs), ReLife memory over MCP for any LLM, and
   `relife crew` (CrewAI plans a team, ReLife staffs it).
-- **Next:** agents/crews in the server + web UI, schedules that fire crews, ReLife-gated
-  machine tools for non-Claude agents; hosting (Managed Agents) later.
+- **Platform in the server (built 2026-10-10, unreleased):** `/agents` `/spaces` `/crews`
+  routes, crews run under `relife serve` with members' approvals in the browser, crew
+  schedules, Agents + Crews panels in the web console.
+- **Next:** ReLife-gated machine tools for non-Claude agents; hosting (Managed Agents) later.
 
 ## 2. Locked decisions (with rationale)
 
@@ -80,7 +82,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** ~800 passing — 790 on Python 3.14 (the CrewAI module skips), 797 in the 3.12 `.venv`
+**Tests:** ~810 passing — 800 on Python 3.14 (the CrewAI modules skip), 811 in the 3.12 `.venv`
 with `[crewai]` (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP and crew suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
@@ -637,9 +639,50 @@ py -3.12 -m venv .venv
   untouched. Fixed from what it surfaced: CrewAI's "function callbacks cannot be serialized" warning on
   every run (our step callback is necessarily a closure; ReLife never checkpoints — silenced at agent
   construction only), and crew episodes all reading "Task: You are working on a crew as …" (the crew
-  prompt now leads with the task, which is what the episode keeps). **Next:** `/agents` `/crews` routes + UI panels in
-  `relife serve` (crew runs as server sessions, approvals in the browser), schedules that fire crews,
-  ReLife-gated shell/file tools for non-Claude agents.
+  prompt now leads with the task, which is what the episode keeps).
+- **Platform pass 2 — the platform in the server (2026-10-10, branch `feat/platform-server`).**
+  (1) **Routes:** `GET /spaces`; `GET/POST /agents`, `GET/DELETE /agents/{name}`,
+  `POST /agents/{name}/attach|detach|promote` (the `relife agent` operations; registry re-read per
+  request, memory work off the loop; token minting stays CLI-only); `GET/POST /crews` (plan a task —
+  one model call — or record a spec; over HTTP a spec may only name `RELIFE_CREW_LLMS` + `claude-max`),
+  `GET /crews/{id}`, `POST /crews/{id}/run|stop`, `DELETE /crews/{id}` (discard a plan). Same auth +
+  same-origin guard as every route. (2) **Crews hosted like sessions** (`server/crews.py`): a
+  `CrewHost` publishes through the `EventStream` base now shared with `AgentSession`, and is adopted
+  by the `SessionManager` — so `/sessions/{id}/events`, the approval route, the UI's watch and the
+  scheduler's recorder all work on a crew unchanged, and a crew counts against the session ceiling,
+  reaper (never reaped while running) and shutdown. `kickoff()` runs on a daemon thread; events cross
+  back with `run_coroutine_threadsafe`; a member's `can_use_tool` is the ordinary
+  `make_approval_callback` over a `LoopBroker` that hops each ask onto the server loop's broker — so an
+  outward action is an approval card, and unattended it times out to deny. Members' `result`/`error`
+  become `member_done`/`member_error` (one `result` per crew). Stop is cooperative: pending approvals
+  denied at once, no new member task starts. `AGENT_MAX_CREWS` (default 1). `run_crew` split into
+  `prepare_crew` + `execute_crew` for this. (3) **Crew schedules:** a schedule may carry a validated
+  crew spec (`crew`); each firing re-validates it against the live registry (no model call), hosts it
+  and records the run like any other; no grants on a crew schedule, never both crew and work.
+  (4) **UI:** Agents panel (list with memory counts + what each reads, add with inherit/fork/isolated,
+  attach/detach chips, promote, delete) and Crews panel (plan → review → run/discard, watch, stop, run
+  again, per-task outcomes, schedule it); crew events name the member; leaving a crew's stream with
+  "new session" never stops it. Found on the way: `asyncio.to_thread` copies context variables, so
+  `anyio.run` inside the worker believed it was already in the loop ("Already running asyncio in this
+  thread") — the planner now runs via `run_in_executor`, the crew on a plain thread; and a fast second
+  `run` could read the record as still `planned` before the worker saved `running` — the live host is
+  checked first. Tests: 14 new (`tests/test_server_platform.py`, 4 need CrewAI): 811 on the 3.12 venv,
+  800 on 3.14 (full suite 10× in a row clean after the race fix below).
+  **Live check from the browser (2026-10-10, scratch `RELIFE_HOME`, 3.12 venv) — ✅ PASSED** (~$1.15 in all).
+  Planned in the crews panel (valid first try, a ReLife `python-builder` + a `claude-max` `code-reviewer`,
+  $0.25); run: the console switched to the crew's stream, events labelled per member; the builder wrote
+  greet.py + tests (pass) and its `curl -X POST http://127.0.0.1:8612/health` came up as an approval
+  card naming the member — approved, it ran (405, as expected); the reviewer called `memory_context` and
+  reviewed the builder's output; status `done`, $0.65. Memory: the builder's episode in its own space,
+  `default` untouched. Found and fixed: (a) **stop didn't stop a CrewAI member** — it only refused the
+  next *ReLife* turn, so the reviewer still ran and the crew ended `done`; the crew's `task_callback`
+  now raises once stop is set (`build_crew(should_stop=)`), so no task of any kind starts after the
+  one in flight — re-checked live: card denied, builder finished, reviewer never called, record
+  `error: crew stopped by the user` with only the builder's task; (b) the crew card read `planned`
+  (offering *run*) until the worker saved `running` — the live host now overrides the status;
+  (c) the full suite then exposed a **Windows read/replace race**: a route reading `record.json` while
+  the worker `os.replace`s it raises `PermissionError` on one side — `CrewRunStore` retries both
+  briefly. Also: the panel buttons now appear once auth passes, not when the chat stream opens.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

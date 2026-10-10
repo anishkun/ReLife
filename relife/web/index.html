@@ -137,14 +137,29 @@
   .hint { max-width: 860px; margin: 8px auto 0; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
 
   /* Schedules panel — autonomous triggers, managed beside the transcript */
-  aside.schedules { width: min(380px, 100%); border-left: 1px solid var(--line);
+  aside.panel { width: min(380px, 100%); border-left: 1px solid var(--line);
     background: var(--surface); overflow-y: auto; padding: 18px 18px 30px;
     display: flex; flex-direction: column; gap: 16px; }
-  aside.schedules[hidden] { display: none; }
-  @media (max-width: 760px) { aside.schedules { position: fixed; inset: 57px 0 0 0; width: 100%; z-index: 20; } }
-  .schedules h2 { margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
+  aside.panel[hidden] { display: none; }
+  @media (max-width: 760px) { aside.panel { position: fixed; inset: 57px 0 0 0; width: 100%; z-index: 20; } }
+  .panel h2 { margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
     font-family: var(--mono); color: var(--muted); font-weight: 600; }
-  .schedules .note { color: var(--faint); font-size: 12px; margin: 0; }
+  .panel .note { color: var(--faint); font-size: 12px; margin: 0; }
+  .panel .note.warn { color: var(--amber); }
+  .chip { font-family: var(--mono); font-size: 11px; border: 1px solid var(--line); border-radius: 5px;
+    padding: 1px 6px; color: var(--muted); background: transparent; cursor: pointer; }
+  .chip:hover { color: var(--red); border-color: var(--red); }
+  .chips { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+  .plan { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: pre-wrap;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; margin: 2px 0; }
+  .inline { display: flex; gap: 6px; }
+  .inline input { flex: 1; min-width: 0; font: inherit; font-size: 12px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; }
+  .who { font-family: var(--mono); font-size: 11px; color: var(--amber); margin-right: 6px; }
+  #schedList, #agentList, #crewList { display: flex; flex-direction: column; gap: 8px; }
+  .sched .st.done { color: var(--green); }
+  .sched .st.amber { color: var(--amber); }
+  .sched .st.bad { color: var(--red); }
   .sched { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
     background: var(--surface-2); display: flex; flex-direction: column; gap: 4px; }
   .sched.paused { opacity: .6; }
@@ -184,7 +199,7 @@
   .addform fieldset .note { font-size: 11.5px; }
   .addform .check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
   .addform .check input { width: auto; accent-color: var(--accent); }
-  .sched .acts button, .addform button, .schedules .newsession {
+  .sched .acts button, .addform button, .panel .newsession, .inline button {
     font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
     color: var(--muted); background: transparent; border: 1px solid var(--line);
     border-radius: 6px; padding: 4px 9px; cursor: pointer; }
@@ -235,6 +250,8 @@
     <span class="status" id="status" data-state="connecting">
       <span class="dot"></span><span id="statusText">connecting</span>
     </span>
+    <button class="newsession" id="agentsBtn" type="button" aria-pressed="false" title="Agents and the memory they hand down" hidden>agents</button>
+    <button class="newsession" id="crewsBtn" type="button" aria-pressed="false" title="Teams of agents planned for one task" hidden>crews</button>
     <button class="newsession" id="schedulesBtn" type="button" aria-pressed="false" title="Tasks the agent runs on a schedule" hidden>schedules</button>
     <button class="newsession" id="newSession" type="button" title="Close this agent and start a fresh one" hidden>new session</button>
   </header>
@@ -250,7 +267,47 @@
     </div>
   </main>
 
-  <aside class="schedules" id="schedules" hidden>
+  <aside class="panel" id="agentsPanel" hidden>
+    <h2>Agents</h2>
+    <p class="note">Each agent keeps its own memory. It also reads what it inherits
+       (live, read-only) and your memory unless isolated. Promote copies what it
+       learned into yours.</p>
+    <p class="note warn" id="agProblem" hidden></p>
+    <div id="agentList"></div>
+    <form class="addform" id="agentForm" autocomplete="off">
+      <input id="agName" placeholder="name (lowercase, e.g. researcher)" maxlength="48" required />
+      <input id="agDesc" placeholder="what it does (optional)" maxlength="500" />
+      <div class="split">
+        <select id="agRuntime" title="ReLife = Claude with tools · other model = a crew member on another LLM · external = any MCP client">
+          <option value="relife">ReLife agent</option>
+          <option value="llm">other model</option>
+          <option value="external">external (MCP)</option>
+        </select>
+        <input id="agModel" placeholder="model (optional)" />
+      </div>
+      <input id="agInherit" placeholder="inherits from: builder, critic (optional)" />
+      <input id="agFork" placeholder="fork from (a snapshot copy, optional)" />
+      <label class="check"><input id="agIsolated" type="checkbox" /> isolated: doesn't read your memory</label>
+      <div class="err" id="agErr"></div>
+      <button class="primary" type="submit">Add agent</button>
+    </form>
+  </aside>
+
+  <aside class="panel" id="crewsPanel" hidden>
+    <h2>Crews</h2>
+    <p class="note">Describe a task. A planner (one model call) picks a team from your
+       agents; you review it and run it. Members' approvals come to this console;
+       if nobody is watching, they are denied when the timer runs out.</p>
+    <p class="note warn" id="crewHint" hidden></p>
+    <form class="addform" id="crewForm" autocomplete="off">
+      <textarea id="crTask" placeholder="what should the crew do?" required></textarea>
+      <div class="err" id="crErr"></div>
+      <button class="primary" type="submit" id="crPlan">Plan crew</button>
+    </form>
+    <div id="crewList"></div>
+  </aside>
+
+  <aside class="panel schedules" id="schedules" hidden>
     <h2>Schedules</h2>
     <p class="note">Each fires as a turn in its own session. If nobody is watching,
        an action that needs approval is denied when the timer runs out.</p>
@@ -331,6 +388,8 @@
 
   const newSessionBtn = document.getElementById("newSession");
   const schedulesBtn = document.getElementById("schedulesBtn");
+  const agentsBtn = document.getElementById("agentsBtn");
+  const crewsBtn = document.getElementById("crewsBtn");
   const schedulesPanel = document.getElementById("schedules");
   const schedList = document.getElementById("schedList");
   const addForm = document.getElementById("addForm");
@@ -341,6 +400,7 @@
 
   let sessionId = null;
   let source = null;
+  let sessionKind = "chat";   // "crew" when watching a crew run (it takes no messages)
 
   // Which agent this browser is attached to. Without it, every reload created a
   // *new* session — a second ClaudeSDKClient subprocess — and orphaned the old
@@ -378,6 +438,9 @@
     return el;
   }
 
+  // A crew's events carry the member that produced them.
+  const who = (ev) => ev.agent ? `<span class="who">${esc(ev.agent)}</span>` : "";
+
   function handle(ev) {
     if (ev.type !== "text") lastTextRow = null;
     switch (ev.type) {
@@ -392,6 +455,7 @@
         break;
       }
       case "text":
+        if (ev.agent) { lastTextRow = null; row("text", "", `${who(ev)}${esc(ev.text)}`); break; }
         if (lastTextRow) {
           lastTextRow.querySelector(".body").textContent += ev.text;
           if (atBottom()) scroll();
@@ -404,7 +468,7 @@
         break;
       case "tool_use": {
         const brief = ev.brief ? ` <span class="brief">${esc(ev.brief)}</span>` : "";
-        row("tool", "→", `<span class="name">${esc(ev.name)}</span>${brief}`);
+        row("tool", "→", `${who(ev)}<span class="name">${esc(ev.name)}</span>${brief}`);
         break;
       }
       case "tool_result":
@@ -431,6 +495,14 @@
       case "note":
         row("result", "·", esc(ev.text));
         break;
+      case "member_done": {
+        const cost = ev.cost_usd ? ` · $${Number(ev.cost_usd).toFixed(3)}` : "";
+        row("result", "✓", `${who(ev)}task turn finished${esc(cost)}`);
+        break;
+      }
+      case "member_error":
+        row("error", "!", `${who(ev)}${esc(ev.message)}`);
+        break;
     }
   }
 
@@ -444,6 +516,7 @@
     card.innerHTML = `
       <div class="head">
         <span class="label">approval required</span>
+        ${ev.agent ? `<span class="who">${esc(ev.agent)}</span>` : ""}
         <span class="tool">${esc(ev.tool)}</span>
       </div>
       <div class="reason">${esc(ev.reason)}</div>
@@ -492,7 +565,7 @@
       setStatus("open", "connected");
       hint.textContent = `session ${sessionId.slice(0,8)}`;
       newSessionBtn.hidden = false;
-      schedulesBtn.hidden = false;
+      showPanelButtons();
     };
     source.onerror = () => setStatus("connecting", "reconnecting");
     source.onmessage = (e) => {
@@ -547,6 +620,7 @@
       }
       gateToken.value = "";
       gate.hidden = true;
+      showPanelButtons();
       if (!(await reattach())) startSession();
     } catch (err) {
       gateErr.textContent = "could not reach the server";
@@ -561,6 +635,7 @@
       const r = await fetch(`/sessions/${encodeURIComponent(id)}`);
       if (!r.ok) { remembered.clear(); return false; }
       sessionId = id;
+      setKind((await r.json()).kind);
       connect({ replay: true });
       return true;
     } catch (_) {
@@ -580,6 +655,7 @@
       if (!r.ok) throw new Error(await r.text());
       sessionId = (await r.json()).session_id;
       remembered.set(sessionId);
+      setKind("chat");
       connect();
     } catch (e) {
       setStatus("connecting", "no server");
@@ -592,10 +668,12 @@
        session slot from the UI, and what to do when one goes stale. */
     newSessionBtn.disabled = true;
     const old = sessionId;
+    const wasCrew = sessionKind === "crew";
     disconnect();
     sessionId = null;
     remembered.clear();
-    if (old) {
+    // Leaving a crew's stream must not stop the crew: only a chat is closed.
+    if (old && !wasCrew) {
       try {
         await fetch(`/sessions/${encodeURIComponent(old)}`, { method: "DELETE" });
       } catch (_) {}
@@ -606,6 +684,14 @@
     newSessionBtn.disabled = false;
   }
 
+  // The panels don't need the chat session: show them as soon as we're in,
+  // not after the session's stream opens (that waits on a CLI subprocess).
+  function showPanelButtons() {
+    schedulesBtn.hidden = false;
+    agentsBtn.hidden = false;
+    crewsBtn.hidden = false;
+  }
+
   async function init() {
     const status = await authStatus();
     if (status === null) {
@@ -614,6 +700,7 @@
       return;
     }
     if (status.auth_required && !status.authenticated) { showGate(); return; }
+    showPanelButtons();
     if (await reattach()) return;
     startSession();
   }
@@ -634,6 +721,7 @@
         await newSession();
         return;
       }
+      if (r.status === 409) { hint.textContent = "this is a crew run — it follows its plan; use new session to chat"; return; }
       if (!r.ok) { hint.textContent = `not sent: ${await r.text()}`; return; }
       input.value = ""; autosize();
     } finally {
@@ -692,6 +780,7 @@
         <div class="top"><span class="name">${esc(sc.name)}</span><span class="cadence">${esc(sc.spec_text)}</span></div>
         ${sc.task ? `<div class="task">${esc(sc.task)}</div>` : ""}
         ${sc.work_text ? `<div class="grants" title="A work schedule: each run takes one new assigned issue">⑂ ${esc(sc.work_text)}</div>` : ""}
+        ${sc.crew_text ? `<div class="grants" title="A crew schedule: each run starts this crew">⚑ ${esc(sc.crew_text)}</div>` : ""}
         ${(sc.grants_text || []).length ? `<div class="grants" title="Pre-approved: runs may do this without asking">✓ may ${sc.grants_text.map(esc).join(" · ")}</div>` : ""}
         <div class="meta">${sc.enabled ? "next " + esc(rel(sc.next_run_at)) : "paused"} · last: ${last}</div>
         ${outcome}
@@ -788,11 +877,14 @@
   async function watchSession(id) {
     /* Point the console at another live session (a schedule's). */
     if (!id) return;
+    let kind = "chat";
     try {
       const r = await fetch(`/sessions/${encodeURIComponent(id)}`);
-      if (!r.ok) { hint.textContent = "that schedule's session has ended (idle) — run it again to start one"; return; }
+      if (!r.ok) { hint.textContent = "that session has ended (idle)"; return; }
+      kind = (await r.json()).kind;
     } catch (_) { return; }
     if (id === sessionId) return;
+    setKind(kind);
     disconnect();
     sessionId = id;
     remembered.set(id);
@@ -803,12 +895,246 @@
 
   function toggleSchedules(open) {
     const show = open ?? schedulesPanel.hidden;
+    if (show) closePanels("schedules");
     schedulesPanel.hidden = !show;
     schedulesBtn.setAttribute("aria-pressed", String(show));
     if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
     if (show) { loadSchedules(); schedTimer = setInterval(() => loadSchedules(true), 15000); }
   }
   schedulesBtn.addEventListener("click", () => toggleSchedules());
+
+  function setKind(kind) {
+    sessionKind = kind || "chat";
+    input.placeholder = sessionKind === "crew"
+      ? "Watching a crew run — it follows its plan. Use new session to chat."
+      : "Ask the agent to do something… (Enter to send, Shift+Enter for newline)";
+  }
+
+  // The side panels share one slot: opening one closes the others.
+  function closePanels(except) {
+    if (except !== "schedules" && !schedulesPanel.hidden) toggleSchedules(false);
+    if (except !== "agents" && !agentsPanel.hidden) toggleAgents(false);
+    if (except !== "crews" && !crewsPanel.hidden) toggleCrews(false);
+  }
+  const fail = async (r) => { let m = await r.text(); try { m = JSON.parse(m).detail || m; } catch (_) {} return m; };
+  const api = async (method, url, body) => {
+    const r = await fetch(url, body === undefined ? { method }
+      : { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (r.status === 401) { showGate("session expired — enter the token again"); throw new Error("auth"); }
+    return r;
+  };
+  const armed = (btn, label) => {
+    // Two clicks for anything that can't be taken back from here.
+    if (btn.dataset.armed === "1") return true;
+    btn.dataset.armed = "1"; btn.textContent = "sure?";
+    setTimeout(() => { btn.dataset.armed = ""; btn.textContent = label; }, 3000);
+    return false;
+  };
+
+  // --- agents ---------------------------------------------------------------
+  const agentsPanel = document.getElementById("agentsPanel");
+  const agentList = document.getElementById("agentList");
+  const agErr = document.getElementById("agErr");
+  async function loadAgents() {
+    try {
+      const r = await api("GET", "/agents");
+      if (!r.ok) throw new Error(await fail(r));
+      const data = await r.json();
+      const prob = document.getElementById("agProblem");
+      prob.hidden = !data.problem;
+      prob.textContent = data.problem ? `agents.json: ${data.problem}` : "";
+      renderAgents(data.agents);
+    } catch (e) {
+      if (e.message !== "auth") agentList.innerHTML = `<p class="note">could not load agents</p>`;
+    }
+  }
+  function renderAgents(items) {
+    agentList.innerHTML = items.length ? "" : `<p class="note">No agents yet — your own memory is the default.</p>`;
+    for (const a of items) {
+      const el = document.createElement("div");
+      el.className = "sched";
+      const engine = a.runtime === "relife" ? "ReLife" : a.runtime === "llm" ? (a.model || "other model") : "external";
+      const inherits = (a.inherits || []).map(sp => `<button type="button" class="chip" data-detach="${esc(sp)}" title="stop reading ${esc(sp)}">${esc(sp)} ×</button>`).join("");
+      el.innerHTML = `
+        <div class="top"><span class="name">${esc(a.name)}</span><span class="cadence">${esc(engine)}${a.isolated ? " · isolated" : ""}</span></div>
+        ${a.description ? `<div class="task">${esc(a.description)}</div>` : ""}
+        <div class="meta">${a.memories} memor${a.memories === 1 ? "y" : "ies"} in ${esc(a.own_space)}${a.parent ? ` · from ${esc(a.parent)}` : ""}</div>
+        <div class="chips"><span class="meta">reads:</span>${inherits || `<span class="meta">nothing inherited</span>`}</div>
+        <div class="inline"><input placeholder="read another agent's memory…" data-attach /><button type="button" data-act="attach">attach</button></div>
+        <div class="acts">
+          <button type="button" data-act="promote" title="Copy its memories into yours (default)">promote</button>
+          <button type="button" class="danger" data-act="delete" title="Unregister; its memory is archived (reversible)">delete</button>
+        </div>`;
+      el.querySelectorAll("[data-detach]").forEach(b => b.onclick = () => agentAction(a, "detach", b, b.dataset.detach));
+      el.querySelectorAll("button[data-act]").forEach(b => b.onclick = () =>
+        agentAction(a, b.dataset.act, b, el.querySelector("[data-attach]").value.trim()));
+      agentList.appendChild(el);
+    }
+  }
+  async function agentAction(a, act, btn, other) {
+    if (act === "promote" && !armed(btn, "promote")) return;
+    if (act === "delete" && !armed(btn, "delete")) return;
+    if (act === "attach" && !other) return;
+    btn.disabled = true;
+    try {
+      const url = `/agents/${encodeURIComponent(a.name)}`;
+      const r = act === "delete" ? await api("DELETE", url)
+        : await api("POST", `${url}/${act}`, act === "promote" ? {} : { other });
+      if (!r.ok) { hint.textContent = `${act}: ${await fail(r)}`; }
+      else if (act === "promote") {
+        const c = (await r.json()).copied;
+        hint.textContent = `promoted ${c.memories} memor${c.memories === 1 ? "y" : "ies"} from ${a.name} into yours`;
+      }
+    } catch (_) {}
+    await loadAgents();
+  }
+  function toggleAgents(open) {
+    const show = open ?? agentsPanel.hidden;
+    if (show) closePanels("agents");
+    agentsPanel.hidden = !show;
+    agentsBtn.setAttribute("aria-pressed", String(show));
+    if (show) loadAgents();
+  }
+  agentsBtn.addEventListener("click", () => toggleAgents());
+  document.getElementById("agentForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    agErr.textContent = "";
+    const v = (id) => document.getElementById(id).value.trim();
+    const body = {
+      name: v("agName"), description: v("agDesc"), runtime: document.getElementById("agRuntime").value,
+      model: v("agModel"), inherit: v("agInherit").split(/[\s,]+/).filter(Boolean),
+      isolated: document.getElementById("agIsolated").checked,
+    };
+    if (v("agFork")) body.fork = v("agFork");
+    try {
+      const r = await api("POST", "/agents", body);
+      if (!r.ok) { agErr.textContent = await fail(r); return; }
+      e.target.reset();
+      await loadAgents();
+    } catch (err) { if (err.message !== "auth") agErr.textContent = "could not reach the server"; }
+  });
+
+  // --- crews -----------------------------------------------------------------
+  const crewsPanel = document.getElementById("crewsPanel");
+  const crewList = document.getElementById("crewList");
+  const crErr = document.getElementById("crErr");
+  let crewTimer = null;
+  const openCrews = new Set();
+  let crewSig = "";
+  async function loadCrews(background = false) {
+    try {
+      const r = await api("GET", "/crews?limit=15");
+      if (!r.ok) throw new Error(await fail(r));
+      const data = await r.json();
+      const h = document.getElementById("crewHint");
+      h.hidden = !data.hint; h.textContent = data.hint || "";
+      const sig = JSON.stringify(data.crews);
+      if (background && (crewList.matches(":hover") || sig === crewSig)) return;
+      crewSig = sig;
+      renderCrews(data.crews, data.crewai);
+    } catch (e) {
+      if (e.message !== "auth") crewList.innerHTML = `<p class="note">could not load crews</p>`;
+    }
+  }
+  const crewCls = (st) => st === "done" ? "done" : st === "running" || st === "planned" ? "amber" : "bad";
+  function renderCrews(items, crewai) {
+    crewList.innerHTML = items.length ? "" : `<p class="note">No crews yet.</p>`;
+    for (const c of items) {
+      const el = document.createElement("div");
+      el.className = "sched";
+      const live = !!c.session_id;
+      const running = c.status === "running";
+      const acts = [];
+      if (c.status === "planned") {
+        acts.push(`<button type="button" data-act="run" ${crewai ? "" : "disabled title=\"CrewAI isn't installed for this server's Python\""}>run</button>`);
+        acts.push(`<button type="button" class="danger" data-act="discard">discard</button>`);
+      }
+      if (live) acts.push(`<button type="button" data-act="watch">watch</button>`);
+      if (running && live) acts.push(`<button type="button" class="danger" data-act="stop">stop</button>`);
+      if (["done", "error", "cancelled", "interrupted"].includes(c.status)) acts.push(`<button type="button" data-act="again" ${crewai ? "" : "disabled"}>run again</button>`);
+      acts.push(`<button type="button" data-act="details" aria-pressed="false">details</button>`);
+      const tasks = (c.tasks || []).map(t =>
+        `<div class="run"><div class="line"><span class="st ${t.error ? "bad" : "done"}">${esc(t.name)}</span> · ${esc(t.agent)} · ${t.tool_calls} tool${t.tool_calls === 1 ? "" : "s"}${esc(money(t.cost_usd))}${t.denied.length ? ` · <span class="st bad">${t.denied.length} denied</span>` : ""}</div><div class="detail">${esc(t.output || t.error || "")}</div></div>`).join("");
+      el.innerHTML = `
+        <div class="top"><span class="name">${esc(c.task.slice(0, 90))}</span><span class="cadence"><span class="st ${crewCls(c.status)}">${esc(c.status)}</span></span></div>
+        <div class="meta">${esc(c.id)} · ${esc(rel(c.created_at))}${esc(money(c.cost_usd))}</div>
+        ${c.error ? `<div class="meta"><span class="bad">${esc(c.error)}</span></div>` : ""}
+        ${c.final_output ? `<div class="outcome">${esc(c.final_output)}</div>` : ""}
+        <div class="acts">${acts.join("")}</div>
+        <div class="runs" hidden>
+          <div class="plan">${esc((c.plan || []).join("\n"))}</div>
+          ${(c.plan_notes || []).map(n => `<div class="meta">${esc(n)}</div>`).join("")}
+          ${tasks}
+          <div class="inline"><input placeholder="schedule it: 1d, 12h, or 09:00" data-cadence /><button type="button" data-act="schedule">schedule</button></div>
+        </div>`;
+      el.querySelectorAll("button[data-act]").forEach(b => b.onclick = () => crewAction(c, b.dataset.act, b, el));
+      if (openCrews.has(c.id)) crewDetails(c, el, true);
+      crewList.appendChild(el);
+    }
+  }
+  function crewDetails(c, el, open) {
+    const box = el.querySelector(".runs"), btn = el.querySelector("button[data-act=details]");
+    box.hidden = !open; btn.setAttribute("aria-pressed", String(open));
+    if (open) openCrews.add(c.id); else openCrews.delete(c.id);
+  }
+  async function crewAction(c, act, btn, el) {
+    if (act === "details") { crewDetails(c, el, btn.getAttribute("aria-pressed") !== "true"); return; }
+    if (act === "watch") { await watchSession(c.session_id); return; }
+    if (act === "stop" && !armed(btn, "stop")) return;
+    if (act === "discard" && !armed(btn, "discard")) return;
+    btn.disabled = true;
+    try {
+      if (act === "run" || act === "again") {
+        let id = c.id;
+        if (act === "again") {
+          const p = await api("POST", "/crews", { spec: c.spec });
+          if (!p.ok) { hint.textContent = `run again: ${await fail(p)}`; return; }
+          id = (await p.json()).id;
+        }
+        const r = await api("POST", `/crews/${id}/run`);
+        if (!r.ok) { hint.textContent = `crew: ${await fail(r)}`; }
+        else await watchSession((await r.json()).session_id);
+      } else if (act === "stop") {
+        const r = await api("POST", `/crews/${c.id}/stop`);
+        hint.textContent = r.ok ? "stopping — the member turn in flight finishes first" : `stop: ${await fail(r)}`;
+      } else if (act === "discard") {
+        await api("DELETE", `/crews/${c.id}`);
+      } else if (act === "schedule") {
+        const raw = el.querySelector("[data-cadence]").value.trim();
+        if (!raw) { btn.disabled = false; return; }
+        const body = { name: `crew: ${c.task.slice(0, 60)}`, crew: c.spec };
+        if (/^\d{1,2}:\d{2}$/.test(raw)) body.at = raw; else body.every = raw;
+        const r = await api("POST", "/schedules", body);
+        hint.textContent = r.ok ? "scheduled — see the schedules panel" : `schedule: ${await fail(r)}`;
+      }
+    } catch (_) {
+    } finally { btn.disabled = false; }
+    await loadCrews();
+  }
+  function toggleCrews(open) {
+    const show = open ?? crewsPanel.hidden;
+    if (show) closePanels("crews");
+    crewsPanel.hidden = !show;
+    crewsBtn.setAttribute("aria-pressed", String(show));
+    if (crewTimer) { clearInterval(crewTimer); crewTimer = null; }
+    if (show) { loadCrews(); crewTimer = setInterval(() => loadCrews(true), 5000); }
+  }
+  crewsBtn.addEventListener("click", () => toggleCrews());
+  document.getElementById("crewForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    crErr.textContent = "";
+    const btn = document.getElementById("crPlan");
+    btn.disabled = true; btn.textContent = "planning… (one model call)";
+    try {
+      const r = await api("POST", "/crews", { task: document.getElementById("crTask").value });
+      if (!r.ok) { crErr.textContent = await fail(r); return; }
+      const c = await r.json();
+      openCrews.add(c.id);
+      e.target.reset();
+      await loadCrews();
+    } catch (err) { if (err.message !== "auth") crErr.textContent = "could not reach the server"; }
+    finally { btn.disabled = false; btn.textContent = "Plan crew"; }
+  });
   schKind.addEventListener("change", () => {
     const at = schKind.value === "at";
     schDays.hidden = !at;

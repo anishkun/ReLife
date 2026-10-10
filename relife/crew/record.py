@@ -24,6 +24,24 @@ from .. import config
 
 _RUN_ID = re.compile(r"^\d{8}-\d{6}-\d{3}$")
 
+# Under `relife serve` a crew's worker thread rewrites its record while HTTP
+# routes read it. On Windows a file being read can't be replaced (and one
+# being replaced can't be opened), so either side may see a PermissionError
+# for an instant: retry briefly rather than fail a request or lose a save.
+_RETRIES = 20
+_RETRY_DELAY = 0.025
+
+
+def _retrying(fn):
+    for attempt in range(_RETRIES):
+        try:
+            return fn()
+        except PermissionError:
+            if attempt == _RETRIES - 1:
+                raise
+            time.sleep(_RETRY_DELAY)
+    return None  # pragma: no cover
+
 
 @dataclass
 class TaskOutcome:
@@ -87,7 +105,7 @@ class CrewRunStore:
         path = d / "record.json"
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        _retrying(lambda: os.replace(tmp, path))
         return path
 
     def get(self, run_id: str) -> CrewRunRecord | None:
@@ -96,7 +114,7 @@ class CrewRunStore:
         path = self.root / run_id / "record.json"
         if not path.exists():
             return None
-        return CrewRunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return CrewRunRecord.from_dict(json.loads(_retrying(lambda: path.read_text(encoding="utf-8"))))
 
     def list(self, limit: int = 20) -> list[CrewRunRecord]:
         if not self.root.is_dir():

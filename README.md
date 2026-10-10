@@ -167,6 +167,12 @@ keys, if any, are read by CrewAI/LiteLLM from your environment — ReLife never 
 outcome is kept in `data/crews/<id>/record.json` (`relife crews ID`). CrewAI's own memory,
 planning and telemetry are off: ReLife's memory is the memory.
 
+From the web console (`relife serve`, run from the 3.12 venv for crews): the **agents** panel
+lists your agents, what each has learned and whose memory it reads, and adds, attaches, promotes
+or deletes them; the **crews** panel plans a crew, shows the plan, and runs it with the members'
+work streaming into the console — an outward action a member wants is an approval card there,
+denied if nobody answers in time. A crew can be put on a schedule from its card.
+
 ## Layout
 
 ```
