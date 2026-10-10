@@ -14,7 +14,12 @@ Design notes (``MODULE_DEEP_DIVE.md`` §M8 has the full rationale):
   threadpool writers, no SQLite lock contention. Fine for a single-user daemon;
   per-request offloading is a later refinement.
 - **Eager schema init** (not a lifespan) so ``httpx.ASGITransport`` /
-  ``TestClient`` work without startup events.
+  ``TestClient`` work without startup events. The one lifespan the app has runs
+  the MCP session manager behind ``/mcp`` — only that route needs it (tests
+  drive it with ``with TestClient(app)``).
+- **``/mcp``** serves ReLife memory over streamable-HTTP MCP to any agent
+  holding a registered agent's token (``memory/mcp_server.py``), scoped to that
+  agent's memory spaces. The REST routes above stay ReLife's own transport.
 
 ``fastapi`` is an optional (``[daemon]``) dependency; importing this module
 requires it. ``wire`` stays dependency-free and is imported by both sides.
@@ -23,16 +28,23 @@ requires it. ``wire`` stays dependency-free and is imported by both sides.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from starlette.routing import Route
 
 from .. import events as _events
+from .. import mcp_server as _mcp
 from .. import skills as _skills
+from .. import spaces as _spaces
 from .. import store as _store_mod
 from .. import workflows as _workflows
+from ..client import LocalMemoryClient
 from ..service import MemoryService
+from ..spaces import DEFAULT_SPACE
 from . import wire
 
 
@@ -54,7 +66,9 @@ def _bind_db(db_path: Path | str) -> None:
 
 
 def _bind_dirs(
-    skills_dir: Path | str | None, workflows_dir: Path | str | None
+    skills_dir: Path | str | None,
+    workflows_dir: Path | str | None,
+    spaces_dir: Path | str | None = None,
 ) -> None:
     """Point the module-level skills/workflows stores at the daemon's dirs.
 
@@ -70,6 +84,10 @@ def _bind_dirs(
         _skills._SKILLS_DIR = Path(skills_dir)
     if workflows_dir is not None:
         _workflows._WORKFLOWS_DIR = Path(workflows_dir)
+    # Non-default spaces keep their skills/workflows under one root; bound for
+    # the same reason (consolidate writes a space's workflows module-side).
+    if spaces_dir is not None:
+        _spaces._SPACES_DIR = Path(spaces_dir)
 
 
 def create_app(
@@ -78,6 +96,9 @@ def create_app(
     *,
     skills_dir: Path | str | None = None,
     workflows_dir: Path | str | None = None,
+    spaces_dir: Path | str | None = None,
+    agents_path: Path | str | None = None,
+    mcp_hosts: list[str] | None = None,
 ) -> FastAPI:
     """Build the memory daemon app bound to ``db_path``.
 
@@ -86,9 +107,34 @@ def create_app(
     and drive it via ``httpx.ASGITransport`` with no side effects.
     """
     _bind_db(db_path)
-    _bind_dirs(skills_dir, workflows_dir)
+    _bind_dirs(skills_dir, workflows_dir, spaces_dir)
     svc = MemoryService()  # default: follows the _DB_PATH we just bound
-    app = FastAPI(title="ReLife memory daemon", version="1.0.0")
+    mcp_manager = _mcp.http_session_manager(mcp_hosts or _mcp.allowed_hosts_for())
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async with mcp_manager.run():
+            yield
+
+    app = FastAPI(title="ReLife memory daemon", version="1.0.0", lifespan=lifespan)
+    # Any MCP client, as a registered agent (bearer token), scoped to its spaces.
+    app.router.routes.append(
+        Route(
+            "/mcp",
+            endpoint=_mcp.McpHttpEndpoint(
+                mcp_manager,
+                LocalMemoryClient(svc),
+                Path(agents_path) if agents_path is not None else None,
+            ),
+        )
+    )
+
+    @app.exception_handler(ValueError)
+    async def invalid_input(request: Request, exc: ValueError) -> JSONResponse:
+        # Invalid input (an empty memory, a bad space name, a malformed pack)
+        # is the caller's error, not the daemon's: 400, which the client maps
+        # back to the ValueError the in-process path raises.
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     def require_token(authorization: str | None = Header(default=None)) -> None:
         if token is None:
@@ -116,6 +162,8 @@ def create_app(
             kind=body.get("kind", "fact"),
             tags=body.get("tags", ""),
             importance=body.get("importance"),
+            space=body.get("space", DEFAULT_SPACE),
+            source=body.get("source", ""),
         )
         return {"id": mid}
 
@@ -126,21 +174,24 @@ def create_app(
             k=int(body.get("k", 5)),
             reinforce=bool(body.get("reinforce", False)),
             include_archived=bool(body.get("include_archived", False)),
+            spaces=body.get("spaces"),
         )
         return {"memories": wire.memories_to_list(hits)}
 
     @app.post("/forget", dependencies=auth)
     async def forget(body: dict[str, Any]) -> dict[str, Any]:
-        gone = svc.forget(body["query"])
+        gone = svc.forget(body["query"], space=body.get("space", DEFAULT_SPACE))
         return {"memory": wire.memory_or_none_to_dict(gone)}
 
     @app.post("/archive", dependencies=auth)
     async def archive(body: dict[str, Any]) -> dict[str, Any]:
-        return {"archived": svc.archive(int(body["id"]))}
+        return {"archived": svc.archive(int(body["id"]), space=body.get("space"))}
 
     @app.get("/memories", dependencies=auth)
-    async def memories(include_archived: bool = True) -> dict[str, Any]:
-        ms = svc.all_memories(include_archived=include_archived)
+    async def memories(
+        include_archived: bool = True, spaces: list[str] | None = Query(default=None)
+    ) -> dict[str, Any]:
+        ms = svc.all_memories(include_archived=include_archived, spaces=spaces)
         return {"memories": wire.memories_to_list(ms)}
 
     @app.get("/memories/{mem_id}", dependencies=auth)
@@ -148,8 +199,38 @@ def create_app(
         return {"memory": wire.memory_or_none_to_dict(svc.get(mem_id))}
 
     @app.get("/count", dependencies=auth)
-    async def count(include_archived: bool = True) -> dict[str, Any]:
-        return {"count": svc.count(include_archived=include_archived)}
+    async def count(
+        include_archived: bool = True, spaces: list[str] | None = Query(default=None)
+    ) -> dict[str, Any]:
+        return {"count": svc.count(include_archived=include_archived, spaces=spaces)}
+
+    # --- memory spaces --------------------------------------------------------
+    @app.get("/spaces", dependencies=auth)
+    async def spaces() -> dict[str, Any]:
+        return {"spaces": svc.spaces()}
+
+    @app.post("/spaces/copy", dependencies=auth)
+    async def spaces_copy(body: dict[str, Any]) -> dict[str, Any]:
+        ids = body.get("ids")
+        return svc.copy_space(
+            body["src"],
+            body["dst"],
+            ids=None if ids is None else [int(i) for i in ids],
+            source=body.get("source"),
+            procedural=bool(body.get("procedural", True)),
+        )
+
+    @app.post("/spaces/archive", dependencies=auth)
+    async def spaces_archive(body: dict[str, Any]) -> dict[str, Any]:
+        return {"archived": svc.archive_space(body["space"])}
+
+    @app.get("/spaces/{space}/export", dependencies=auth)
+    async def spaces_export(space: str) -> dict[str, Any]:
+        return svc.export_space(space)
+
+    @app.post("/spaces/import", dependencies=auth)
+    async def spaces_import(body: dict[str, Any]) -> dict[str, Any]:
+        return svc.import_pack(body["pack"], body["space"])
 
     @app.post("/consolidate", dependencies=auth)
     async def consolidate() -> dict[str, Any]:
@@ -175,7 +256,10 @@ def create_app(
     async def skill_write(body: dict[str, Any]) -> dict[str, Any]:
         try:
             slug = svc.skill_write(
-                body["name"], body.get("when_to_use", ""), body["steps"]
+                body["name"],
+                body.get("when_to_use", ""),
+                body["steps"],
+                space=body.get("space", DEFAULT_SPACE),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -183,12 +267,12 @@ def create_app(
 
     @app.post("/skills/find", dependencies=auth)
     async def skill_find(body: dict[str, Any]) -> dict[str, Any]:
-        hits = svc.skill_find(body["query"], k=int(body.get("k", 3)))
+        hits = svc.skill_find(body["query"], k=int(body.get("k", 3)), spaces=body.get("spaces"))
         return {"skills": wire.skills_to_list(hits)}
 
     @app.get("/skills/count", dependencies=auth)
-    async def skill_count() -> dict[str, Any]:
-        return {"count": svc.skill_count()}
+    async def skill_count(space: str = DEFAULT_SPACE) -> dict[str, Any]:
+        return {"count": svc.skill_count(space=space)}
 
     # --- procedural memory: workflows ---------------------------------------
     @app.post("/workflows/write", dependencies=auth)
@@ -199,6 +283,7 @@ def create_app(
                 body.get("when_to_use", ""),
                 body["steps"],
                 trigger=body.get("trigger", ""),
+                space=body.get("space", DEFAULT_SPACE),
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -206,18 +291,23 @@ def create_app(
 
     @app.post("/workflows/find", dependencies=auth)
     async def workflow_find(body: dict[str, Any]) -> dict[str, Any]:
-        hits = svc.workflow_find(body["query"], k=int(body.get("k", 3)))
+        hits = svc.workflow_find(
+            body["query"], k=int(body.get("k", 3)), spaces=body.get("spaces")
+        )
         return {"workflows": wire.workflows_to_list(hits)}
 
     @app.get("/workflows/count", dependencies=auth)
-    async def workflow_count() -> dict[str, Any]:
-        return {"count": svc.workflow_count()}
+    async def workflow_count(space: str = DEFAULT_SPACE) -> dict[str, Any]:
+        return {"count": svc.workflow_count(space=space)}
 
     # --- tool-event log -----------------------------------------------------
     @app.post("/events/log", dependencies=auth)
     async def event_log(body: dict[str, Any]) -> dict[str, Any]:
         mid = svc.log_event(
-            body["tool"], body.get("brief", ""), body.get("task_id", "")
+            body["tool"],
+            body.get("brief", ""),
+            body.get("task_id", ""),
+            space=body.get("space", DEFAULT_SPACE),
         )
         return {"id": mid}
 
@@ -248,6 +338,7 @@ def serve(
     *,
     skills_dir: Path | str | None = None,
     workflows_dir: Path | str | None = None,
+    spaces_dir: Path | str | None = None,
 ) -> None:
     """Run the daemon (blocking). Writes a sidecar file so a local in-process
     write can warn, and removes it on shutdown.
@@ -261,7 +352,12 @@ def serve(
 
     db_path = Path(db_path)
     app = create_app(
-        db_path, token=token, skills_dir=skills_dir, workflows_dir=workflows_dir
+        db_path,
+        token=token,
+        skills_dir=skills_dir,
+        workflows_dir=workflows_dir,
+        spaces_dir=spaces_dir,
+        mcp_hosts=_mcp.allowed_hosts_for(host),
     )
     sidecar = _write_sidecar(db_path, f"http://{host}:{port}")
 

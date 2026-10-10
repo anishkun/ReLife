@@ -18,24 +18,29 @@ the consolidation pass can write them mechanically:
     1. ...ordered steps, may reference skills...
 
 Recall is keyword + recency over name + when_to_use + trigger + body, with the
-name weighted — same approach as skills.
+name weighted — same approach as skills. Workflows live per memory space with the
+same layout and shadowing rule as skills (see ``skills.py``).
 """
 
 from __future__ import annotations
 
 import re
+import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .. import config
 from ._text import tokenize as _tokens
+from .spaces import DEFAULT_SPACE, space_dir
 
 _WORKFLOWS_DIR = config.WORKFLOWS_DIR
 _SLUG_OK = re.compile(r"[^a-z0-9]+")
 
 
-def _dir():
-    _WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
-    return _WORKFLOWS_DIR
+def _dir(space: str = DEFAULT_SPACE):
+    d = space_dir("workflows", space, _WORKFLOWS_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _slug(name: str) -> str:
@@ -50,9 +55,10 @@ class Workflow:
     trigger: str
     body: str
     slug: str
+    space: str = DEFAULT_SPACE
 
 
-def _parse(path) -> Workflow:
+def _parse(path, space: str = DEFAULT_SPACE) -> Workflow:
     text = path.read_text(encoding="utf-8")
     name, when, trigger, body = path.stem, "", "", text
     if text.startswith("---"):
@@ -68,15 +74,24 @@ def _parse(path) -> Workflow:
                 when = val
             elif key == "trigger":
                 trigger = val
-    return Workflow(name=name, when_to_use=when, trigger=trigger, body=body, slug=path.stem)
+    return Workflow(
+        name=name, when_to_use=when, trigger=trigger, body=body, slug=path.stem, space=space
+    )
 
 
-def write_workflow(name: str, when_to_use: str, steps: str, trigger: str = "") -> str:
-    """Create or overwrite a workflow. Returns its slug."""
+def write_workflow(
+    name: str,
+    when_to_use: str,
+    steps: str,
+    trigger: str = "",
+    *,
+    space: str = DEFAULT_SPACE,
+) -> str:
+    """Create or overwrite a workflow in ``space``. Returns its slug."""
     if not name.strip() or not steps.strip():
         raise ValueError("workflow needs a name and steps")
     slug = _slug(name)
-    path = _dir() / f"{slug}.md"
+    path = _dir(space) / f"{slug}.md"
     content = (
         f"---\nname: {name.strip()}\n"
         f"when_to_use: {when_to_use.strip()}\n"
@@ -87,30 +102,52 @@ def write_workflow(name: str, when_to_use: str, steps: str, trigger: str = "") -
     return slug
 
 
-def list_workflows() -> list[Workflow]:
-    return [_parse(p) for p in sorted(_dir().glob("*.md"))]
+def list_workflows(space: str = DEFAULT_SPACE) -> list[Workflow]:
+    return [_parse(p, space) for p in sorted(_dir(space).glob("*.md"))]
 
 
-def find_workflows(query: str, k: int = 3) -> list[Workflow]:
-    """Return workflows relevant to ``query`` (keyword overlap, name weighted)."""
+def find_workflows(
+    query: str, k: int = 3, *, spaces: Sequence[str] | None = None
+) -> list[Workflow]:
+    """Return workflows relevant to ``query`` (keyword overlap, name weighted),
+    searching ``spaces`` in order (``None`` = the default space); an earlier
+    space's slug shadows a later one's."""
     q = _tokens(query)
     if not q:
         return []
     scored: list[tuple[int, Workflow]] = []
-    for wf in list_workflows():
-        name_tok = _tokens(wf.name + " " + wf.slug)
-        body_tok = _tokens(wf.when_to_use + " " + wf.trigger + " " + wf.body)
-        score = 2 * len(q & name_tok) + len(q & body_tok)
-        if score:
-            scored.append((score, wf))
+    seen: set[str] = set()
+    for space in spaces if spaces is not None else (DEFAULT_SPACE,):
+        for wf in list_workflows(space):
+            if wf.slug in seen:
+                continue
+            seen.add(wf.slug)
+            name_tok = _tokens(wf.name + " " + wf.slug)
+            body_tok = _tokens(wf.when_to_use + " " + wf.trigger + " " + wf.body)
+            score = 2 * len(q & name_tok) + len(q & body_tok)
+            if score:
+                scored.append((score, wf))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [w for _, w in scored[:k]]
 
 
-def read_workflow(name: str) -> Workflow | None:
-    path = _dir() / f"{_slug(name)}.md"
-    return _parse(path) if path.exists() else None
+def read_workflow(name: str, space: str = DEFAULT_SPACE) -> Workflow | None:
+    path = _dir(space) / f"{_slug(name)}.md"
+    return _parse(path, space) if path.exists() else None
 
 
-def count() -> int:
-    return len(list(_dir().glob("*.md")))
+def count(space: str = DEFAULT_SPACE) -> int:
+    return len(list(_dir(space).glob("*.md")))
+
+
+def copy_space(src: str, dst: str) -> int:
+    """Copy every workflow of ``src`` that ``dst`` lacks into ``dst`` (fork)."""
+    if src == dst:
+        return 0
+    target = _dir(dst)
+    n = 0
+    for p in sorted(_dir(src).glob("*.md")):
+        if not (target / p.name).exists():
+            shutil.copyfile(p, target / p.name)
+            n += 1
+    return n

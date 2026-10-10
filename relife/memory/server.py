@@ -4,281 +4,74 @@ Named ``relife_memory`` so tools surface as ``mcp__relife_memory__*`` — matche
 by the permission policy's trusted ``mcp__relife`` prefix (auto-allowed).
 
 Shipping memory as an MCP server (even in-process) means the agent-facing
-contract is identical when we later split it into a standalone server.
+contract is identical when it is served out of process — and it now is: the
+tool definitions live in ``tools.py`` and the standalone ``mcp_server.py``
+serves the same specs to agents on any LLM.
+
+``memory_server(client)`` binds the tools to one memory client (an agent's
+``ScopedMemoryClient``). The module-level tool objects below serve the main
+agent and resolve ``default_client`` from this module at call time.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from .client import default_client, off_loop
+from . import tools as _tools
+from .client import default_client
 
 
-def _k(args: dict[str, Any], default: int) -> int:
-    """The model-supplied result cap, tolerating junk (``"five"``, ``null``)."""
-    try:
-        return max(1, min(int(args.get("k") or default), 50))
-    except (TypeError, ValueError):
-        return default
+def _sdk_tool(spec: _tools.ToolSpec, get_client: Callable[[], Any]):
+    """Wrap one transport-neutral spec as a Claude Agent SDK tool."""
+
+    @tool(spec.name, spec.description, spec.input_schema)
+    async def _call(args: dict[str, Any]) -> dict[str, Any]:
+        text, is_error = await spec.handler(get_client(), args)
+        out: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+        if is_error:
+            out["is_error"] = True
+        return out
+
+    return _call
 
 
-def _err(what: str, e: Exception) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": f"Error {what}: {e}"}], "is_error": True}
+def _main_client():
+    return default_client()
 
 
-@tool(
-    "memory_save",
-    "Save a durable fact, user preference, or task lesson to long-term memory so "
-    "future sessions can recall it. Use for things worth remembering across tasks "
-    "(preferences, project conventions, where things live) — not transient detail.",
-    {
-        "type": "object",
-        "properties": {
-            "text": {"type": "string", "description": "The thing to remember, self-contained."},
-            "kind": {
-                "type": "string",
-                "enum": ["fact", "preference", "episode", "pattern"],
-                "description": "fact = general truth; preference = how the user likes things; episode = a task outcome; pattern = a recurring regularity.",
-            },
-            "tags": {"type": "string", "description": "Optional comma-separated keywords to aid recall."},
-            "importance": {
-                "type": "number",
-                "description": (
-                    "0..1 salience — higher resists fading (>= 0.8 is effectively "
-                    "pinned and never auto-archived). Guidance: 0.8-1.0 for durable "
-                    "user preferences/conventions and hard constraints that must "
-                    "persist; ~0.6 for project facts worth keeping a while; ~0.4 or "
-                    "lower for transient/episodic context that should fade unless "
-                    "reused. Omit to use a sensible default for the kind."
-                ),
-            },
-        },
-        "required": ["text"],
-    },
-)
-async def memory_save(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        mid = await off_loop(
-            default_client().save,
-            text=args["text"],
-            kind=args.get("kind", "fact"),
-            tags=args.get("tags", ""),
-            importance=args.get("importance"),
-        )
-    except Exception as e:  # noqa: BLE001 - surface to the model
-        return {"content": [{"type": "text", "text": f"Error saving memory: {e}"}], "is_error": True}
-    return {"content": [{"type": "text", "text": f"Saved memory #{mid}."}]}
+memory_save = _sdk_tool(_tools.MEMORY_SAVE, _main_client)
+memory_recall = _sdk_tool(_tools.MEMORY_RECALL, _main_client)
+memory_forget = _sdk_tool(_tools.MEMORY_FORGET, _main_client)
+skill_write = _sdk_tool(_tools.SKILL_WRITE, _main_client)
+skill_find = _sdk_tool(_tools.SKILL_FIND, _main_client)
+workflow_save = _sdk_tool(_tools.WORKFLOW_SAVE, _main_client)
+workflow_find = _sdk_tool(_tools.WORKFLOW_FIND, _main_client)
+memory_consolidate = _sdk_tool(_tools.MEMORY_CONSOLIDATE, _main_client)
+memory_dream = _sdk_tool(_tools.MEMORY_DREAM, _main_client)
+
+_MAIN_TOOLS = [
+    memory_save,
+    memory_recall,
+    memory_forget,
+    skill_write,
+    skill_find,
+    workflow_save,
+    workflow_find,
+    memory_consolidate,
+    memory_dream,
+]
 
 
-@tool(
-    "memory_recall",
-    "Search long-term memory for facts/preferences/lessons relevant to a query. "
-    "Call this when starting a task to see what you already know about the user "
-    "or project.",
-    {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What to look up."},
-            "k": {"type": "integer", "description": "Max results (default 5)."},
-        },
-        "required": ["query"],
-    },
-)
-async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        hits = await off_loop(default_client().recall, args["query"], k=_k(args, 5), reinforce=True)
-    except Exception as e:  # noqa: BLE001 - surface to the model
-        return _err("recalling memory", e)
-    if not hits:
-        return {"content": [{"type": "text", "text": "(no relevant memories)"}]}
-    lines = [f"- [{m.kind}] {m.text}" + (f"  ({m.tags})" if m.tags else "") for m in hits]
-    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+def memory_server(client: Any = None):
+    """Return the McpSdkServerConfig for the memory + skills + workflows server.
 
-
-@tool(
-    "skill_write",
-    "Record a reusable procedure (a 'skill') after you succeed at a task that you "
-    "(or future-you) will likely do again — e.g. 'scaffold a Python CLI', 'push a "
-    "new repo to GitHub here'. Writing skills is how you get faster and more "
-    "reliable over time. Capture the concrete steps that worked. Re-writing an "
-    "existing skill name updates it.",
-    {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "description": "Short skill name, e.g. 'scaffold-python-cli'."},
-            "when_to_use": {"type": "string", "description": "One line: the situation this applies to."},
-            "steps": {"type": "string", "description": "The procedure, as concrete steps (Markdown)."},
-        },
-        "required": ["name", "when_to_use", "steps"],
-    },
-)
-async def skill_write(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        slug = await off_loop(
-            default_client().skill_write, args["name"], args.get("when_to_use", ""), args["steps"]
-        )
-    except Exception as e:  # noqa: BLE001
-        return {"content": [{"type": "text", "text": f"Error writing skill: {e}"}], "is_error": True}
-    return {"content": [{"type": "text", "text": f"Saved skill '{slug}'."}]}
-
-
-@tool(
-    "skill_find",
-    "Search your saved skills for procedures relevant to the current task. Call "
-    "this when starting a task to reuse a proven approach instead of figuring it "
-    "out from scratch.",
-    {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What you're about to do."},
-            "k": {"type": "integer", "description": "Max results (default 3)."},
-        },
-        "required": ["query"],
-    },
-)
-async def skill_find(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        hits = await off_loop(default_client().skill_find, args["query"], k=_k(args, 3))
-    except Exception as e:  # noqa: BLE001
-        return _err("finding skills", e)
-    if not hits:
-        return {"content": [{"type": "text", "text": "(no matching skills yet)"}]}
-    blocks = [f"## {s.name}\nWhen to use: {s.when_to_use}\n\n{s.body}" for s in hits]
-    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(blocks)}]}
-
-
-@tool(
-    "memory_forget",
-    "Soft-forget a memory that is no longer useful (e.g. a finished work item). "
-    "It is archived (kept but excluded from recall), not destroyed. Prefer this "
-    "over leaving stale memories to clutter recall — though unused memories also "
-    "fade on their own over time.",
-    {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Recall query identifying the memory to forget."},
-        },
-        "required": ["query"],
-    },
-)
-async def memory_forget(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        forgotten = await off_loop(default_client().forget, args["query"])
-    except Exception as e:  # noqa: BLE001
-        return _err("forgetting memory", e)
-    if forgotten is None:
-        return {"content": [{"type": "text", "text": "(nothing matched; nothing forgotten)"}]}
-    return {"content": [{"type": "text", "text": f"Archived: {forgotten.text}"}]}
-
-
-@tool(
-    "workflow_save",
-    "Record a reusable multi-step WORKFLOW — an ordered chain of steps (often "
-    "stitching several skills/actions together) for a recurring multi-stage job, "
-    "e.g. 'scaffold → test → create repo → push'. Use this (vs a single skill) "
-    "when the value is in the sequence. Re-saving the same name updates it.",
-    {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "description": "Short workflow name, e.g. 'ship-new-service'."},
-            "when_to_use": {"type": "string", "description": "One line: the multi-step situation this applies to."},
-            "steps": {"type": "string", "description": "Ordered steps (Markdown); may reference skills by name."},
-            "trigger": {"type": "string", "description": "Optional comma-separated keywords/tools that signal this workflow."},
-        },
-        "required": ["name", "when_to_use", "steps"],
-    },
-)
-async def workflow_save(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        slug = await off_loop(
-            default_client().workflow_write,
-            args["name"], args.get("when_to_use", ""), args["steps"], args.get("trigger", "")
-        )
-    except Exception as e:  # noqa: BLE001
-        return {"content": [{"type": "text", "text": f"Error writing workflow: {e}"}], "is_error": True}
-    return {"content": [{"type": "text", "text": f"Saved workflow '{slug}'."}]}
-
-
-@tool(
-    "workflow_find",
-    "Search your saved workflows for a multi-step plan relevant to the current "
-    "job. Call this when a task looks like a recurring multi-stage process.",
-    {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What multi-step job you're about to do."},
-            "k": {"type": "integer", "description": "Max results (default 3)."},
-        },
-        "required": ["query"],
-    },
-)
-async def workflow_find(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        hits = await off_loop(default_client().workflow_find, args["query"], k=_k(args, 3))
-    except Exception as e:  # noqa: BLE001
-        return _err("finding workflows", e)
-    if not hits:
-        return {"content": [{"type": "text", "text": "(no matching workflows yet)"}]}
-    blocks = [
-        f"## {w.name}\nWhen to use: {w.when_to_use}\n\n{w.body}" for w in hits
-    ]
-    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(blocks)}]}
-
-
-@tool(
-    "memory_consolidate",
-    "Run a consolidation ('sleep') pass over memory: fade/archive unused "
-    "memories, merge duplicates, and detect recurring patterns and tool "
-    "sequences (synthesizing workflows from them). This usually runs "
-    "automatically; call it explicitly to reflect and tidy memory now.",
-    {"type": "object", "properties": {}},
-)
-async def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        report = await off_loop(default_client().consolidate)
-    except Exception as e:  # noqa: BLE001
-        return {"content": [{"type": "text", "text": f"Error consolidating: {e}"}], "is_error": True}
-    lines = [f"Consolidation: {report.summary()}."]
-    if report.workflows_created:
-        lines.append("New workflows: " + ", ".join(report.workflows_created))
-    if report.patterns:
-        lines.append("Patterns:\n" + "\n".join(f"- {p}" for p in report.patterns[:10]))
-    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
-
-
-@tool(
-    "memory_dream",
-    "Run an opt-in REM ('dream') pass: the model reviews recent memories as an "
-    "adversarial critic — flagging contradictions, unsafe/hallucinated memories, "
-    "and mis-weighted importance — then archives (reversibly) or reweights them. "
-    "This is more expensive than memory_consolidate (it uses the model), so use "
-    "it sparingly when a deep, qualitative tidy-up of memory is warranted.",
-    {"type": "object", "properties": {}},
-)
-async def memory_dream(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        report = await default_client().dream()
-    except Exception as e:  # noqa: BLE001
-        return {"content": [{"type": "text", "text": f"Error during REM pass: {e}"}], "is_error": True}
-    return {"content": [{"type": "text", "text": f"REM pass: {report.summary()}."}]}
-
-
-def memory_server():
-    """Return the McpSdkServerConfig for the memory + skills + workflows server."""
-    return create_sdk_mcp_server(
-        name="relife_memory",
-        version="0.2.0",
-        tools=[
-            memory_save,
-            memory_recall,
-            memory_forget,
-            skill_write,
-            skill_find,
-            workflow_save,
-            workflow_find,
-            memory_consolidate,
-            memory_dream,
-        ],
-    )
+    ``client`` binds the tools to one memory client (an agent with its own
+    space gets its ``ScopedMemoryClient``); omitted, they serve the main agent.
+    """
+    if client is None:
+        sdk_tools = _MAIN_TOOLS
+    else:
+        sdk_tools = [_sdk_tool(spec, lambda: client) for spec in _tools.INTERNAL_TOOLS]
+    return create_sdk_mcp_server(name="relife_memory", version="0.3.0", tools=sdk_tools)

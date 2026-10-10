@@ -22,6 +22,7 @@ ANN backend is a synced accelerator, never the only copy.
 from __future__ import annotations
 
 from array import array
+from collections.abc import Sequence
 from typing import Protocol
 
 from . import embeddings
@@ -41,8 +42,14 @@ class VectorIndex(Protocol):
     name: str
 
     def search(
-        self, conn, q_vec: list[float], limit: int, include_archived: bool = False
+        self,
+        conn,
+        q_vec: list[float],
+        limit: int,
+        include_archived: bool = False,
+        spaces: Sequence[str] | None = None,
     ) -> list[tuple[int, float]]:
+        """``spaces`` restricts hits to those memory spaces (``None`` = all)."""
         ...
 
     def sync(self, conn) -> None:
@@ -56,11 +63,20 @@ class BruteForceIndex:
     name = "bruteforce"
 
     def search(
-        self, conn, q_vec: list[float], limit: int, include_archived: bool = False
+        self,
+        conn,
+        q_vec: list[float],
+        limit: int,
+        include_archived: bool = False,
+        spaces: Sequence[str] | None = None,
     ) -> list[tuple[int, float]]:
         where = "embedding IS NOT NULL" + ("" if include_archived else " AND status='active'")
+        params: list[str] = []
+        if spaces is not None:
+            params = list(spaces)
+            where += f" AND space IN ({','.join('?' * len(params))})" if params else " AND 0"
         scored: list[tuple[int, float]] = []
-        for r in conn.execute(f"SELECT id, embedding FROM memories WHERE {where}"):
+        for r in conn.execute(f"SELECT id, embedding FROM memories WHERE {where}", params):
             sim = embeddings.cosine(q_vec, _unpack(r["embedding"]))
             scored.append((int(r["id"]), sim))
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -120,21 +136,36 @@ class SqliteVecIndex:
         self._synced_count = n
 
     def search(
-        self, conn, q_vec: list[float], limit: int, include_archived: bool = False
+        self,
+        conn,
+        q_vec: list[float],
+        limit: int,
+        include_archived: bool = False,
+        spaces: Sequence[str] | None = None,
     ) -> list[tuple[int, float]]:
         self._load(conn)
         self.sync(conn)
         q = array("f", q_vec).tobytes()
+        # The vec table holds every space, so when the search is scoped ask for
+        # more neighbours than needed and filter after: a space's memories must
+        # not be crowded out of the top-k by another space's.
+        k = limit if spaces is None else limit * 4
         rows = conn.execute(
-            "SELECT v.rowid AS id, m.embedding AS embedding, m.status AS status "
+            "SELECT v.rowid AS id, m.embedding AS embedding, m.status AS status, "
+            "m.space AS space "
             "FROM memories_vec v JOIN memories m ON m.id = v.rowid "
             "WHERE v.embedding MATCH ? AND k = ? ORDER BY distance",
-            (q, limit),
+            (q, k),
         ).fetchall()
+        allowed = None if spaces is None else set(spaces)
         out: list[tuple[int, float]] = []
         for r in rows:
             if not include_archived and r["status"] != "active":
                 continue
+            if allowed is not None and r["space"] not in allowed:
+                continue
+            if len(out) >= limit:
+                break
             out.append((int(r["id"]), embeddings.cosine(q_vec, _unpack(r["embedding"]))))
         return out
 

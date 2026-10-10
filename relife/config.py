@@ -42,6 +42,8 @@ DATA_DIR = PROJECT_ROOT / "data"          # gitignored: db + logs
 BUILDS_DIR = DATA_DIR / "builds"          # one subdir per orchestrated `relife build`
 SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
 WORKFLOWS_DIR = DATA_DIR / "workflows"    # one Markdown file per learned workflow
+AGENTS_PATH = DATA_DIR / "agents.json"    # agent registry (identity + memory scope per agent)
+CREWS_DIR = DATA_DIR / "crews"            # one subdir per `relife crew` run (plan + outcome)
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
 WEB_DIR = PACKAGE_DIR / "web"              # self-contained web UI served by `relife serve`
@@ -277,13 +279,16 @@ def agent_env() -> dict[str, str]:
 
 
 # --- MCP servers -----------------------------------------------------------
-def default_mcp_servers() -> dict:
+def default_mcp_servers(memory_client=None) -> dict:
     """MCP servers attached to every run.
 
     'browser' = Microsoft's Playwright MCP (navigate/read/click/fill). Launched
     on demand via npx; first run downloads the package and a Chromium build.
     Tools surface to the agent as ``mcp__browser__*`` and are allowed by the
     permission policy (browsing is a core v1 capability).
+
+    ``memory_client`` binds the memory tools to one agent's scoped client (see
+    ``relife/agents.py``); omitted, they serve the main agent.
     """
     # Lazy import: server.py imports the SDK; keep config import-light.
     from .memory.server import memory_server
@@ -294,7 +299,7 @@ def default_mcp_servers() -> dict:
             "command": "npx",
             "args": ["-y", "@playwright/mcp@latest"],
         },
-        "relife_memory": memory_server(),
+        "relife_memory": memory_server(memory_client),
     }
 
 

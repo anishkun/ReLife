@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import config
+from .spaces import DEFAULT_SPACE, validate_space
 
 _DB_PATH = config.DATA_DIR / "relife.db"
 
@@ -30,6 +31,13 @@ class Event:
     tool: str
     brief: str
     created_at: float
+    # The memory space of the agent that made the call, so consolidation learns
+    # each agent's recurring sequences into that agent's own space.
+    space: str = DEFAULT_SPACE
+
+
+def _row_to_event(r) -> Event:
+    return Event(r["id"], r["task_id"], r["tool"], r["brief"], r["created_at"], r["space"])
 
 
 class EventLog:
@@ -60,16 +68,28 @@ class EventLog:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS events_task ON events(task_id, id)"
             )
+            # Memory spaces (store schema v3): idempotent, like every step there.
+            # Rows journaled before spaces existed belong to the default space.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+            if "space" not in cols:
+                conn.execute(
+                    "ALTER TABLE events ADD COLUMN space TEXT NOT NULL "
+                    f"DEFAULT '{DEFAULT_SPACE}'"
+                )
 
-    def log_event(self, tool: str, brief: str = "", task_id: str = "") -> int:
+    def log_event(
+        self, tool: str, brief: str = "", task_id: str = "", *, space: str = DEFAULT_SPACE
+    ) -> int:
         tool = (tool or "").strip()
         if not tool:
             return 0
+        validate_space(space)
         self.init_db()
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO events (task_id, tool, brief, created_at) VALUES (?, ?, ?, ?)",
-                (task_id or "", tool, (brief or "")[:200], time.time()),
+                "INSERT INTO events (task_id, tool, brief, created_at, space) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id or "", tool, (brief or "")[:200], time.time(), space),
             )
             return int(cur.lastrowid)
 
@@ -80,10 +100,7 @@ class EventLog:
                 "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         rows.reverse()  # chronological
-        return [
-            Event(r["id"], r["task_id"], r["tool"], r["brief"], r["created_at"])
-            for r in rows
-        ]
+        return [_row_to_event(r) for r in rows]
 
     def events_by_task(self, limit: int = 500) -> dict[str, list[Event]]:
         """Recent events grouped by task_id, chronological within each task."""
@@ -115,8 +132,10 @@ def init_db() -> None:
     _log().init_db()
 
 
-def log_event(tool: str, brief: str = "", task_id: str = "") -> int:
-    return _log().log_event(tool, brief=brief, task_id=task_id)
+def log_event(
+    tool: str, brief: str = "", task_id: str = "", *, space: str = DEFAULT_SPACE
+) -> int:
+    return _log().log_event(tool, brief=brief, task_id=task_id, space=space)
 
 
 def recent_events(limit: int = 500) -> list[Event]:

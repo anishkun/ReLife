@@ -27,12 +27,14 @@ from __future__ import annotations
 import sqlite3
 import time
 from array import array
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from .. import config
 from . import cognitive, embeddings, vector_index
 from ._text import tokenize as _tokens
+from .spaces import DEFAULT_SPACE, validate_space
 
 # Reassignable module global the default store binds to (tests redirect it).
 _DB_PATH = config.DATA_DIR / "relife.db"
@@ -51,6 +53,10 @@ class Memory:
     last_used_at: float = 0.0
     use_count: int = 0
     status: str = "active"
+    # Which memory space (agent partition) holds it, and who wrote it: "" is the
+    # main ReLife agent, else an agent name or "import:<space>".
+    space: str = DEFAULT_SPACE
+    source: str = ""
 
     def activation(self, now: float | None = None) -> float:
         return cognitive.activation(
@@ -72,7 +78,29 @@ def _row_to_memory(r) -> Memory:
         last_used_at=r["last_used_at"] or r["created_at"],
         use_count=r["use_count"],
         status=r["status"],
+        space=r["space"],
+        source=r["source"],
     )
+
+
+def _space_filter(spaces: Sequence[str] | None, col: str = "space") -> tuple[str, list[str]]:
+    """SQL condition (no leading AND) + params restricting ``col`` to ``spaces``.
+
+    ``None`` means unfiltered (the store is mechanism; scope policy lives in the
+    service). An empty sequence matches nothing — a scope that can read no space
+    must not fall through to "everything".
+    """
+    if spaces is None:
+        return "", []
+    spaces = list(spaces)
+    if not spaces:
+        return "0", []
+    return f"{col} IN ({','.join('?' * len(spaces))})", spaces
+
+
+def _where(*conds: str) -> str:
+    live = [c for c in conds if c]
+    return ("WHERE " + " AND ".join(live)) if live else ""
 
 
 # --- embedding (de)serialization -------------------------------------------
@@ -121,8 +149,9 @@ class MemoryStore:
     # Current on-disk schema version. Tracked via SQLite's built-in
     # ``PRAGMA user_version`` so upgrades apply once, in order, on a long-lived
     # store. v2 = the cognitive columns (importance/last_used_at/use_count/
-    # status/embedding). Add future steps to ``_apply_migrations``.
-    SCHEMA_VERSION = 2
+    # status/embedding); v3 = memory spaces (space/source + index). Add future
+    # steps to ``_apply_migrations``.
+    SCHEMA_VERSION = 3
 
     def init_db(self) -> None:
         """Create or migrate the schema (idempotent). Safe on every access."""
@@ -132,11 +161,12 @@ class MemoryStore:
                 # A fresh DB, or one that predates version tracking (a v1 store,
                 # or an already-v2 store with user_version never set). Create the
                 # table if absent, then idempotently ensure the v2 columns exist
-                # — covers all three cases — and stamp the version.
+                # — covers all three cases — and stamp **2**, not the current
+                # version: the later steps below must still run on a fresh DB.
                 self._create_schema(conn)
                 self._migrate_to_v2(conn)
-                conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
-                version = self.SCHEMA_VERSION
+                conn.execute("PRAGMA user_version = 2")
+                version = 2
             self._apply_migrations(conn, version)
             self._fts_ok = self._init_fts(conn)
 
@@ -185,12 +215,24 @@ class MemoryStore:
     def _apply_migrations(self, conn, from_version: int) -> None:
         """Apply ordered migrations for versions above ``from_version``.
 
-        Empty today (current schema is v2); the structure is here so a future
-        column/table change is a single ordered, once-applied step on existing
-        long-lived stores. Example:
-            if from_version < 3: <alter>; conn.execute("PRAGMA user_version = 3")
+        Each step is idempotent (columns are added only if missing) and stamps
+        its version, so a long-lived store upgrades once, in order.
         """
-        return None
+        if from_version < 3:
+            # v3: memory spaces. Every pre-existing row belongs to the default
+            # space (the main agent's memory) — exactly what it was before.
+            cols = self._columns(conn)
+            if "space" not in cols:
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN space TEXT NOT NULL "
+                    f"DEFAULT '{DEFAULT_SPACE}'"
+                )
+            if "source" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS memories_space ON memories(space, status)"
+            )
+            conn.execute("PRAGMA user_version = 3")
 
     def _init_fts(self, conn) -> bool:
         """Create the FTS5 mirror + sync triggers. False if FTS5 is absent."""
@@ -237,13 +279,19 @@ class MemoryStore:
         kind: str = "fact",
         tags: str = "",
         importance: float | None = None,
+        *,
+        space: str = DEFAULT_SPACE,
+        source: str = "",
     ) -> int:
-        """Persist a memory. Returns its id.
+        """Persist a memory into ``space``. Returns its id.
 
         Saving the same text again does not duplicate it — it **reinforces** the
         existing memory (refreshes recency, bumps use_count, keeps the higher
-        importance), exactly as recalling it would.
+        importance), exactly as recalling it would. Duplicates are judged
+        *within the space*: the same sentence in two agents' spaces is two
+        memories, and one agent's save never strengthens another's.
         """
+        validate_space(space)
         text = (text or "").strip()
         if not text:
             raise ValueError("memory text is empty")
@@ -257,7 +305,8 @@ class MemoryStore:
         now = time.time()
         with self._connect() as conn:
             existing = conn.execute(
-                "SELECT id, importance, use_count FROM memories WHERE text = ?", (text,)
+                "SELECT id, importance, use_count FROM memories WHERE text = ? AND space = ?",
+                (text, space),
             ).fetchone()
             if existing:
                 conn.execute(
@@ -276,7 +325,7 @@ class MemoryStore:
             # already exists, strengthen it instead of inserting a clone. Only
             # active when embeddings are available; otherwise exact-match only.
             if emb_vec is not None:
-                dup = self._semantic_duplicate(conn, emb_vec, config.SAVE_DEDUP_SIM)
+                dup = self._semantic_duplicate(conn, emb_vec, config.SAVE_DEDUP_SIM, space)
                 if dup is not None:
                     conn.execute(
                         "UPDATE memories SET last_used_at = ?, "
@@ -287,23 +336,23 @@ class MemoryStore:
                     return int(dup[0])
             cur = conn.execute(
                 "INSERT INTO memories (kind, text, tags, importance, created_at, "
-                "last_used_at, use_count, status, embedding) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?)",
-                (kind, text, tags or "", imp, now, now, _pack(emb_vec)),
+                "last_used_at, use_count, status, embedding, space, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?)",
+                (kind, text, tags or "", imp, now, now, _pack(emb_vec), space, source or ""),
             )
             return int(cur.lastrowid)
 
     def _semantic_duplicate(
-        self, conn, vec: list[float], threshold: float
+        self, conn, vec: list[float], threshold: float, space: str = DEFAULT_SPACE
     ) -> tuple[int, float] | None:
-        """Best active memory whose embedding cosine to ``vec`` is >= threshold.
+        """Best active memory in ``space`` whose embedding cosine to ``vec`` is >= threshold.
 
         Returns ``(id, importance)`` or ``None``. Goes through the vector index
         (brute force by default, ANN when available); only reached when
         embeddings are on, so the test path never runs it.
         """
         idx = vector_index.get_index(len(vec))
-        for mid, sim in idx.search(conn, vec, 1):
+        for mid, sim in idx.search(conn, vec, 1, spaces=(space,)):
             if sim >= threshold:
                 r = conn.execute(
                     "SELECT importance FROM memories WHERE id = ?", (mid,)
@@ -347,29 +396,38 @@ class MemoryStore:
             )
 
     # --- read ---------------------------------------------------------------
-    def _candidates(self, conn, q_terms: set[str], q_vec, include_archived: bool):
+    def _candidates(
+        self,
+        conn,
+        q_terms: set[str],
+        q_vec,
+        include_archived: bool,
+        spaces: Sequence[str] | None = None,
+    ):
         """Stage 1: a bounded candidate set from FTS5 keyword + semantic scan."""
-        status_clause = "" if include_archived else "WHERE m.status = 'active'"
+        active = "" if include_archived else "m.status = 'active'"
+        in_space, space_params = _space_filter(spaces, "m.space")
         rows: dict[int, sqlite3.Row] = {}
 
         # Keyword candidates (indexed, scales to large stores).
         if q_terms and self._fts_ok:
             match = " OR ".join(sorted(q_terms))
-            active_only = "" if include_archived else "AND m.status = 'active'"
             sql = (
                 "SELECT m.* FROM memories_fts f JOIN memories m ON m.id = f.rowid "
-                f"WHERE memories_fts MATCH ? {active_only} "
+                f"{_where('memories_fts MATCH ?', active, in_space)} "
                 "ORDER BY bm25(memories_fts) LIMIT ?"
             )
             try:
-                for r in conn.execute(sql, (match, config.CANDIDATE_TOPN)):
+                for r in conn.execute(sql, (match, *space_params, config.CANDIDATE_TOPN)):
                     rows[r["id"]] = r
             except sqlite3.OperationalError:
                 pass  # malformed MATCH — fall through to scan below
 
         # Fallback keyword scan when FTS5 is unavailable (or returned nothing).
         if q_terms and not self._fts_ok:
-            for r in conn.execute(f"SELECT m.* FROM memories m {status_clause}"):
+            for r in conn.execute(
+                f"SELECT m.* FROM memories m {_where(active, in_space)}", space_params
+            ):
                 if _tokens(r["text"] + " " + r["tags"]) & q_terms:
                     rows[r["id"]] = r
 
@@ -377,7 +435,9 @@ class MemoryStore:
         # default; an ANN backend swaps in transparently for large stores).
         if q_vec is not None:
             idx = vector_index.get_index(len(q_vec))
-            hits = idx.search(conn, q_vec, config.CANDIDATE_TOPN, include_archived)
+            hits = idx.search(
+                conn, q_vec, config.CANDIDATE_TOPN, include_archived, spaces=spaces
+            )
             new_ids = [
                 mid
                 for mid, sim in hits
@@ -393,28 +453,41 @@ class MemoryStore:
 
         return list(rows.values())
 
-    def _doc_freq(self, conn, terms: set[str], include_archived: bool) -> tuple[int, dict[str, int]]:
+    def _doc_freq(
+        self,
+        conn,
+        terms: set[str],
+        include_archived: bool,
+        spaces: Sequence[str] | None = None,
+    ) -> tuple[int, dict[str, int]]:
         """How many memories contain each query term (and how many there are).
 
-        One indexed COUNT per term with FTS5 — query terms are few — or a scan
-        on builds without it (recall already scans there anyway).
+        Counted over the spaces being searched — "common" means common in what
+        this agent can see. One indexed COUNT per term with FTS5 — query terms
+        are few — or a scan on builds without it (recall already scans there).
         """
-        status = "" if include_archived else "WHERE status = 'active'"
-        n = conn.execute(f"SELECT COUNT(*) FROM memories {status}").fetchone()[0]
+        status = "" if include_archived else "status = 'active'"
+        in_space, space_params = _space_filter(spaces)
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM memories {_where(status, in_space)}", space_params
+        ).fetchone()[0]
         df: dict[str, int] = {}
         if self._fts_ok:
-            active_only = "" if include_archived else "AND m.status = 'active'"
+            active = "" if include_archived else "m.status = 'active'"
+            m_space, _ = _space_filter(spaces, "m.space")
             sql = (
                 "SELECT COUNT(*) FROM memories_fts f JOIN memories m ON m.id = f.rowid "
-                f"WHERE memories_fts MATCH ? {active_only}"
+                f"{_where('memories_fts MATCH ?', active, m_space)}"
             )
             for t in terms:
                 try:
-                    df[t] = conn.execute(sql, (f'"{t}"',)).fetchone()[0]
+                    df[t] = conn.execute(sql, (f'"{t}"', *space_params)).fetchone()[0]
                 except sqlite3.OperationalError:
                     df[t] = 0
         else:
-            for r in conn.execute(f"SELECT text, tags FROM memories {status}"):
+            for r in conn.execute(
+                f"SELECT text, tags FROM memories {_where(status, in_space)}", space_params
+            ):
                 for t in _tokens(r["text"] + " " + r["tags"]) & terms:
                     df[t] = df.get(t, 0) + 1
         return n, df
@@ -426,6 +499,7 @@ class MemoryStore:
         *,
         reinforce: bool = False,
         include_archived: bool = False,
+        spaces: Sequence[str] | None = None,
     ) -> list[Memory]:
         """Return up to ``k`` memories most relevant to ``query``.
 
@@ -433,7 +507,9 @@ class MemoryStore:
         activation, and importance (see ``cognitive.fused_score``). A row
         qualifies only if it has keyword overlap or strong semantic similarity,
         so an unrelated query surfaces nothing. Pass ``reinforce=True`` to
-        strengthen what was surfaced (recall is itself a use).
+        strengthen what was surfaced (recall is itself a use). ``spaces``
+        restricts the search to those memory spaces (``None`` = every space;
+        callers acting for an agent always pass its scope).
         """
         self.init_db()
         q_terms = _tokens(query)
@@ -443,8 +519,10 @@ class MemoryStore:
         now = time.time()
         scored: list[tuple[float, Memory]] = []
         with self._connect() as conn:
-            cands = self._candidates(conn, q_terms, q_vec, include_archived)
-            n_rows, df = self._doc_freq(conn, q_terms, include_archived) if cands else (0, {})
+            cands = self._candidates(conn, q_terms, q_vec, include_archived, spaces)
+            n_rows, df = (
+                self._doc_freq(conn, q_terms, include_archived, spaces) if cands else (0, {})
+            )
             # A term in a large share of the store ("write", "test" — words
             # that also name tools in episode/pattern text) is weak evidence.
             common_at = max(config.RECALL_COMMON_MIN_DOCS, config.RECALL_COMMON_TERM_FRACTION * n_rows)
@@ -486,12 +564,17 @@ class MemoryStore:
                 self.reinforce(m.id, now)
         return top
 
-    def all_memories(self, include_archived: bool = True) -> list[Memory]:
-        """Every memory (for the consolidation sweep)."""
+    def all_memories(
+        self, include_archived: bool = True, spaces: Sequence[str] | None = None
+    ) -> list[Memory]:
+        """Every memory (for the consolidation sweep), optionally in ``spaces``."""
         self.init_db()
-        clause = "" if include_archived else "WHERE status = 'active'"
+        status = "" if include_archived else "status = 'active'"
+        in_space, params = _space_filter(spaces)
         with self._connect() as conn:
-            rows = conn.execute(f"SELECT * FROM memories {clause}").fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM memories {_where(status, in_space)}", params
+            ).fetchall()
         return [_row_to_memory(r) for r in rows]
 
     def get(self, mem_id: int) -> Memory | None:
@@ -502,15 +585,105 @@ class MemoryStore:
             ).fetchone()
         return _row_to_memory(r) if r else None
 
-    def count(self, include_archived: bool = True) -> int:
+    def count(
+        self, include_archived: bool = True, spaces: Sequence[str] | None = None
+    ) -> int:
         self.init_db()
-        clause = "" if include_archived else "WHERE status = 'active'"
+        status = "" if include_archived else "status = 'active'"
+        in_space, params = _space_filter(spaces)
         with self._connect() as conn:
             return int(
                 conn.execute(
-                    f"SELECT COUNT(*) AS n FROM memories {clause}"
+                    f"SELECT COUNT(*) AS n FROM memories {_where(status, in_space)}", params
                 ).fetchone()["n"]
             )
+
+    # --- spaces -------------------------------------------------------------
+    def space_counts(self, include_archived: bool = False) -> dict[str, int]:
+        """``{space: number of memories}`` for every space that holds any."""
+        self.init_db()
+        status = "" if include_archived else "WHERE status = 'active'"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT space, COUNT(*) AS n FROM memories {status} GROUP BY space ORDER BY space"
+            ).fetchall()
+        return {r["space"]: int(r["n"]) for r in rows}
+
+    def copy_space(
+        self,
+        src: str,
+        dst: str,
+        *,
+        ids: Sequence[int] | None = None,
+        source: str | None = None,
+    ) -> int:
+        """Copy ``src``'s active memories (or just ``ids`` of them) into ``dst``.
+
+        The fork/promote primitive. Each copy keeps its strength (importance,
+        use count, recency, embedding) — an inherited lesson is as established
+        as it was — and its provenance (``source`` overrides it when given).
+        A text ``dst`` already holds is reinforced instead of cloned, the same
+        rule ``save`` applies, so promoting twice never duplicates. Returns the
+        number of memories copied or reinforced.
+        """
+        validate_space(src)
+        validate_space(dst)
+        if src == dst:
+            return 0
+        self.init_db()
+        now = time.time()
+        params: list[object] = [src]
+        only = ""
+        if ids is not None:
+            ids = [int(i) for i in ids]
+            if not ids:
+                return 0
+            only = f" AND id IN ({','.join('?' * len(ids))})"
+            params += ids
+        n = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE space = ? AND status = 'active'{only} ORDER BY id",
+                params,
+            ).fetchall()
+            held = {
+                r["text"]: (r["id"], r["importance"])
+                for r in conn.execute("SELECT id, text, importance FROM memories WHERE space = ?", (dst,))
+            }
+            for r in rows:
+                if r["text"] in held:
+                    mid, imp = held[r["text"]]
+                    conn.execute(
+                        "UPDATE memories SET use_count = use_count + 1, last_used_at = ?, "
+                        "importance = ?, status = 'active' WHERE id = ?",
+                        (now, max(imp, r["importance"]), mid),
+                    )
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO memories (kind, text, tags, importance, created_at, "
+                        "last_used_at, use_count, status, embedding, space, source) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                        (
+                            r["kind"], r["text"], r["tags"], r["importance"], r["created_at"],
+                            r["last_used_at"], r["use_count"], r["embedding"], dst,
+                            r["source"] if source is None else source,
+                        ),
+                    )
+                    held[r["text"]] = (int(cur.lastrowid), r["importance"])
+                n += 1
+        return n
+
+    def archive_space(self, space: str) -> int:
+        """Archive every active memory in ``space`` (reversible, like forget).
+        Consolidation's slow hard-delete tier reclaims them later."""
+        validate_space(space)
+        self.init_db()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE memories SET status = 'archived' WHERE space = ? AND status = 'active'",
+                (space,),
+            )
+            return int(cur.rowcount)
 
 
 # --- default-instance plumbing + back-compat module API --------------------
@@ -532,9 +705,17 @@ def init_db() -> None:
 
 
 def save(
-    text: str, kind: str = "fact", tags: str = "", importance: float | None = None
+    text: str,
+    kind: str = "fact",
+    tags: str = "",
+    importance: float | None = None,
+    *,
+    space: str = DEFAULT_SPACE,
+    source: str = "",
 ) -> int:
-    return _store().save(text, kind=kind, tags=tags, importance=importance)
+    return _store().save(
+        text, kind=kind, tags=tags, importance=importance, space=space, source=source
+    )
 
 
 def reinforce(mem_id: int, now: float | None = None) -> None:
@@ -563,19 +744,26 @@ def recall(
     *,
     reinforce: bool = False,
     include_archived: bool = False,
+    spaces: Sequence[str] | None = None,
 ) -> list[Memory]:
     return _store().recall(
-        query, k=k, reinforce=reinforce, include_archived=include_archived
+        query, k=k, reinforce=reinforce, include_archived=include_archived, spaces=spaces
     )
 
 
-def all_memories(include_archived: bool = True) -> list[Memory]:
-    return _store().all_memories(include_archived=include_archived)
+def all_memories(
+    include_archived: bool = True, spaces: Sequence[str] | None = None
+) -> list[Memory]:
+    return _store().all_memories(include_archived=include_archived, spaces=spaces)
 
 
 def get(mem_id: int) -> Memory | None:
     return _store().get(mem_id)
 
 
-def count(include_archived: bool = True) -> int:
-    return _store().count(include_archived=include_archived)
+def count(include_archived: bool = True, spaces: Sequence[str] | None = None) -> int:
+    return _store().count(include_archived=include_archived, spaces=spaces)
+
+
+def space_counts(include_archived: bool = False) -> dict[str, int]:
+    return _store().space_counts(include_archived=include_archived)

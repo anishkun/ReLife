@@ -21,6 +21,7 @@ from ..consolidate import ConsolidationReport
 from ..events import Event
 from ..rem import RemReport
 from ..skills import Skill
+from ..spaces import DEFAULT_SPACE
 from ..store import Memory
 from ..workflows import Workflow
 
@@ -36,14 +37,21 @@ _MEMORY_FIELDS = (
     "use_count",
     "status",
 )
+# Added with memory spaces. Read with a default so a payload from a peer that
+# predates spaces still decodes (as the default space) instead of KeyError-ing.
+_MEMORY_SPACE_FIELDS = {"space": DEFAULT_SPACE, "source": ""}
 
 
 def memory_to_dict(m: Memory) -> dict[str, Any]:
-    return {f: getattr(m, f) for f in _MEMORY_FIELDS}
+    d = {f: getattr(m, f) for f in _MEMORY_FIELDS}
+    d.update({f: getattr(m, f) for f in _MEMORY_SPACE_FIELDS})
+    return d
 
 
 def memory_from_dict(d: dict[str, Any]) -> Memory:
-    return Memory(**{f: d[f] for f in _MEMORY_FIELDS})
+    kw = {f: d[f] for f in _MEMORY_FIELDS}
+    kw.update({f: d.get(f, default) for f, default in _MEMORY_SPACE_FIELDS.items()})
+    return Memory(**kw)
 
 
 def memory_or_none_to_dict(m: Memory | None) -> dict[str, Any] | None:
@@ -70,11 +78,11 @@ _WORKFLOW_FIELDS = ("name", "when_to_use", "trigger", "body", "slug")
 
 
 def skill_to_dict(s: Skill) -> dict[str, Any]:
-    return {f: getattr(s, f) for f in _SKILL_FIELDS}
+    return {**{f: getattr(s, f) for f in _SKILL_FIELDS}, "space": s.space}
 
 
 def skill_from_dict(d: dict[str, Any]) -> Skill:
-    return Skill(**{f: d[f] for f in _SKILL_FIELDS})
+    return Skill(**{f: d[f] for f in _SKILL_FIELDS}, space=d.get("space", DEFAULT_SPACE))
 
 
 def skills_to_list(ss: list[Skill]) -> list[dict[str, Any]]:
@@ -86,11 +94,11 @@ def skills_from_list(items: list[dict[str, Any]]) -> list[Skill]:
 
 
 def workflow_to_dict(w: Workflow) -> dict[str, Any]:
-    return {f: getattr(w, f) for f in _WORKFLOW_FIELDS}
+    return {**{f: getattr(w, f) for f in _WORKFLOW_FIELDS}, "space": w.space}
 
 
 def workflow_from_dict(d: dict[str, Any]) -> Workflow:
-    return Workflow(**{f: d[f] for f in _WORKFLOW_FIELDS})
+    return Workflow(**{f: d[f] for f in _WORKFLOW_FIELDS}, space=d.get("space", DEFAULT_SPACE))
 
 
 def workflows_to_list(ws: list[Workflow]) -> list[dict[str, Any]]:
@@ -106,11 +114,11 @@ _EVENT_FIELDS = ("id", "task_id", "tool", "brief", "created_at")
 
 
 def event_to_dict(e: Event) -> dict[str, Any]:
-    return {f: getattr(e, f) for f in _EVENT_FIELDS}
+    return {**{f: getattr(e, f) for f in _EVENT_FIELDS}, "space": e.space}
 
 
 def event_from_dict(d: dict[str, Any]) -> Event:
-    return Event(**{f: d[f] for f in _EVENT_FIELDS})
+    return Event(**{f: d[f] for f in _EVENT_FIELDS}, space=d.get("space", DEFAULT_SPACE))
 
 
 def events_to_list(es: list[Event]) -> list[dict[str, Any]]:

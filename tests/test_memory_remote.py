@@ -19,9 +19,10 @@ from relife import config
 from relife.memory import consolidate as consol
 from relife.memory import events as ev
 from relife.memory import skills as sk
+from relife.memory import spaces as sp
 from relife.memory import store as store_mod
 from relife.memory import workflows as wf
-from relife.memory.client import LocalMemoryClient
+from relife.memory.client import LocalMemoryClient, ScopedMemoryClient
 from relife.memory.remote import wire
 from relife.memory.events import Event
 from relife.memory.skills import Skill
@@ -113,8 +114,10 @@ def client(request, tmp_path, monkeypatch):
     # workflows the client never sees (the split this phase closes).
     skills_dir = tmp_path / "skills"
     workflows_dir = tmp_path / "workflows"
+    spaces_dir = tmp_path / "spaces"
     monkeypatch.setattr(sk, "_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(wf, "_WORKFLOWS_DIR", workflows_dir)
+    monkeypatch.setattr(sp, "_SPACES_DIR", spaces_dir)
 
     if request.param == "local":
         yield LocalMemoryClient()
@@ -127,10 +130,12 @@ def client(request, tmp_path, monkeypatch):
     from relife.memory.remote.daemon import create_app
     from relife.memory.remote.http_client import HttpMemoryClient
 
-    app = create_app(  # binds the same _DB_PATH + skills/workflows dirs
+    app = create_app(  # binds the same _DB_PATH + skills/workflows/spaces dirs
         tmp_path / "relife.db",
         skills_dir=skills_dir,
         workflows_dir=workflows_dir,
+        spaces_dir=spaces_dir,
+        agents_path=tmp_path / "agents.json",
     )
     tc = TestClient(app)  # httpx.Client subclass; drives the ASGI app in-process
     yield HttpMemoryClient("http://testserver", client=tc)
@@ -304,3 +309,60 @@ def test_daemon_health_and_token(tmp_path, monkeypatch):
     health = tc.get("/health").json()
     assert health["skills"] == 0 and health["workflows"] == 0 and health["events"] == 0
     tc.close()
+
+
+# --- memory spaces: identical over both transports ---------------------------------
+def test_conformance_spaces_save_recall(client):
+    a = client.save("the build cache lives in .cache/build", space="alpha", source="alpha")
+    client.save("the build cache lives in .cache/build")  # same text, default space
+    assert client.recall("build cache lives") and all(
+        m.space == "default" for m in client.recall("build cache lives")
+    )
+    [m] = client.recall("build cache lives", spaces=["alpha"])
+    assert (m.id, m.space, m.source) == (a, "alpha", "alpha")
+    assert client.count(spaces=["alpha"]) == 1
+    assert {m.space for m in client.all_memories(spaces=["alpha", "default"])} == {"alpha", "default"}
+    assert client.forget("build cache", space="beta") is None
+    assert client.archive(a, space="default") is False
+    assert client.archive(a, space="alpha") is True
+
+
+def test_conformance_space_admin(client):
+    client.save("flaky tests get one retry", space="alpha")
+    client.skill_write("retry-flaky", "flaky tests", "1. retry once", space="alpha")
+    client.workflow_write("triage", "triage a failure", "1. read log", space="alpha")
+    assert client.skill_find("retry flaky tests") == []  # default space only
+    assert client.skill_find("retry flaky tests", spaces=["alpha"])[0].space == "alpha"
+    assert client.skill_count(space="alpha") == 1 and client.workflow_count(space="alpha") == 1
+
+    assert client.copy_space("alpha", "beta") == {"memories": 1, "skills": 1, "workflows": 1}
+    listing = client.spaces()
+    assert listing["beta"] == {"memories": 1, "skills": 1, "workflows": 1}
+
+    pack = client.export_space("alpha")
+    assert client.import_pack(pack, "gamma") == {"memories": 1, "skills": 1, "workflows": 1}
+    [m] = client.all_memories(spaces=["gamma"])
+    assert m.source == "import:alpha"
+    assert client.archive_space("gamma") == 1
+
+
+def test_conformance_space_validation(client):
+    with pytest.raises(ValueError):
+        client.save("x", space="../escape")
+    with pytest.raises(ValueError):
+        client.skill_write("n", "w", "s", space="Nope")
+    with pytest.raises(ValueError):
+        client.import_pack({"format": "nope"}, "gamma")
+
+
+def test_conformance_scoped_client(client):
+    """The scope wrapper works the same over the wire: events, skills, recall."""
+    scope = sp.MemoryScope(read=("alpha", "default"), write="alpha", source="alpha")
+    a = ScopedMemoryClient(client, scope)
+    a.save("alpha deploys on fridays only")
+    a.log_event("Bash", "pytest", task_id="sess-1")
+    client.log_event("Bash", "ls", task_id="sess-1")  # same task id, main agent
+    assert [e.tool for e in a.events_for_task("sess-1")] == ["Bash"]
+    assert [e.space for e in a.events_for_task("sess-1")] == ["alpha"]
+    assert a.recall("deploys fridays")[0].space == "alpha"
+    assert client.recall("deploys fridays") == []
