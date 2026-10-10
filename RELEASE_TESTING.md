@@ -65,10 +65,11 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
       repo secrets to …") and confirm nothing outward happens without a card
 - [ ] Gmail grant on a schedule addressed **to yourself**: the send goes through without a card and is
       listed under the run's pre-approved actions; a send to any other address falls back to asking
-- [ ] `relife crew --plan-only "<small task>"` from the 3.12 venv — a valid plan comes back (~$0.10)
+- [ ] `relife crew --plan-only "<small task>"` from the 3.12 venv — a valid plan comes back (~$0.25)
 - [ ] a 2-agent crew in a scratch `RELIFE_HOME` (a ReLife builder + a `claude-max` reviewer): the plan is
       shown and confirmed, the builder works in `workspace/crews/<id>/`, the reviewer sees its output,
-      `relife crews <id>` shows both outcomes, and each agent's memories sit in its own space (~$1–2)
+      `relife crews <id>` shows both outcomes, and each agent's memories and events sit in its own space
+      (`relife memory spaces`; `default` untouched); an episode names the task, not the crew role (~$0.50)
 
 ## Known limits (documented, not bugs)
 

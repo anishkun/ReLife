@@ -190,14 +190,21 @@ class ReLifeAgent(BaseAgentAdapter):
 
     # --- prompt ------------------------------------------------------------------------
     def task_prompt(self, task: Any, context: str | None) -> str:
-        """The turn's prompt: who the agent is on this crew, the task, and the
-        earlier tasks' outputs it was given — fenced as data."""
+        """The turn's prompt: the task, who the agent is on this crew, and the
+        earlier tasks' outputs it was given — fenced as data.
+
+        The task comes first on purpose: the Stop hook's episode keeps the
+        prompt's first line as the task's intent, and a role line there made
+        every crew episode of an agent identical (noise for the pattern miner).
+        """
         lines = [
+            _task_text(task),
+            "",
+            "## Your role on this crew",
             f"You are working on a crew as **{self.role}**. Your goal: {self.goal}",
         ]
         if self.backstory:
             lines.append(self.backstory)
-        lines += ["", "## Your task", _task_text(task)]
         if context:
             lines += [
                 "",

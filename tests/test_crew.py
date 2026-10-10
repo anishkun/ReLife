@@ -129,6 +129,11 @@ def test_relife_agent_implements_the_adapter_contract(env, tmp_path):
     p = a.task_prompt(t, "previous output text")
     assert "**Engineer**" in p and "Add a flag." in p
     assert "<<<CONTEXT\nprevious output text\nCONTEXT>>>" in p
+    # The episode the Stop hook saves names the task, not the crew role (a live
+    # smoke caught every crew episode reading "You are working on a crew as …").
+    from relife.hooks import _episode_text
+
+    assert _episode_text(p, ["Write", "Bash"]).startswith("Task: Add a flag.")
 
 
 def test_failed_turn_without_output_raises(env, tmp_path):
@@ -174,6 +179,23 @@ def test_memory_tools_write_into_the_agents_space(env):
     [m] = client.all_memories(spaces=["critic"])
     assert m.source == "critic"
     assert "cite the diff" in tools["memory_recall"].run(query="reviews cite diff")
+
+
+def test_llm_agent_builds_without_the_checkpointing_warning(env, recwarn):
+    # The step callback is a closure (it carries the agent's scoped client), which
+    # CrewAI flags as unserializable for checkpointing — noise for ReLife, which
+    # never checkpoints a crew. The live smoke printed it; it must stay quiet.
+    from relife.crew.native import llm_agent
+    from relife.crew.spec import AgentSpec
+
+    store, client, _ = env
+    ag.create_agent(store, client, "critic", runtime="llm")
+    scoped = ScopedMemoryClient(client, store.require("critic").scope())
+    spec = AgentSpec(name="critic", role="Reviewer", goal="review", backstory="", runtime="llm",
+                     llm="claude-max", inherit=[], fork=None)
+    agent = llm_agent(spec, memory_client=scoped, llm=ClaudeMaxLLM(ask_model=StubModel()), task_id="t1")
+    assert agent.step_callback is not None
+    assert not [w for w in recwarn if "checkpointing" in str(w.message)]
 
 
 # --- the whole crew ------------------------------------------------------------------------

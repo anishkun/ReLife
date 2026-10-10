@@ -19,7 +19,7 @@
 > is the synthesis — read it last, and re-read it whenever you make an architectural
 > change. Line references are to the code as of the platform pass (branch
 > `feat/platform-crewai`, commit `a53ef91`); the test suite is **~800 deterministic
-> tests** — 790 on Python 3.14, 796 in the 3.12 `.venv` where CrewAI is installed
+> tests** — 790 on Python 3.14, 797 in the 3.12 `.venv` where CrewAI is installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -2467,9 +2467,9 @@ This module is the synthesis: the recurring design *principles*, the deliberate
    unsupported today.
 5. **Live verification is expensive and rationed.** Because live runs consume Max
    budget, the team relies on the ~800 deterministic tests and avoids hammering live
-   runs. Some end-to-end behaviors are validated less often than unit-level logic; at
-   the time of writing, the live crew smokes (`relife crew --plan-only`, a two-agent
-   crew) have **not** been run.
+   runs. Some end-to-end behaviors are validated less often than unit-level logic. The
+   live crew smokes ran once (a plan, then a two-agent crew: $0.26 + $0.47) and caught two
+   things no stub could: a warning on every run and crew episodes that all looked alike.
 6. **Windows-specific sharp edges.** Console encoding must be forced to UTF-8
    (`agent.py:40`) or Rich crashes on glyphs under cp1252; two shell tools must be
    gated identically; `gh` PATH injection is a workaround for a mid-session install;

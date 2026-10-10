@@ -80,7 +80,7 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** ~800 passing — 790 on Python 3.14 (the CrewAI module skips), 796 in the 3.12 `.venv`
+**Tests:** ~800 passing — 790 on Python 3.14 (the CrewAI module skips), 797 in the 3.12 `.venv`
 with `[crewai]` (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP and crew suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
@@ -621,12 +621,23 @@ py -3.12 -m venv .venv
   `execute_task/aexecute_task/create_agent_executor/get_delegation_tools/get_platform_tools/get_mcp_tools`
   are abstract (its own OpenAI adapter predates that), and a crew member must expose
   `function_calling_llm`, `step_callback` and `last_messages`.
-  Tests: 790 on 3.14 (crew module skips), 796 on the 3.12 venv with `[crewai]` — including a real
+  Tests: 790 on 3.14 (crew module skips), 797 on the 3.12 venv with `[crewai]` — including a real
   `Crew.kickoff()` with a ReLife agent and a CrewAI agent on `ClaudeMaxLLM`, zero model calls. CI's
   `full` job adds `[crewai]`. Smokes (no budget): stdio MCP via the SDK's own client on Windows;
   `relife crew --spec crew.yaml --plan-only` + `relife crews ID`; doctor on both interpreters.
-  **Not yet run live** (spends budget — ask first): `relife crew --plan-only "<task>"` (one planner
-  call) and a 2-agent crew (see RELEASE_TESTING §5). **Next:** `/agents` `/crews` routes + UI panels in
+  **Live crew smokes (2026-10-10, scratch `RELIFE_HOME`, 3.12 venv) — ✅ PASSED.** (1) `relife crew
+  --plan-only` on a "slugify module + tests + edge-case review" task: valid plan first try (a ReLife
+  `python-dev` + a `claude-max` `code-reviewer`, review ← implement), 18 s, $0.26. (2) That plan as
+  `--spec`, with `inherit: [python-dev]` added to the reviewer, confirmed via the real `[y/N]` prompt:
+  agents created with the lineage; the builder wrote `slugify.py` + `test_slugify.py` in
+  `workspace/crews/<id>/` (14 tests pass); the reviewer got the output as context, called
+  `memory_context`, and wrote a substantive review (found real bugs: `ß/ø/ł` dropped, em-dash words
+  merged); `relife crews <id>` showed both outcomes; status `done`, $0.47. Isolation held: the builder's
+  events + episode in `python-dev`, the reviewer's journaled step in `code-reviewer`, `default`
+  untouched. Fixed from what it surfaced: CrewAI's "function callbacks cannot be serialized" warning on
+  every run (our step callback is necessarily a closure; ReLife never checkpoints — silenced at agent
+  construction only), and crew episodes all reading "Task: You are working on a crew as …" (the crew
+  prompt now leads with the task, which is what the episode keeps). **Next:** `/agents` `/crews` routes + UI panels in
   `relife serve` (crew runs as server sessions, approvals in the browser), schedules that fire crews,
   ReLife-gated shell/file tools for non-Claude agents.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every

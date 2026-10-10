@@ -22,6 +22,7 @@ is a ReLife agent's job. (Gated tools for other models are a later step.)
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable
 
 from crewai import Agent
@@ -31,6 +32,9 @@ from .memory_tools import memory_tools
 from .spec import AgentSpec
 
 LlmFactory = Callable[[str], Any]
+
+# CrewAI's warning for a callback it can't round-trip through JSON (crewai.types.callback).
+_UNSERIALIZABLE_CALLBACK = r".*callbacks cannot be serialized and will prevent checkpointing"
 
 
 def default_llm(model: str) -> Any:
@@ -74,13 +78,19 @@ def llm_agent(
         if on_step is not None:
             on_step(s)
 
-    return Agent(
-        role=spec.role,
-        goal=spec.goal,
-        backstory=spec.backstory or spec.role,
-        llm=llm,
-        tools=memory_tools(memory_client),
-        allow_delegation=False,
-        verbose=False,
-        step_callback=step,
-    )
+    # The callback is a closure by necessity (it carries this agent's scoped
+    # client and task id), which CrewAI warns can't be serialized for its
+    # checkpointing. ReLife never checkpoints a crew (the run record is ours),
+    # so that one warning is noise; anything else still surfaces.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_UNSERIALIZABLE_CALLBACK, category=UserWarning)
+        return Agent(
+            role=spec.role,
+            goal=spec.goal,
+            backstory=spec.backstory or spec.role,
+            llm=llm,
+            tools=memory_tools(memory_client),
+            allow_delegation=False,
+            verbose=False,
+            step_callback=step,
+        )

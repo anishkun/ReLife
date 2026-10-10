@@ -49,7 +49,7 @@ running on the **Claude Code Max subscription** (no metered API key).
   daemon, the agent server and whether your schedules will actually fire.
 
 **Since 1.0 (unreleased — see `CHANGELOG.md`).** Tested deterministically (including a real
-CrewAI run with stand-in models) but not yet live-tested with real model calls:
+CrewAI run with stand-in models) and with live crew smokes (`RELEASE_TESTING.md` §5):
 
 - **Many agents, handed-down memory** — register agents (`relife agent create`); each writes its
   own memory space and reads what it **inherited** from older agents (live, read-only), can start

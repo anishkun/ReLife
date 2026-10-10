@@ -41,6 +41,10 @@
   of a drive. Slash switches are now only recognised for cmd built-ins.
 
 ### Fixed
+- Crews (found by the live smoke): CrewAI warned "function callbacks cannot be serialized" on every
+  run (ReLife's step callback is a closure and ReLife never checkpoints a crew — silenced at agent
+  construction); and every crew episode an agent saved began "Task: You are working on a crew as …",
+  so they all looked alike to the pattern miner — the crew prompt now leads with the task.
 - A fresh memory DB stamped the current schema version before later migration steps ran; it now
   stamps v2 and applies each step in order.
 - Grants checked against the real Gmail/Calendar connector schemas: camelCase content fields
