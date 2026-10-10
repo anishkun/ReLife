@@ -105,7 +105,7 @@ def prepare_crew(
             lambda: plan_crew(task, roster=roster(store, client), ask_model=ask_model)
         )
 
-    run_id = CrewRunRecord.new_id()
+    run_id = records.reserve_id()
     crew_ws = (workspace / "crews" / run_id).resolve()
     record = CrewRunRecord(
         id=run_id,
@@ -153,9 +153,6 @@ def execute_crew(
     from .build import build_crew, ensure_profiles
 
     crew_ws.mkdir(parents=True, exist_ok=True)
-    for n in ensure_profiles(spec, store, client):
-        echo(f"  · {n}")
-
     relife_results: dict[str, TurnResult] = {}
 
     def on_outcome(task_obj: Any, agent: Any, result: TurnResult) -> None:
@@ -169,6 +166,11 @@ def execute_crew(
     record.status = "running"
     records.save(record)
     try:
+        # Inside the try: the registry may have changed since the plan was
+        # recorded (a fork parent deleted), and that must end the run as an
+        # error on the record — not leave it "planned" with nothing running.
+        for n in ensure_profiles(spec, store, client):
+            echo(f"  · {n}")
         crew = build_crew(
             spec,
             store=store,

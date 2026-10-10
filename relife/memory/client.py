@@ -57,7 +57,7 @@ class MemoryClient(Protocol):
     # Every agent-facing call takes the space(s) it acts on, defaulting to the
     # main agent's ``default`` space; admin listings default to every space.
     def save(self, text: str, kind: str = ..., tags: str = ..., importance: float | None = ..., *, space: str = ..., source: str = ...) -> int: ...
-    def recall(self, query: str, k: int = ..., *, reinforce: bool = ..., include_archived: bool = ..., spaces: Sequence[str] | None = ...) -> list[Memory]: ...
+    def recall(self, query: str, k: int = ..., *, reinforce: bool = ..., include_archived: bool = ..., spaces: Sequence[str] | None = ..., reinforce_space: str | None = ...) -> list[Memory]: ...
     def forget(self, query: str, *, space: str = ...) -> Memory | None: ...
     def archive(self, mem_id: int, *, space: str | None = ...) -> bool: ...
     def get(self, mem_id: int) -> Memory | None: ...
@@ -99,10 +99,12 @@ class LocalMemoryClient:
         )
 
     def recall(
-        self, query, k=5, *, reinforce=False, include_archived=False, spaces=None
+        self, query, k=5, *, reinforce=False, include_archived=False, spaces=None,
+        reinforce_space=None,
     ) -> list[Memory]:
         return self._svc.recall(
-            query, k=k, reinforce=reinforce, include_archived=include_archived, spaces=spaces
+            query, k=k, reinforce=reinforce, include_archived=include_archived, spaces=spaces,
+            reinforce_space=reinforce_space,
         )
 
     def forget(self, query, *, space=DEFAULT_SPACE) -> Memory | None:
@@ -216,6 +218,10 @@ class ScopedMemoryClient:
             reinforce=reinforce,
             include_archived=include_archived,
             spaces=self.scope.read,
+            # Reading strengthens only the agent's own memory: inherited spaces
+            # and the user's default are read-only, and that includes how
+            # strong their memories are (what recall ranks and decay spares).
+            reinforce_space=self.scope.write,
         )
 
     def get(self, mem_id) -> Memory | None:

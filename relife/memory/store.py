@@ -24,6 +24,7 @@ backward-compatible with v1 while the implementation lives on the class.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from array import array
@@ -33,6 +34,7 @@ from pathlib import Path
 
 from .. import config
 from . import cognitive, embeddings, vector_index
+from ._sqlite import connect as _sqlite_connect
 from ._text import tokenize as _tokens
 from .spaces import DEFAULT_SPACE, validate_space
 
@@ -40,6 +42,27 @@ from .spaces import DEFAULT_SPACE, validate_space
 _DB_PATH = config.DATA_DIR / "relife.db"
 
 _VALID_KINDS = {"fact", "preference", "episode", "pattern"}
+
+# Bounds on what one save may write. Memory is written by models — external
+# MCP agents and imported packs included — and everything saved is injected
+# into later prompts, so an unbounded text is a storage and a context hazard.
+MAX_TEXT_CHARS = 8000
+MAX_TAGS_CHARS = 500
+
+
+def clean_importance(importance: object) -> float | None:
+    """A caller's importance as a 0..1 float, or ``None`` (the kind default)
+    when it is missing or not a finite number. ``nan`` would otherwise clamp to
+    1.0 (``min(1.0, nan)`` is 1.0): junk must never mean "most important"."""
+    if importance is None or isinstance(importance, bool):
+        return None
+    try:
+        v = float(importance)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return max(0.0, min(1.0, v))
 
 
 @dataclass
@@ -132,15 +155,10 @@ class MemoryStore:
 
     # --- connection / schema ------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # Wait briefly instead of erroring instantly on SQLITE_BUSY, so a local
-        # write that races the memory daemon (a command run without
-        # RELIFE_MEMORY_URL) retries rather than failing. Sole-writer discipline
-        # still holds; this just removes the sharp edge.
-        conn.execute("PRAGMA busy_timeout = 5000")
-        return conn
+        # A cached per-thread connection (see _sqlite.connect): busy_timeout so
+        # a local write racing the memory daemon retries rather than failing
+        # (sole-writer discipline still holds), WAL + NORMAL sync for cheap commits.
+        return _sqlite_connect(self.db_path)
 
     @staticmethod
     def _columns(conn) -> set[str]:
@@ -292,15 +310,25 @@ class MemoryStore:
         memories, and one agent's save never strengthens another's.
         """
         validate_space(space)
-        text = (text or "").strip()
+        if not isinstance(text, str):
+            raise ValueError("memory text must be a string")
+        text = text.strip()
         if not text:
             raise ValueError("memory text is empty")
+        if len(text) > MAX_TEXT_CHARS:
+            raise ValueError(
+                f"memory text is {len(text)} characters; at most {MAX_TEXT_CHARS} "
+                "(save the lesson, not the transcript)"
+            )
+        tags = tags if isinstance(tags, str) else ""
+        if len(tags) > MAX_TAGS_CHARS:
+            raise ValueError(f"tags are at most {MAX_TAGS_CHARS} characters")
+        source = str(source or "")[:200]
         if kind not in _VALID_KINDS:
             kind = "fact"
-        if importance is None:
+        imp = clean_importance(importance)
+        if imp is None:
             imp = config.DEFAULT_IMPORTANCE.get(kind, 0.5)
-        else:
-            imp = max(0.0, min(1.0, float(importance)))
         self.init_db()
         now = time.time()
         with self._connect() as conn:
@@ -387,8 +415,11 @@ class MemoryStore:
 
     def set_importance(self, mem_id: int, importance: float) -> None:
         """Set a memory's importance (clamped to 0..1). Used by the REM pass to
-        recalibrate salience; does not touch use_count/recency."""
-        imp = max(0.0, min(1.0, float(importance)))
+        recalibrate salience; does not touch use_count/recency. A non-finite
+        value (a model's ``NaN``) leaves the memory as it was."""
+        imp = clean_importance(importance)
+        if imp is None:
+            return
         self.init_db()
         with self._connect() as conn:
             conn.execute(
@@ -500,8 +531,13 @@ class MemoryStore:
         reinforce: bool = False,
         include_archived: bool = False,
         spaces: Sequence[str] | None = None,
+        reinforce_space: str | None = None,
     ) -> list[Memory]:
         """Return up to ``k`` memories most relevant to ``query``.
+
+        ``reinforce_space``: when given, only hits in that space are
+        reinforced — an agent reading what it inherited (or the user's
+        ``default``) must not change how strong that memory is.
 
         Relevance fuses semantic similarity, keyword overlap, cognitive
         activation, and importance (see ``cognitive.fused_score``). A row
@@ -561,7 +597,8 @@ class MemoryStore:
         top = [m for _, m in scored[:k]]
         if reinforce:
             for m in top:
-                self.reinforce(m.id, now)
+                if reinforce_space is None or m.space == reinforce_space:
+                    self.reinforce(m.id, now)
         return top
 
     def all_memories(
@@ -576,6 +613,28 @@ class MemoryStore:
                 f"SELECT * FROM memories {_where(status, in_space)}", params
             ).fetchall()
         return [_row_to_memory(r) for r in rows]
+
+    def stored_embeddings(self, ids: Sequence[int]) -> dict[int, list[float]]:
+        """The embeddings saved with these memories (rows without one are left
+        out). Lets a sweep reuse what ``save`` already computed instead of
+        re-embedding the whole store on every pass."""
+        if not ids:
+            return {}
+        self.init_db()
+        out: dict[int, list[float]] = {}
+        with self._connect() as conn:
+            ids = [int(i) for i in ids]
+            for i in range(0, len(ids), 500):  # SQLite caps bound parameters
+                chunk = ids[i : i + 500]
+                for r in conn.execute(
+                    f"SELECT id, embedding FROM memories WHERE id IN ({','.join('?' * len(chunk))}) "
+                    "AND embedding IS NOT NULL",
+                    chunk,
+                ):
+                    vec = _unpack(r["embedding"])
+                    if vec:
+                        out[int(r["id"])] = vec
+        return out
 
     def get(self, mem_id: int) -> Memory | None:
         self.init_db()
@@ -745,9 +804,11 @@ def recall(
     reinforce: bool = False,
     include_archived: bool = False,
     spaces: Sequence[str] | None = None,
+    reinforce_space: str | None = None,
 ) -> list[Memory]:
     return _store().recall(
-        query, k=k, reinforce=reinforce, include_archived=include_archived, spaces=spaces
+        query, k=k, reinforce=reinforce, include_archived=include_archived, spaces=spaces,
+        reinforce_space=reinforce_space,
     )
 
 
@@ -759,6 +820,10 @@ def all_memories(
 
 def get(mem_id: int) -> Memory | None:
     return _store().get(mem_id)
+
+
+def stored_embeddings(ids: Sequence[int]) -> dict[int, list[float]]:
+    return _store().stored_embeddings(ids)
 
 
 def count(include_archived: bool = True, spaces: Sequence[str] | None = None) -> int:

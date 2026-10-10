@@ -3,7 +3,10 @@
 1. **Agents and their memory.** Each spec agent is a registered ReLife agent:
    an existing one is reused (it brings what it has learned), a new one is
    created — inheriting or forking older agents' memory as the plan says. This
-   is where memory is handed from old agents to new ones.
+   is where memory is handed from old agents to new ones. A plan's ``inherit``
+   on a *reused* agent widens what it reads **for this run only**: a plan is
+   model output, and must not permanently change a registered agent's scope
+   (that is ``relife agent attach``, the user's act).
 2. **Members.** ``runtime: relife`` → :class:`ReLifeAgent` (a full ReLife turn
    per task); ``runtime: llm`` → a CrewAI agent on the chosen model with ReLife
    memory attached. Each gets a ``ScopedMemoryClient`` for its own scope.
@@ -21,8 +24,9 @@ from typing import Any, Callable
 
 from crewai import Crew, Process, Task
 
-from ..agents import AgentStore, attach, create_agent
+from ..agents import AgentStore, create_agent
 from ..memory.client import ScopedMemoryClient
+from ..memory.spaces import MemoryScope
 from ..memory.context import build_context
 from .agent import OnOutcome, ReLifeAgent, TurnRunner
 from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
@@ -49,10 +53,25 @@ def ensure_profiles(spec: CrewSpec, store: AgentStore, client: Any) -> list[str]
                 how.append(f"forked {copied['memories']} memories from {a.fork}")
             notes.append(f"new agent {a.name}" + (f" ({'; '.join(how)})" if how else ""))
         else:
-            for other in a.inherit:
-                attach(store, a.name, other)
-            notes.append(f"reusing {a.name} ({existing.runtime})")
+            extra = [o for o in a.inherit if o != a.name]
+            notes.append(
+                f"reusing {a.name} ({existing.runtime})"
+                + (f"; reads {', '.join(extra)} for this run" if extra else "")
+            )
     return notes
+
+
+def run_scope(spec_agent: Any, store: AgentStore) -> MemoryScope:
+    """The registered agent's scope, plus (read-only, this run only) the spaces
+    of the agents the plan says it inherits from — and what they inherited."""
+    base = store.require(spec_agent.name).scope()
+    extra: list[str] = []
+    for other in spec_agent.inherit:
+        p = store.require(other)
+        extra += [p.own_space, *p.inherits]
+    if not extra:
+        return base
+    return MemoryScope(read=(*base.read, *extra), write=base.write, source=base.source)
 
 
 def build_crew(
@@ -76,7 +95,7 @@ def build_crew(
     members: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
     for a in spec.agents:
-        scoped[a.name] = ScopedMemoryClient(client, store.require(a.name).scope())
+        scoped[a.name] = ScopedMemoryClient(client, run_scope(a, store))
         if a.runtime == "relife":
             ev: OnEvent | None = (lambda e, n=a.name: on_event(n, e)) if on_event else None
             members[a.name] = ReLifeAgent(

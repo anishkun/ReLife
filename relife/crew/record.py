@@ -99,6 +99,23 @@ class CrewRunStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root) if root is not None else config.CREWS_DIR
 
+    def reserve_id(self, now: float | None = None) -> str:
+        """A fresh run id, claimed by creating its directory (``mkdir`` is
+        atomic). Ids are millisecond timestamps, so two crews planned in the
+        same millisecond — a schedule firing while the UI plans — would
+        otherwise share one record and one workspace; the later one moves on a
+        millisecond instead."""
+        now = time.time() if now is None else now
+        self.root.mkdir(parents=True, exist_ok=True)
+        for step in range(1000):
+            run_id = CrewRunRecord.new_id(now + step / 1000)
+            try:
+                (self.root / run_id).mkdir()
+            except FileExistsError:
+                continue
+            return run_id
+        raise RuntimeError("could not allocate a crew run id")
+
     def save(self, record: CrewRunRecord) -> Path:
         d = self.root / record.id
         d.mkdir(parents=True, exist_ok=True)

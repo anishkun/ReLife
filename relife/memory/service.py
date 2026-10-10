@@ -39,7 +39,8 @@ from . import workflows as _workflows
 from .events import Event
 from .skills import Skill
 from .spaces import DEFAULT_SPACE, validate_space
-from .store import _VALID_KINDS, Memory, MemoryStore
+from ._procedure import check_procedure
+from .store import _VALID_KINDS, MAX_TAGS_CHARS, MAX_TEXT_CHARS, Memory, MemoryStore
 from .workflows import Workflow
 
 PACK_FORMAT = "relife-memory-pack"
@@ -49,6 +50,9 @@ PACK_VERSION = 1
 def _read_spaces(spaces: Sequence[str] | None) -> tuple[str, ...]:
     """An agent-facing read with no explicit spaces reads the default space."""
     return (DEFAULT_SPACE,) if spaces is None else tuple(spaces)
+
+
+MAX_PACK_ITEMS = 50_000
 
 
 def validate_pack(pack: Any) -> dict[str, Any]:
@@ -65,13 +69,23 @@ def validate_pack(pack: Any) -> dict[str, Any]:
         items = pack.get(section, [])
         if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
             raise ValueError(f"memory pack section {section!r} must be a list of objects")
+    if sum(len(pack.get(s, [])) for s in ("memories", "skills", "workflows")) > MAX_PACK_ITEMS:
+        raise ValueError(f"memory pack holds more than {MAX_PACK_ITEMS} items")
     for m in pack.get("memories", []):
         if not isinstance(m.get("text"), str) or not m["text"].strip():
             raise ValueError("memory pack entry without text")
+        if len(m["text"].strip()) > MAX_TEXT_CHARS:
+            raise ValueError(f"memory pack entry longer than {MAX_TEXT_CHARS} characters")
+        if len(str(m.get("tags") or "")) > MAX_TAGS_CHARS:
+            raise ValueError(f"memory pack entry with tags longer than {MAX_TAGS_CHARS} characters")
     for section, label in (("skills", "skill"), ("workflows", "workflow")):
         for item in pack.get(section, []):
             if not isinstance(item.get("name"), str) or not isinstance(item.get("body"), str):
                 raise ValueError(f"memory pack {label} without a name and body")
+            try:
+                check_procedure(item["name"], item["body"])
+            except ValueError as e:
+                raise ValueError(f"memory pack {label}: {e}") from None
     return pack
 
 
@@ -128,6 +142,7 @@ class MemoryService:
         reinforce: bool = False,
         include_archived: bool = False,
         spaces: Sequence[str] | None = None,
+        reinforce_space: str | None = None,
     ) -> list[Memory]:
         return self._resolved().recall(
             query,
@@ -135,6 +150,7 @@ class MemoryService:
             reinforce=reinforce,
             include_archived=include_archived,
             spaces=_read_spaces(spaces),
+            reinforce_space=reinforce_space,
         )
 
     def all_memories(
@@ -245,7 +261,7 @@ class MemoryService:
                 m["text"],
                 kind=kind,
                 tags=str(m.get("tags") or ""),
-                importance=float(imp) if isinstance(imp, (int, float)) else None,
+                importance=imp,  # save() drops junk (non-numeric, NaN, inf)
                 space=space,
                 source=f"import:{origin}",
             )
@@ -318,7 +334,7 @@ class MemoryService:
         return _events.log_event(tool, brief=brief, task_id=task_id, space=space)
 
     def events_for_task(self, task_id: str, limit: int = 500) -> list[Event]:
-        return _events.events_by_task(limit).get(task_id, [])
+        return _events.for_task(task_id, limit)
 
     def event_count(self) -> int:
         return _events.count()

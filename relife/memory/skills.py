@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from .. import config
 from ._text import tokenize as _tokens
+from ._procedure import cached_dir, check_procedure, header_value
 from .spaces import DEFAULT_SPACE, space_dir
 
 _SKILLS_DIR = config.SKILLS_DIR
@@ -77,21 +78,33 @@ def write_skill(
     name: str, when_to_use: str, steps: str, *, space: str = DEFAULT_SPACE
 ) -> str:
     """Create or overwrite a skill in ``space``. Returns its slug."""
-    if not name.strip() or not steps.strip():
-        raise ValueError("skill needs a name and steps")
+    try:
+        check_procedure(name, steps)
+    except ValueError as e:
+        raise ValueError(f"skill {e}") from None
+    name = header_value(name)
     slug = _slug(name)
     path = _dir(space) / f"{slug}.md"
     content = (
-        f"---\nname: {name.strip()}\n"
-        f"when_to_use: {when_to_use.strip()}\n---\n"
+        f"---\nname: {name}\n"
+        f"when_to_use: {header_value(when_to_use)}\n---\n"
         f"{steps.strip()}\n"
     )
     path.write_text(content, encoding="utf-8")
     return slug
 
 
+def _index(sk: Skill) -> tuple[set[str], set[str]]:
+    return _tokens(sk.name + " " + sk.slug), _tokens(sk.when_to_use + " " + sk.body)
+
+
+def _indexed(space: str):
+    # Parsed once per file version (see _procedure.cached_dir), not per search.
+    return cached_dir(_dir(space), lambda p: _parse(p, space), _index)
+
+
 def list_skills(space: str = DEFAULT_SPACE) -> list[Skill]:
-    return [_parse(p, space) for p in sorted(_dir(space).glob("*.md"))]
+    return [sk for sk, _, _ in _indexed(space)]
 
 
 def find_skills(
@@ -106,12 +119,10 @@ def find_skills(
     scored: list[tuple[int, Skill]] = []
     seen: set[str] = set()
     for space in spaces if spaces is not None else (DEFAULT_SPACE,):
-        for sk in list_skills(space):
+        for sk, name_tok, body_tok in _indexed(space):
             if sk.slug in seen:
                 continue
             seen.add(sk.slug)
-            name_tok = _tokens(sk.name + " " + sk.slug)
-            body_tok = _tokens(sk.when_to_use + " " + sk.body)
             score = 2 * len(q & name_tok) + len(q & body_tok)
             if score:
                 scored.append((score, sk))

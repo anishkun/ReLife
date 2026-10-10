@@ -271,3 +271,46 @@ def test_a_failing_member_is_recorded_not_raised(env, tmp_path):
         store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
     )
     assert rec.status == "error" and "disk full" in rec.error
+
+
+# --- hardening ------------------------------------------------------------------------------
+def test_a_plan_reusing_an_agent_widens_its_reads_for_that_run_only(env, tmp_path):
+    """A plan is model output: its ``inherit`` on an agent that already exists
+    must not permanently attach spaces to that agent (that is the user's
+    `relife agent attach`)."""
+    from relife.crew.build import run_scope
+
+    store, client, _ = env
+    ag.create_agent(store, client, "builder")
+    ag.create_agent(store, client, "critic", isolated=True)
+    client.save("builder knows the export lives in export.py", space="builder", source="builder")
+    spec = normalize_spec(
+        {**SPEC, "agents": [SPEC["agents"][0], {**SPEC["agents"][1], "inherit": ["builder"]}]},
+        existing_agents={"builder", "critic"},
+    )
+    notes = ensure_profiles(spec, store, client)
+    assert "reads builder for this run" in notes[1]
+    assert ag.AgentStore(store.path).require("critic").inherits == []  # nothing persisted
+    scope = run_scope(spec.agent("critic"), store)
+    assert scope.read == ("critic", "builder") and scope.write == "critic"  # still isolated
+    run = ScopedMemoryClient(client, scope)
+    assert run.recall("where does the export live")[0].space == "builder"
+
+
+def test_a_registry_change_after_planning_ends_the_run_as_an_error(env, tmp_path):
+    store, client, _ = env
+    ag.create_agent(store, client, "parent")
+    spec_raw = {**SPEC, "agents": [{**SPEC["agents"][0], "fork": "parent"}, SPEC["agents"][1]]}
+    records = CrewRunStore(tmp_path / "crews")
+    record, spec = crew_runner.prepare_crew(
+        None, workspace=tmp_path, spec_raw=spec_raw, echo=lambda s: None,
+        store=store, client=client, records=records,
+    )
+    ag.delete_agent(store, client, "parent")  # gone before the crew runs
+    rec = crew_runner.execute_crew(
+        record, spec, echo=lambda s: None, runner=FakeRunner(),
+        llm_factory=lambda model: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=records,
+    )
+    assert rec.status == "error" and "parent" in rec.error
+    assert records.get(rec.id).status == "error"  # not left "planned"

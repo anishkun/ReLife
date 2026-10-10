@@ -28,10 +28,13 @@ requires it. ``wire`` stays dependency-free and is imported by both sides.
 from __future__ import annotations
 
 import os
+import secrets
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.routing import Route
@@ -140,10 +143,29 @@ def create_app(
         if token is None:
             return
         expected = f"Bearer {token}"
-        if authorization != expected:
+        if not secrets.compare_digest((authorization or "").encode(), expected.encode()):
             raise HTTPException(status_code=401, detail="invalid or missing token")
 
     auth = [Depends(require_token)]
+
+    # Bulk work (a consolidation sweep, copying/exporting/importing a space)
+    # runs on a worker thread: inline, one sweep — seconds on a large store —
+    # froze every other caller of the daemon, every agent on /mcp included.
+    # One at a time (they mine and rewrite the same rows); the quick per-call
+    # routes stay on the loop. SQLite + a connection per call make the overlap
+    # safe (WAL above; busy_timeout for the rare write-write wait).
+    bulk_lock = threading.Lock()
+
+    async def bulk(fn, *args, skip_if_busy: bool = False, **kwargs):
+        def run():
+            if not bulk_lock.acquire(blocking=not skip_if_busy):
+                return None  # a sweep is already running; the throttle fires again later
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                bulk_lock.release()
+
+        return await anyio.to_thread.run_sync(run)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -175,6 +197,7 @@ def create_app(
             reinforce=bool(body.get("reinforce", False)),
             include_archived=bool(body.get("include_archived", False)),
             spaces=body.get("spaces"),
+            reinforce_space=body.get("reinforce_space"),
         )
         return {"memories": wire.memories_to_list(hits)}
 
@@ -212,7 +235,8 @@ def create_app(
     @app.post("/spaces/copy", dependencies=auth)
     async def spaces_copy(body: dict[str, Any]) -> dict[str, Any]:
         ids = body.get("ids")
-        return svc.copy_space(
+        return await bulk(
+            svc.copy_space,
             body["src"],
             body["dst"],
             ids=None if ids is None else [int(i) for i in ids],
@@ -222,25 +246,25 @@ def create_app(
 
     @app.post("/spaces/archive", dependencies=auth)
     async def spaces_archive(body: dict[str, Any]) -> dict[str, Any]:
-        return {"archived": svc.archive_space(body["space"])}
+        return {"archived": await bulk(svc.archive_space, body["space"])}
 
     @app.get("/spaces/{space}/export", dependencies=auth)
     async def spaces_export(space: str) -> dict[str, Any]:
-        return svc.export_space(space)
+        return await bulk(svc.export_space, space)
 
     @app.post("/spaces/import", dependencies=auth)
     async def spaces_import(body: dict[str, Any]) -> dict[str, Any]:
-        return svc.import_pack(body["pack"], body["space"])
+        return await bulk(svc.import_pack, body["pack"], body["space"])
 
     @app.post("/consolidate", dependencies=auth)
     async def consolidate() -> dict[str, Any]:
-        return wire.consolidation_to_dict(svc.consolidate())
+        return wire.consolidation_to_dict(await bulk(svc.consolidate))
 
     @app.post("/consolidate/maybe", dependencies=auth)
     async def consolidate_maybe() -> dict[str, Any] | None:
         # The throttle decision runs here, server-side, against the daemon's own
         # event log + watermark — never split to a client-side gate.
-        report = svc.maybe_consolidate()
+        report = await bulk(svc.maybe_consolidate, skip_if_busy=True)
         return None if report is None else wire.consolidation_to_dict(report)
 
     @app.post("/dream", dependencies=auth)

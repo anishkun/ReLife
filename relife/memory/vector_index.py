@@ -106,9 +106,14 @@ class SqliteVecIndex:
     def _load(conn) -> None:
         import sqlite_vec  # type: ignore
 
+        loaded = getattr(conn, "loaded", None)
+        if loaded is not None and "vec" in loaded:
+            return  # connections are reused now; load once each
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
+        if loaded is not None:
+            loaded.add("vec")
 
     def _ensure_table(self, conn) -> None:
         conn.execute(

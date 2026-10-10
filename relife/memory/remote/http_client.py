@@ -115,7 +115,8 @@ class HttpMemoryClient:
         return int(data["id"])
 
     def recall(
-        self, query, k=5, *, reinforce=False, include_archived=False, spaces=None
+        self, query, k=5, *, reinforce=False, include_archived=False, spaces=None,
+        reinforce_space=None,
     ) -> list[Memory]:
         body = {
             "query": query,
@@ -123,6 +124,8 @@ class HttpMemoryClient:
             "reinforce": reinforce,
             "include_archived": include_archived,
         }
+        if reinforce_space is not None:
+            body["reinforce_space"] = reinforce_space
         data = self._post("/recall", self._space_params(body, spaces))
         return wire.memories_from_list(data["memories"])
 

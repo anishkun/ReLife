@@ -27,6 +27,7 @@ would consume Max budget; the deterministic stubs are useful on their own.)
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -75,8 +76,12 @@ def should_auto_run() -> bool:
     """True if enough new events have accrued since the last consolidation."""
     if not config.AUTO_CONSOLIDATE:
         return False
-    last = _read_state().get("last_event_count", 0)
-    return (events.count() - last) >= config.CONSOLIDATE_EVERY
+    state = _read_state()
+    # By event id, not row count: pruning lowers the count, which would stall
+    # the throttle. (A pre-pruning state file holds a count; with nothing ever
+    # deleted then, the newest id equalled it, so it reads as an id.)
+    last = state.get("last_event_id", state.get("last_event_count", 0))
+    return (events.max_id() - last) >= config.CONSOLIDATE_EVERY
 
 
 # --- the sweep -------------------------------------------------------------
@@ -110,55 +115,186 @@ def _decay_and_archive(now: float, report: ConsolidationReport) -> None:
             report.deleted += 1
 
 
-def _dedupe(report: ConsolidationReport) -> None:
-    """Merge near-duplicate active memories.
+_DEDUP_JACCARD = 0.9
+
+
+def _valid_mark(mark) -> int:
+    """A mark is ``[id, created_at]`` of the newest memory checked. It counts
+    only while that memory is still the one with that id — a replaced or
+    rebuilt DB restarts ids, and a stale mark would skip new memories."""
+    if not (isinstance(mark, list) and len(mark) == 2):
+        return 0
+    try:
+        mid, created = int(mark[0]), float(mark[1])
+    except (TypeError, ValueError):
+        return 0
+    m = store.get(mid)
+    return mid if m is not None and abs(m.created_at - created) < 1e-6 else 0
+
+
+def _dedupe(report: ConsolidationReport, marks: dict | None = None) -> dict:
+    """Merge near-duplicate active memories, space by space.
 
     Two memories are duplicates if their token sets overlap heavily (keyword
     Jaccard >= 0.9) OR — when embeddings are available — their meanings are very
     close (cosine >= ``config.DEDUP_SIM``), which also catches paraphrases that
-    share few exact tokens. The survivor is reinforced; the duplicate is dropped.
+    share few exact tokens. The survivor (the older one) is reinforced; the
+    duplicate is dropped.
+
+    ``marks`` (``{"<mode>:<space>": [id, created_at]}``, from the last pass)
+    says up to which memory a space was already deduped: those memories were checked against each other
+    then, so only newer ones are compared — against everything. Returns the
+    marks for the next pass. Built to scale: the old all-pairs loop took 19 s
+    at 3,000 memories and re-embedded every memory on every pass.
     """
+    from . import embeddings
+
+    marks = dict(marks or {})
+    use_sem = embeddings.available()
+    mode = "sem" if use_sem else "kw"
     by_space: dict[str, list] = {}
     for m in store.all_memories(include_archived=False):
         by_space.setdefault(m.space, []).append(m)
-    for mems in by_space.values():
-        _dedupe_group(mems, report)
+    out: dict[str, int] = {}
+    for space, mems in by_space.items():
+        mems.sort(key=lambda m: m.id)
+        # A mark made without embeddings never compared meanings: start over.
+        key = f"{mode}:{space}"
+        newest = _dedupe_group(mems, report, since=_valid_mark(marks.get(key)), use_sem=use_sem)
+        if newest is not None:
+            out[key] = [newest.id, newest.created_at]
+    return out
 
 
-def _dedupe_group(mems: list, report: ConsolidationReport) -> None:
-    """Dedupe one space's active memories (never across spaces)."""
+def _prefix(toks: list[str]) -> list[str]:
+    """Prefix filtering: two sets with Jaccard >= t must share a token among
+    each one's first ``|x| - ceil(t·|x|) + 1`` tokens, in one global order."""
+    return toks[: len(toks) - math.ceil(_DEDUP_JACCARD * len(toks)) + 1]
+
+
+def _dedupe_group(mems: list, report: ConsolidationReport, *, since: int = 0, use_sem: bool = False):
+    """Dedupe one space's active memories (sorted by id; never across spaces).
+
+    Greedy in id order, as before: a memory is a duplicate of the *oldest*
+    surviving memory it matches. Keyword candidates come from an inverted index
+    over each survivor's rarest tokens (exact for the Jaccard threshold, not a
+    heuristic); meanings are compared as one matrix-vector product per new
+    memory over stored embeddings — only memories without one are embedded.
+    Returns the newest survivor (the next pass's mark), or None."""
     from . import embeddings
 
-    use_sem = embeddings.available()
-    vecs: dict[int, list[float] | None] = {}
-    if use_sem:
-        batch = embeddings.embed([m.text for m in mems]) or []
-        vecs = {m.id: v for m, v in zip(mems, batch)}
+    toks = {m.id: _tokens(m.text) for m in mems}
+    df: Counter = Counter(t for ts in toks.values() for t in ts)
+    order = {m.id: sorted(toks[m.id], key=lambda t: (df[t], t)) for m in mems}
 
-    seen: list[tuple[set[str], object]] = []
+    vecs: dict[int, list[float]] = {}
+    if use_sem:
+        vecs = store.stored_embeddings([m.id for m in mems])
+        missing = [m for m in mems if m.id not in vecs]
+        if missing:
+            for m, v in zip(missing, embeddings.embed([m.text for m in missing]) or []):
+                if v:
+                    vecs[m.id] = v
+    sem = _SemIndex(len(mems)) if use_sem else None
+
+    index: dict[str, list] = {}  # token → survivors whose prefix holds it
+    newest = None
+
+    def keep(m) -> None:
+        nonlocal newest
+        newest = m
+        for t in _prefix(order[m.id]):
+            index.setdefault(t, []).append(m)
+        if sem is not None:
+            sem.add(m, vecs.get(m.id))
+
     for m in mems:
-        toks = _tokens(m.text)
-        if not toks:
+        ts = toks[m.id]
+        if not ts:
+            continue
+        if m.id <= since:  # checked last pass: a survivor by definition
+            keep(m)
             continue
         dup_of = None
-        for toks2, keep in seen:
-            union = toks | toks2
-            kw_dup = bool(union) and len(toks & toks2) / len(union) >= 0.9
-            sem_dup = (
-                use_sem
-                and embeddings.cosine(vecs.get(m.id), vecs.get(keep.id))  # type: ignore[attr-defined]
-                >= config.DEDUP_SIM
-            )
-            if kw_dup or sem_dup:
-                dup_of = keep
-                break
+        seen_ids: set[int] = set()
+        for t in _prefix(order[m.id]):
+            for other in index.get(t, ()):
+                if other.id in seen_ids:
+                    continue
+                seen_ids.add(other.id)
+                o = toks[other.id]
+                if len(ts & o) / len(ts | o) >= _DEDUP_JACCARD and (dup_of is None or other.id < dup_of.id):
+                    dup_of = other
+        if sem is not None:
+            other = sem.first_match(vecs.get(m.id), config.DEDUP_SIM)
+            if other is not None and (dup_of is None or other.id < dup_of.id):
+                dup_of = other
         if dup_of is None:
-            seen.append((toks, m))
+            keep(m)
         else:
             # Reinforce the survivor, drop the duplicate.
-            store.reinforce(dup_of.id)  # type: ignore[attr-defined]
+            store.reinforce(dup_of.id)
             store.delete(m.id)
             report.merged += 1
+    return newest
+
+
+class _SemIndex:
+    """Survivors' unit vectors, searched with one product per query (numpy,
+    which fastembed brings), or a plain loop when numpy is absent."""
+
+    def __init__(self, capacity: int) -> None:
+        self._items: list = []
+        self._vecs: list[list[float]] = []
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - embeddings imply numpy
+            self._np = None
+        else:
+            self._np = np
+            self._mat = None
+            self._cap = max(capacity, 1)
+            self._n = 0
+
+    def add(self, m, vec: list[float] | None) -> None:
+        if not vec:
+            return
+        if self._np is None:
+            self._items.append(m)
+            self._vecs.append(vec)
+            return
+        np = self._np
+        v = np.asarray(vec, dtype=np.float32)
+        norm = float(np.linalg.norm(v))
+        if norm == 0.0:
+            return
+        if self._mat is None:
+            self._mat = np.zeros((self._cap, v.shape[0]), dtype=np.float32)
+        if v.shape[0] != self._mat.shape[1]:
+            return  # a vector from another model; can't be compared
+        self._mat[self._n] = v / norm
+        self._items.append(m)
+        self._n += 1
+
+    def first_match(self, vec: list[float] | None, threshold: float):
+        """The oldest survivor at or above ``threshold`` cosine, or None."""
+        if not vec or not self._items:
+            return None
+        if self._np is None:
+            from . import embeddings
+
+            for m, v in zip(self._items, self._vecs):
+                if embeddings.cosine(vec, v) >= threshold:
+                    return m
+            return None
+        np = self._np
+        q = np.asarray(vec, dtype=np.float32)
+        norm = float(np.linalg.norm(q))
+        if norm == 0.0 or q.shape[0] != self._mat.shape[1]:
+            return None
+        sims = self._mat[: self._n] @ (q / norm)
+        hits = np.nonzero(sims >= threshold)[0]
+        return self._items[int(hits[0])] if hits.size else None
 
 
 def _cluster_episodes(threshold: float = 0.6, space: str = DEFAULT_SPACE) -> list[list[object]]:
@@ -279,7 +415,7 @@ def _tool_ngrams(sizes=(2, 3, 4), space: str = DEFAULT_SPACE, by_task=None) -> C
     git-clone→test→git-push is visible instead of collapsing into one "Bash"."""
     counts: Counter = Counter()
     if by_task is None:
-        by_task = events.events_by_task()
+        by_task = events.events_by_task(space=space)
     for task_id, evs in by_task.items():
         if not task_id:
             continue  # only sequences that belong to a known task
@@ -298,11 +434,11 @@ def _tool_ngrams(sizes=(2, 3, 4), space: str = DEFAULT_SPACE, by_task=None) -> C
 
 def _detect_patterns(report: ConsolidationReport) -> None:
     """Detect patterns space by space, learning each into its own space."""
-    by_task = events.events_by_task()
     spaces = {m.space for m in store.all_memories(include_archived=True)}
-    spaces |= {e.space for evs in by_task.values() for e in evs}
+    spaces |= events.spaces()
     for space in sorted(spaces or {DEFAULT_SPACE}):
-        _detect_patterns_in(space, by_task, report)
+        # Each space mines its own recent window (see events.recent_events).
+        _detect_patterns_in(space, events.events_by_task(space=space), report)
 
 
 def _detect_patterns_in(space: str, by_task, report: ConsolidationReport) -> None:
@@ -365,7 +501,8 @@ def run_consolidation(now: float | None = None) -> ConsolidationReport:
     report = ConsolidationReport()
     store.init_db()
     _decay_and_archive(now, report)
-    _dedupe(report)
+    marks = _dedupe(report, _read_state().get("dedupe_marks"))
     _detect_patterns(report)
-    _write_state({"last_event_count": events.count(), "last_run": now})
+    events.prune(config.EVENTS_KEEP)
+    _write_state({"last_event_id": events.max_id(), "last_run": now, "dedupe_marks": marks})
     return report
