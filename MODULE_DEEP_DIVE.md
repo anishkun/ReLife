@@ -19,7 +19,7 @@
 > is the synthesis — read it last, and re-read it whenever you make an architectural
 > change. Line references are to the code as of the platform pass (branch
 > `feat/platform-crewai`, commit `a53ef91`); the test suite is **~800 deterministic
-> tests** — 800 on Python 3.14, 811 in the 3.12 `.venv` where CrewAI is installed
+> tests** — 877 on Python 3.14, 891 in the 3.12 `.venv` where CrewAI is installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -973,8 +973,8 @@ in its own space.
 every session, so each inline recall (FTS + ONNX with embeddings), each journaled tool
 call (a loopback POST in daemon mode) froze every other session's stream and pending
 approval. Every such call now goes through `memory.client.off_loop(fn, …)`
-(`client.py:40`, `anyio.to_thread`). Thread safety is the pass-4 argument: a fresh
-SQLite connection per call, a locked model load, a thread-safe `httpx.Client`. This
+(`client.py:40`, `anyio.to_thread`). Thread safety is the pass-4 argument: an own
+SQLite connection per thread (`memory/_sqlite.connect`), a locked model load, a thread-safe `httpx.Client`. This
 delivered the practical goal of the once-planned async `MemoryClient` variants without
 a second client surface.
 
@@ -1566,8 +1566,8 @@ long-lived process reveals: the pass does SQLite scans, dedupe and (with embeddi
 ONNX inference — seconds on a big store — and on the *one* loop that hosts every
 session's SSE stream and every pending approval, **everything froze for the
 duration.** `maybe_consolidate_off_loop()` (`agent.py:245`) runs it on a worker
-thread. It's safe there because the store opens a fresh SQLite connection per call
-and `httpx.Client` is thread-safe; the non-blocking process lock (M2) stops two
+thread. It's safe there because each thread uses its own SQLite connection
+(`memory/_sqlite.connect`) and `httpx.Client` is thread-safe; the non-blocking process lock (M2) stops two
 sessions sweeping at once. A pass that changed something is published as a `note`
 event so the console shows the brain ticking.
 
@@ -2720,7 +2720,7 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 | `memory/remote/http_client.py` | `HttpMemoryClient`: pooled httpx, rebuilds real objects, 400→`ValueError`, `dream` off-thread with no timeout. |
 | `memory/skills.py` | Single procedures as Markdown, per space; weighted keyword `find_skills` (earlier space shadows). |
 | `memory/workflows.py` | Multi-step procedures as Markdown (+`trigger`), per space; weighted keyword `find_workflows`. |
-| `memory/events.py` | `EventLog`: append-only tool journal (with `space`), `events_by_task`, `count`. |
+| `memory/events.py` | `EventLog`: tool journal (with `space`), `events_by_task(space=)`, `for_task`, `max_id`, `prune`. |
 | `memory/consolidate.py` | Deterministic "sleep", per space: decay/archive/delete, dedupe, n-gram mining, workflow synthesis, `should_auto_run`. |
 | `memory/rem.py` | Opt-in LLM "dream": replay buffer, critic prompt, deterministic reversible `_apply`, journal. |
 | `memory/tools.py` | `ToolSpec` + the memory tools defined once; `INTERNAL_TOOLS` (Claude's nine) and `EXTERNAL_TOOLS` (no consolidate/dream, + `memory_context`). |

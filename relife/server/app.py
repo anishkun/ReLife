@@ -698,6 +698,10 @@ def create_app(
     @app.delete("/crews/{crew_id}", dependencies=mutate)
     async def discard_crew_route(crew_id: str) -> dict[str, Any]:
         rec = _crew_or_404(crew_id)
+        if crews.host(crew_id) is not None or crews.starting(crew_id):
+            # Started, though the record may still say "planned" for an
+            # instant: discarding it would mark a live crew cancelled.
+            raise HTTPException(status_code=409, detail="that crew has been started; stop it instead")
         if rec.status != "planned":
             raise HTTPException(status_code=409, detail=f"crew is {rec.status}; only a plan can be discarded")
         rec.status = "cancelled"

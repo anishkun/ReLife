@@ -31,6 +31,7 @@ import json
 import os
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -44,6 +45,12 @@ MAX_INHERITS = 16
 MAX_DESCRIPTION = 500
 MAX_MODEL = 200
 TOKEN_PREFIX = "rla_"
+
+# Every change is read-modify-write of one file, and under `relife serve` the
+# routes (on worker threads) and a crew's worker can change the registry at the
+# same time: writes are serialized, and each re-reads the file first so one
+# writer never drops another's agent.
+_WRITE_LOCK = threading.RLock()
 
 
 def validate_agent_name(name: Any) -> str:
@@ -162,17 +169,19 @@ class AgentStore:
         self._load()
 
     def _load(self) -> None:
+        self._items, self.problem = self._read()
+
+    def _read(self) -> tuple[dict[str, AgentProfile], str | None]:
+        items: dict[str, AgentProfile] = {}
         if not self.path.exists():
-            return
+            return items, None
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
-            self.problem = f"unreadable ({type(e).__name__}: {e})"
-            return
+            return items, f"unreadable ({type(e).__name__}: {e})"
         records = raw.get("agents", []) if isinstance(raw, dict) else None
         if not isinstance(records, list):
-            self.problem = "unexpected format (no agents list)"
-            return
+            return items, "unexpected format (no agents list)"
         dropped = 0
         for d in records:
             try:
@@ -180,9 +189,18 @@ class AgentStore:
             except (TypeError, ValueError):
                 dropped += 1
                 continue
-            self._items[a.name] = a
-        if dropped:
-            self.problem = f"{dropped} unreadable agent record(s) skipped"
+            items[a.name] = a
+        return items, (f"{dropped} unreadable agent record(s) skipped" if dropped else None)
+
+    def _refresh(self) -> None:
+        """Pick up what other writers saved since this store was loaded. A file
+        that reads as broken now is left to :meth:`save`'s backup path — the
+        records this store already holds are kept, never thrown away."""
+        items, problem = self._read()
+        if problem is None:
+            self._items = items
+        elif self.problem is None:
+            self.problem = problem  # so save() keeps the broken file aside first
 
     def _preserve_original(self) -> None:
         if self.problem is None or not self.path.exists():
@@ -216,18 +234,26 @@ class AgentStore:
             raise LookupError(f"no agent named {name!r} (see `relife agent list`)")
         return a
 
-    def put(self, profile: AgentProfile) -> AgentProfile:
+    def put(self, profile: AgentProfile, *, new: bool = False) -> AgentProfile:
+        """Save one agent. ``new``: refuse if the name was taken meanwhile (two
+        creates racing must not have the second silently replace the first)."""
         # Round-trip through from_dict so a profile built in code obeys the
         # same rules as one read from disk.
         profile = AgentProfile.from_dict(asdict(profile))
-        self._items[profile.name] = profile
-        self.save()
+        with _WRITE_LOCK:
+            self._refresh()
+            if new and profile.name in self._items:
+                raise ValueError(f"an agent named {profile.name!r} already exists")
+            self._items[profile.name] = profile
+            self.save()
         return profile
 
     def remove(self, name: str) -> bool:
-        if self._items.pop(name, None) is None:
-            return False
-        self.save()
+        with _WRITE_LOCK:
+            self._refresh()
+            if self._items.pop(name, None) is None:
+                return False
+            self.save()
         return True
 
     def by_token(self, token: str | None) -> AgentProfile | None:
@@ -295,7 +321,8 @@ def create_agent(
             inherits=inherits,
             isolated=isolated,
             parent=fork or (inherit[0] if inherit else None),
-        )
+        ),
+        new=True,
     )
     copied = None
     if fork_profile is not None:

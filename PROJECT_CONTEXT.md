@@ -683,6 +683,45 @@ py -3.12 -m venv .venv
   (c) the full suite then exposed a **Windows read/replace race**: a route reading `record.json` while
   the worker `os.replace`s it raises `PermissionError` on one side — `CrewRunStore` retries both
   briefly. Also: the panel buttons now appear once auth passes, not when the chat stream opens.
+- **Hardening pass — the platform under untrusted input and concurrency (2026-10-10).** An audit of
+  what models, packs, specs and racing requests could do; each fix pinned by a test that fails on the
+  old code (`tests/test_hardening_platform.py`, 43, no CrewAI; plus 2 in `test_crew.py`, 6 in
+  `test_server_platform.py`). (1) **Memory writes bounded** (`store.save`): text ≤ 8000 chars, tags
+  ≤ 500, non-string text refused, and a non-finite importance (`NaN` clamped to *1.0* before — junk
+  meant "most important") falls back to the kind default; `set_importance(NaN)` is a no-op.
+  (2) **Procedure files** (`memory/_procedure.py`): skill/workflow header values are one line with
+  `---` defused, so a name like `x
+---
+name: evil` can no longer close the frontmatter and forge
+  fields or swallow the steps; names ≤ 120, bodies ≤ 20k. (3) **Packs** validated for the same
+  bounds (and ≤ 50k items) before anything is written. (4) **Crew specs**: a non-string `fork` or task
+  `agent` was a `TypeError` (HTTP 500) — now a 400; inherit capped at `MAX_INHERITS`. (5) **A plan's
+  `inherit` on a reused agent is run-scoped** (`build.run_scope`) — it used to `attach` permanently, so
+  model output could widen a registered (even isolated) agent's reads for good. (6) **Registry writes
+  merge**: `AgentStore.put/remove` re-read the file under a lock, so concurrent writers (routes on
+  worker threads, a crew's worker) don't drop each other's agents, and a racing create of one name
+  fails instead of replacing; a file found broken mid-session is kept aside before the next write.
+  (7) **Crew starts reserved before the first await** (`CrewService._pending`): `adopt` yields, so
+  two quick `run`s could start one crew twice or overshoot `AGENT_MAX_CREWS`. (8) **Crew ids reserved
+  atomically** (`CrewRunStore.reserve_id`, `mkdir`): two crews planned in the same millisecond shared
+  one record and one workspace. (9) `DELETE /crews/{id}` on a started crew is a 409 (it marked a live
+  crew `cancelled`). (10) `ensure_profiles` runs inside `execute_crew`'s recorded `try`: a fork parent
+  deleted after planning left the record `planned` forever. 862 on the 3.12 venv, 848 on 3.14.
+- **Scaling pass (2026-10-10).** From an architecture review that measured the hot paths. (1)
+  **Dedupe** (`consolidate._dedupe_group`): prefix-filter index for the Jaccard check (exact),
+  `_SemIndex` over stored embeddings (numpy; only missing vectors embedded), incremental via
+  `dedupe_marks` validated against the DB — 3,000 memories 19 s → 0.2 s, and a property test proves the
+  same merges as the old all-pairs loop. (2) **Skill/workflow search** caches parsed files by mtime +
+  size (`_procedure.cached_dir`) — 1,000 skills 12 s → 10 ms. (3) **Daemon** bulk routes off the
+  loop, serialized, `maybe` skips while one runs; constant-time token compare. (4) **Reinforcement
+  scoped** to the reader's write space (`recall(reinforce_space=)`, through store/service/both
+  transports). (5) **Events**: pruned to `EVENTS_KEEP`, mined per space, `for_task` off the index (a
+  turn's episode could miss its own events behind 500 newer ones), throttle by `max_id`. (6) Found
+  while writing the tests: **a connection per call was the real write cost** — per-thread cached
+  connections with WAL (`memory/_sqlite.py`): a logged tool call ~15 ms → <1 ms; the new test file
+  went 116 s → 8 s. Tests: `tests/test_scaling.py` (24; 13 fail on the old code) + 3 in
+  `test_memory_remote.py`. Still open from the review: session/crew subprocess weight, no global Max
+  budget guard, in-memory server state, sqlite-vec full mirror rebuild, cross-process registry lock.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

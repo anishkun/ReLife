@@ -45,7 +45,33 @@
   cmd switch (`del /s /q`) for every verb, but to `rm`/`cp`/`mv`/`tee`… in Git Bash it is the root
   of a drive. Slash switches are now only recognised for cmd built-ins.
 
+- Memory writes are bounded (text ≤ 8000 chars, tags ≤ 500) and a non-finite importance no longer
+  clamps to the maximum — external MCP agents and imported packs are untrusted writers. Skill and
+  workflow header values are kept to one line with `---` defused, so a crafted name can't forge
+  frontmatter fields or swallow the steps; packs are checked for the same bounds before import.
+- A crew plan's `inherit` on an agent that already exists now widens its reads for that run only; it
+  used to attach the spaces to the registered agent permanently (model output changing an agent's scope).
+
+### Performance
+- Memory scales: consolidation's duplicate check is indexed and incremental and reuses stored
+  embeddings (3,000 memories: 19 s → 0.2 s); skill/workflow search caches parsed files (1,000 skills:
+  12 s → 10 ms per search); memory DB connections are reused per thread with WAL (a logged tool call
+  ~15 ms → well under 1 ms); the memory daemon runs sweeps and space copy/import/export off its event
+  loop, so one sweep no longer stalls every agent.
+- The tool-event log is pruned (`RELIFE_EVENTS_KEEP`, default 20,000) and pattern mining reads each
+  space's own recent events, so a busy agent no longer hides a quiet one's patterns.
+
 ### Fixed
+- Reading memory no longer strengthens memory in another space: an agent recalling your default
+  memory (or an inherited space, or through `memory_context` over MCP) used to reinforce it.
+- A turn's episode now finds its own tool events however many other sessions logged since (it read
+  them from the newest 500 events overall).
+- Platform under concurrency: agent registry writes merge with the file instead of dropping another
+  writer's agent (and a racing create of one name fails); a crew can't be started twice by two quick
+  `run` requests or overshoot `RELIFE_AGENT_MAX_CREWS`; two crews planned in the same millisecond no
+  longer share one record and workspace; discarding a started crew is refused; a crew whose fork
+  parent was deleted after planning ends as an error instead of staying `planned`; a malformed crew
+  spec over HTTP is a 400, not a 500.
 - `mcp` is now a declared dependency (`>=1.28,<2`). It was only pulled in through the Agent SDK,
   whose range admits mcp 2.x — a base install got mcp 2.3 and the memory MCP server's API moved.
 - Crews (found by the live smoke): CrewAI warned "function callbacks cannot be serialized" on every
