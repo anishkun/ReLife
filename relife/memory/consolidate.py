@@ -13,6 +13,11 @@ runs, or via ``relife consolidate``) and does four deterministic things:
 4. **Synthesize** — turn a strongly-recurring tool sequence into a reusable
    ``workflow`` automatically, so next time the agent can replay it.
 
+Steps 2–4 run **per memory space** (see ``spaces.py``): two agents' memories
+are never merged into one another, and a recurring sequence is learned into the
+space of the agent that kept doing it — one agent's sweep can never delete or
+rewrite what another agent knows.
+
 Everything here is deterministic and LLM-free, so it is cheap, safe to run
 automatically, and fully unit-testable. (An optional LLM enrichment step to give
 synthesized workflows better names/generalization is intentionally deferred — it
@@ -29,6 +34,7 @@ from dataclasses import dataclass, field
 from .. import config
 from . import events, store, workflows
 from ._text import tokenize as _tokens
+from .spaces import DEFAULT_SPACE
 
 _STATE_PATH = config.DATA_DIR / "consolidate_state.json"
 
@@ -112,9 +118,17 @@ def _dedupe(report: ConsolidationReport) -> None:
     close (cosine >= ``config.DEDUP_SIM``), which also catches paraphrases that
     share few exact tokens. The survivor is reinforced; the duplicate is dropped.
     """
+    by_space: dict[str, list] = {}
+    for m in store.all_memories(include_archived=False):
+        by_space.setdefault(m.space, []).append(m)
+    for mems in by_space.values():
+        _dedupe_group(mems, report)
+
+
+def _dedupe_group(mems: list, report: ConsolidationReport) -> None:
+    """Dedupe one space's active memories (never across spaces)."""
     from . import embeddings
 
-    mems = [m for m in store.all_memories(include_archived=False)]
     use_sem = embeddings.available()
     vecs: dict[int, list[float] | None] = {}
     if use_sem:
@@ -147,9 +161,13 @@ def _dedupe(report: ConsolidationReport) -> None:
             report.merged += 1
 
 
-def _cluster_episodes(threshold: float = 0.6) -> list[list[object]]:
-    """Greedy clusters of episodes that describe the same kind of task."""
-    eps = [m for m in store.all_memories(include_archived=True) if m.kind == "episode"]
+def _cluster_episodes(threshold: float = 0.6, space: str = DEFAULT_SPACE) -> list[list[object]]:
+    """Greedy clusters of ``space``'s episodes that describe the same kind of task."""
+    eps = [
+        m
+        for m in store.all_memories(include_archived=True, spaces=(space,))
+        if m.kind == "episode"
+    ]
     clusters: list[list[object]] = []
     cluster_toks: list[set[str]] = []
     for m in eps:
@@ -255,16 +273,20 @@ def _contains(longer: tuple, sub: tuple) -> bool:
     return any(longer[i : i + len(sub)] == sub for i in range(len(longer) - len(sub) + 1))
 
 
-def _tool_ngrams(sizes=(2, 3, 4)) -> Counter:
-    """Count recurring *action* sequences across tasks (consecutive dups
-    collapsed). Works over action labels, not raw tool names, so e.g.
+def _tool_ngrams(sizes=(2, 3, 4), space: str = DEFAULT_SPACE, by_task=None) -> Counter:
+    """Count recurring *action* sequences across ``space``'s tasks (consecutive
+    dups collapsed). Works over action labels, not raw tool names, so e.g.
     git-clone→test→git-push is visible instead of collapsing into one "Bash"."""
     counts: Counter = Counter()
-    for task_id, evs in events.events_by_task().items():
+    if by_task is None:
+        by_task = events.events_by_task()
+    for task_id, evs in by_task.items():
         if not task_id:
             continue  # only sequences that belong to a known task
         seq: list[str] = []
         for e in evs:
+            if e.space != space:
+                continue
             label = _action_label(e.tool, e.brief)
             if not seq or seq[-1] != label:
                 seq.append(label)
@@ -275,8 +297,20 @@ def _tool_ngrams(sizes=(2, 3, 4)) -> Counter:
 
 
 def _detect_patterns(report: ConsolidationReport) -> None:
+    """Detect patterns space by space, learning each into its own space."""
+    by_task = events.events_by_task()
+    spaces = {m.space for m in store.all_memories(include_archived=True)}
+    spaces |= {e.space for evs in by_task.values() for e in evs}
+    for space in sorted(spaces or {DEFAULT_SPACE}):
+        _detect_patterns_in(space, by_task, report)
+
+
+def _detect_patterns_in(space: str, by_task, report: ConsolidationReport) -> None:
+    # Report lines name the space unless it's the default one (the main agent).
+    label = "" if space == DEFAULT_SPACE else f"[{space}] "
+
     # Recurring episodes → pattern memory.
-    for cluster in _cluster_episodes():
+    for cluster in _cluster_episodes(space=space):
         if len(cluster) >= config.RECUR_THRESHOLD:
             common = sorted(set.intersection(*[_tokens(m.text) for m in cluster]))[:8]
             if not common:
@@ -285,11 +319,11 @@ def _detect_patterns(report: ConsolidationReport) -> None:
                 f"Recurring task pattern (seen {len(cluster)}x): "
                 f"{' '.join(common)}"
             )
-            store.save(desc, kind="pattern", tags=",".join(common), importance=0.7)
-            report.patterns.append(desc)
+            store.save(desc, kind="pattern", tags=",".join(common), importance=0.7, space=space)
+            report.patterns.append(label + desc)
 
     # Recurring tool sequences → pattern memory + a synthesized workflow.
-    ngrams = _tool_ngrams()
+    ngrams = _tool_ngrams(space=space, by_task=by_task)
     accepted: list[tuple[str, ...]] = []
     # Longest first so a full sequence wins over its sub-sequences.
     for seq, n in sorted(ngrams.items(), key=lambda x: (-len(x[0]), -x[1])):
@@ -307,9 +341,9 @@ def _detect_patterns(report: ConsolidationReport) -> None:
         shorts = [_short_tool(t) for t in seq]
         name = "auto-" + "-".join(shorts).lower()
         desc = f"Recurring tool sequence (seen {n}x): {' → '.join(shorts)}"
-        store.save(desc, kind="pattern", tags=",".join(shorts), importance=0.7)
-        report.patterns.append(desc)
-        if workflows.read_workflow(name) is None:
+        store.save(desc, kind="pattern", tags=",".join(shorts), importance=0.7, space=space)
+        report.patterns.append(label + desc)
+        if workflows.read_workflow(name, space) is None:
             steps = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(seq))
             workflows.write_workflow(
                 name=name,
@@ -320,8 +354,9 @@ def _detect_patterns(report: ConsolidationReport) -> None:
                 ),
                 steps=steps,
                 trigger=",".join(shorts),
+                space=space,
             )
-            report.workflows_created.append(name)
+            report.workflows_created.append(label + name)
 
 
 def run_consolidation(now: float | None = None) -> ConsolidationReport:

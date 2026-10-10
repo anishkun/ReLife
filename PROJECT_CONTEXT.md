@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-07-04.
+> Last updated: 2026-10-10.
 
 ## 1. Vision
 
@@ -13,35 +13,55 @@ measurably better at recurring tasks.
 - **v1 (built):** terminal agent that builds projects, pushes to git, drives a browser —
   autonomous for code/git, asks approval for outward actions. Memory of facts + reusable
   skills.
-- **Future:** complete assigned work items, reply to email/messages, plan the calendar;
-  an always-on daemon + UI.
+- **Since v1 (built, released as 1.0.0 on 2026-10-08):** cognitive memory (decay,
+  consolidation, opt-in "dream"), orchestrated resumable builds, an always-on server +
+  web console with schedules and run records, GitHub work items (`relife work`, work
+  schedules), Gmail/Calendar/Drive via the claude.ai connectors with narrow
+  pre-approvals, `relife doctor`.
+- **Platform pass (built 2026-10-10, unreleased):** agents with their own memory spaces,
+  memory handoff (inherit/fork/promote/packs), ReLife memory over MCP for any LLM, and
+  `relife crew` (CrewAI plans a team, ReLife staffs it).
+- **Platform in the server (built 2026-10-10, unreleased):** `/agents` `/spaces` `/crews`
+  routes, crews run under `relife serve` with members' approvals in the browser, crew
+  schedules, Agents + Crews panels in the web console.
+- **Next:** ReLife-gated machine tools for non-Claude agents; hosting (Managed Agents) later.
 
 ## 2. Locked decisions (with rationale)
 
 | Area | Choice | Why |
 |---|---|---|
-| Foundation | **Claude Agent SDK** (Python, `claude-agent-sdk` v0.2.105) | Same engine as Claude Code: inherits the production agent loop, native MCP, hooks, permissions. The model is the same across any foundation, so effort goes into memory (the real edge), not plumbing. |
+| Foundation | **Claude Agent SDK** (Python, `claude-agent-sdk` ≥ 0.2.105) | Same engine as Claude Code: inherits the production agent loop, native MCP, hooks, permissions. The model is the same across any foundation, so effort goes into memory (the real edge), not plumbing. |
 | Language | **Python** (≥3.11; dev machine has 3.14) | Best ecosystem for the memory/embeddings side. |
 | Model | **`claude-opus-4-8`**, effort `high` | Strong agentic work. |
 | **Auth / billing** | **Claude Code Max subscription** — NOT a metered API key | User explicitly does not want to buy API tokens. The SDK drives the logged-in `claude` CLI, so it uses the subscription. Verified: `ANTHROPIC_API_KEY` unset, queries still succeed. **Caveat:** agent runs consume the same Max usage limits as interactive Claude Code (we hit the limit once mid-build). |
 | Memory | **A + B: retrieval (facts/episodes) + procedural skills.** No fine-tuning. | Retrieval shrinks re-derivation; skills replace re-planning → improvement without training. |
-| Interface | **Terminal CLI** now; daemon + UI later | |
-| Security | Code + git push **autonomous**; outward actions (mail/messages/etc.) **require approval** | User's stated autonomy model. |
+| Interface | **Terminal CLI** + an always-on local server and web console (`relife serve`) | CLI first; the server came once the core was proven. |
+| Security | Code + git push **autonomous**; outward actions (mail/messages/etc.) **require approval** | User's stated autonomy model. Narrow per-schedule pre-approvals are the only exception. |
+| Other LLMs (2026-10-10) | **Any provider, keys optional** — via CrewAI/LiteLLM, keys read from the env; Claude always via Max (`ClaudeMaxLLM`) | ReLife never stores or requires a key. |
+| Memory handoff (2026-10-10) | **Own space + inherit read-only**; fork, promote and packs on top | An agent can never write the user's memory; trusting it is an explicit `promote`. |
+| Crews' Python (2026-10-10) | **Python 3.12 `.venv`** for `[crewai]` | CrewAI 1.15 requires `<3.14`; ReLife's core stays 3.11–3.14. |
 
 ## 3. Architecture
 
 ```
-relife (CLI, Typer)
+relife (CLI, Typer)  ·  relife serve (FastAPI + web console, schedules)
   └─ ClaudeSDKClient (streaming)  ── Claude Opus 4.8, Claude Code preset + ReLife persona
        ├─ built-in tools: Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebFetch/WebSearch
-       ├─ can_use_tool  → permission policy (auto-allow code/git, ask for outward)
-       ├─ UserPromptSubmit hook → auto-inject recalled memories + skills
+       ├─ can_use_tool  → permission policy (auto-allow code/git, ask for outward; grants)
+       ├─ hooks: UserPromptSubmit (inject recalled memory + skills + workflows),
+       │         PostToolUse (journal), Stop (episode)
        └─ MCP servers:
             ├─ browser        (Playwright, npx @playwright/mcp)  → mcp__browser__*
-            └─ relife_memory  (in-process SDK MCP server)        → mcp__relife_memory__*
-                 ├─ memory_save / memory_recall   (facts/preferences/episodes)
-                 └─ skill_write / skill_find       (reusable procedures)
-GitHub: via `gh` CLI (build → commit → gh repo create → push)
+            ├─ relife_memory  (in-process SDK MCP server)        → mcp__relife_memory__*
+            │    memory_save/recall/forget, skill_write/find, workflow_save/find,
+            │    memory_consolidate, memory_dream
+            └─ claude.ai connectors (Gmail / Calendar / Drive, from the account)
+memory: MemoryClient seam → Local (default) | Http daemon (RELIFE_MEMORY_URL);
+        spaces per agent (ScopedMemoryClient); also served to ANY MCP client:
+        `relife mcp --agent NAME` (stdio) and /mcp on the daemon (agent token)
+crews:  `relife crew` → CrewAI Crew of ReLifeAgent (a ReLife turn per task) +
+        CrewAI agents on other models (ReLife memory, no machine tools)
+GitHub: via `gh` CLI (build → commit → gh repo create → push; `relife work` → PR)
 ```
 
 **Why memory is an MCP server (even in-process):** the agent-facing contract stays identical
@@ -62,8 +82,9 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 360 passing (`python -m pytest tests/`; later phases below added the daemon, server,
-scheduler, run-outcome and doctor suites). The original set covers permission classify, store
+**Tests:** ~810 passing — 800 on Python 3.14 (the CrewAI modules skip), 811 in the 3.12 `.venv`
+with `[crewai]` (`python -m pytest tests/`; later phases below added the daemon, server,
+scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP and crew suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -100,21 +121,30 @@ session limit hit), but `session_id` is persisted for it.
 ## 5. File map (`D:\ReLife`)
 
 ```
-pyproject.toml              # deps: claude-agent-sdk, typer, rich
+pyproject.toml              # deps: claude-agent-sdk, typer, rich; extras embeddings/vector/daemon/server/crewai
 PROJECT_CONTEXT.md          # this file
-README.md
+README.md / CHANGELOG.md / RELEASE_TESTING.md / CLAUDE.md
+HOW_IT_WORKS.md             # plain-English guide;  MODULE_DEEP_DIVE.md — architecture + reasoning (M1–M16)
 relife/
-  cli.py                    # Typer: `relife do`, `relife chat`, `relife build` (--workspace)
-  agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming)
-  config.py                 # MODEL, EFFORT, paths, agent_env() (gh PATH), default_mcp_servers()
-  permissions.py            # classify() + make_permission_callback() (can_use_tool); connector verb policy
+  cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */mcp/crew/crews
+  __main__.py               # `python -m relife` (what MCP client configs launch)
+  agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens
+  agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming), to_event
+  config.py                 # MODEL, EFFORT, paths (RELIFE_HOME), agent_env() (gh PATH), default_mcp_servers()
+  permissions.py            # classify() + callbacks (TTY / UI); gh + connector verb policy; schedule grants
+  workitems.py              # `relife work`: GitHub issue plumbing (parse/list/fetch/checkout/branch/prompt)
   doctor.py                 # `relife doctor`: pure run_checks() over injected Probes
-  hooks.py                  # UserPromptSubmit recall hook (memory + skills)
+  hooks.py                  # recall (UserPromptSubmit), journal (PostToolUse), episode (Stop); per-client factory
   prompts/system.md         # persona + safety + memory/skill instructions
+  web/index.html            # self-contained web console served by `relife serve`
   memory/                   # cognitive memory: relevance rises w/ use, fades when idle
     cognitive.py            # pure ACT-R-style activation/fused_score/should_archive/should_hard_delete
     store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay
     vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested)
+    spaces.py               # memory spaces: names, MemoryScope(read, write, source), per-space dirs
+    tools.py                # the memory tools, defined once (ToolSpec) for every transport
+    context.py              # the recalled-context block (recall hook + memory_context tool)
+    mcp_server.py           # ReLife memory over MCP for any agent: stdio + the daemon's /mcp
     service.py              # MemoryService — in-process facade over MemoryStore
     client.py               # MemoryClient seam; default_client() picks Local (default) or Http by RELIFE_MEMORY_URL
     remote/                 # opt-in out-of-process daemon ([daemon] extra): wire.py, daemon.py (FastAPI), http_client.py
@@ -126,22 +156,30 @@ relife/
     rem.py                  # opt-in "dream" pass (`relife dream`): LLM adversarial critic; prunes/reweights, reversibly
     server.py               # MCP server (tools route through default_client()): memory/skill/workflow tools
     _text.py                # shared tokenizer w/ stopwords
+  crew/                     # `relife crew` ([crewai] extra, Python <= 3.13)
+    spec.py / planner.py    # pure: validated CrewSpec; Claude plans it (one tool-less call)
+    agent.py                # ReLifeAgent(BaseAgentAdapter): a crew member = a fresh ReLife turn
+    llm.py                  # ClaudeMaxLLM(BaseLLM): Claude via the CLI for CrewAI (no API key)
+    native.py / memory_tools.py  # CrewAI agents on other models + ReLife memory as CrewAI tools
+    build.py / runner.py / record.py  # profiles+handoff → Crew → kickoff → data/crews/<id>/
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
     server.py               # relife_build MCP server (plan_set/milestone_update/status)
-  server/
-    session.py              # AgentSession (busy flag) / ApprovalBroker / SessionManager
-    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
-    security.py             # pure auth/CSRF/bind/workspace-confinement policy
-    schedules.py            # Schedule record, spec parsing, next_run(), JSON ScheduleStore
-    scheduler.py            # lifespan tick loop: fire due schedules into sessions + record outcomes
-    runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
     agents.py               # `builder` subagent definition (Task-delegated milestones)
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
-data/                       # gitignored runtime: relife.db, skills/, builds/, logs
+  server/
+    session.py              # AgentSession (busy flag, per-turn grants) / ApprovalBroker / SessionManager
+    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
+    security.py             # pure auth/CSRF/bind/DNS-rebinding/workspace-confinement policy
+    schedules.py            # Schedule record (grants, work), spec parsing, next_run(), JSON ScheduleStore
+    scheduler.py            # lifespan tick loop: fire due schedules (incl. work schedules) + record outcomes
+    runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
+data/                       # gitignored runtime: relife.db, skills/, workflows/, spaces/, agents.json,
+                            #   builds/, crews/, runs/, schedules.json
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 252 tests (248 deterministic + 4 semantic, embeddings forced off)
+tests/                      # ~800 tests (deterministic + 4 semantic, embeddings forced off)
+.venv/                      # gitignored Python 3.12 env for `[crewai]` (CrewAI needs < 3.14)
 ```
 
 ## 6. Setup / run
@@ -150,10 +188,16 @@ Prereqs: Python ≥3.11, Node.js (npx for browser MCP), logged-in `claude` CLI (
 `gh` authenticated.
 
 ```sh
-pip install -e .
+pip install -e .                  # extras: ".[embeddings]", ".[vector]", ".[daemon]", ".[server]"
+relife doctor                     # what's missing, with the fix for each
 relife do "scaffold a Python CLI that prints the weather for a city"
 relife chat
 # --workspace PATH chooses the dir the agent works in (default ./workspace)
+
+# crews (CrewAI needs Python <= 3.13):
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -e ".[crewai]"
+.venv\Scripts\relife crew --plan-only "<task>"
 ```
 
 ## 7. Non-obvious gotchas (learned the hard way)
@@ -169,8 +213,9 @@ relife chat
 - **Max session limits.** Heavy multi-step agent runs can hit the subscription limit
   ("You've hit your session limit · resets …"). Prefer cheap/deterministic verification;
   don't re-burn budget hammering live runs.
-- **Inherited claude.ai MCP connectors.** The subscription surfaces Gmail/Calendar/Drive MCP
-  servers (status `needs-auth`). Useful later; our policy gates them (not in trusted prefixes).
+- **Inherited claude.ai MCP connectors.** The subscription attaches Gmail/Calendar/Drive MCP
+  servers to every session (`setting_sources=None` doesn't exclude them). Linked in-session
+  on first use; gated by the verb-based connector policy (see MVP pass 2 and post-1.0 below).
 - **git author identity.** This machine's *global* git config is `tezoo2002@live.com` /
   "ReLife" (the system email) — so commits ReLife makes are authored as that unless changed.
   See open items.
@@ -544,6 +589,100 @@ relife chat
   `rm -rf /d` was auto-allowed (`_FLAG` read `/d` as a cmd switch for every verb; in Git Bash it is
   drive D:) — fixed, slash switches only for cmd built-ins; plus a false ask: Git Bash `/d/…` paths
   inside the workspace now translate (`_msys_to_windows`, `Bash` tool on Windows only).
+- **Platform pass — agents, memory handoff, memory for any LLM, CrewAI crews — ✅ DONE (2026-10-10).**
+  The user asked for ReLife to become a platform: CrewAI spins up ReLife agents for a task, memory
+  can be handed from old agents to new ones, and other LLMs connect as agents with memory attached.
+  Decisions (asked, all the recommended options): other models via any provider with keys optional
+  (Claude stays on Max — `ClaudeMaxLLM`, never an API key); handoff default = own space + inherit
+  read-only, with fork / promote / packs; this pass = foundation + MCP + CrewAI CLI (server/UI next);
+  crews run from a Python 3.12 `.venv` because CrewAI 1.15 requires `<3.14`.
+  (1) **Memory spaces** (store schema v3): every memory/event has a `space` (+ `source` provenance);
+  skills/workflows per space; recall, save-dedupe, doc-freq, vector search and consolidation are all
+  space-scoped — consolidation never merges or learns across spaces. Found + fixed on the way: a
+  fresh DB stamped the *current* schema version before later steps ran (now stamps v2, then migrates).
+  (2) **Agents** (`relife/agents.py`, `data/agents.json`): a profile resolves to a `MemoryScope` —
+  writes only its own space (never `default`), reads own + inherited (transitive) + `default` unless
+  `--isolated`. `ScopedMemoryClient` enforces it: no space arguments exist, admin ops and `dream`
+  refuse. Handoff: inherit (live, read-only), fork (snapshot copy, strength + provenance kept),
+  promote (the explicit path into the user's memory), export/import packs (validated, `import:<space>`).
+  (3) **Memory over MCP**: tools defined once (`memory/tools.py`); the in-process SDK server is
+  unchanged for Claude; a standalone server (`memory/mcp_server.py`) serves the external set (no
+  consolidate/dream, plus `memory_context`) over stdio (`relife mcp --agent NAME`) and streamable HTTP
+  at `/mcp` on the memory daemon (agent bearer token, re-read per request; DNS-rebinding protection).
+  Real-stdio smoke on Windows found a **deadlock**: with embeddings on, the first `tools/call` hung
+  (initialize/list answered) because fastembed/onnxruntime was constructed on a worker thread while the
+  stdio reader blocked on stdin — fixed by warming the model before serving (regression test pins the
+  order; the smoke is in RELEASE_TESTING).
+  (4) **Crews** (`relife/crew/`): planner → validated `CrewSpec` (caps, backward-only task refs, known
+  lineage; one retry, then a single-agent fallback) → record → shown + confirmed → profiles created
+  with the plan's inherit/fork → `Crew.kickoff()`. ReLife members are `ReLifeAgent(BaseAgentAdapter)`
+  (each task a fresh ReLife turn in `<workspace>/crews/<id>/`, ReLife permissions, scoped memory; CrewAI
+  tools exposed as `crew_tools`, outside the trusted prefix); other-model members are CrewAI agents with
+  ReLife memory tools and the recall block, and no machine-touching tools. CrewAI memory/planning/
+  telemetry off. Two CrewAI 1.15.27 contract surprises, both from reading the pinned source: all of
+  `execute_task/aexecute_task/create_agent_executor/get_delegation_tools/get_platform_tools/get_mcp_tools`
+  are abstract (its own OpenAI adapter predates that), and a crew member must expose
+  `function_calling_llm`, `step_callback` and `last_messages`.
+  Tests: 790 on 3.14 (crew module skips), 797 on the 3.12 venv with `[crewai]` — including a real
+  `Crew.kickoff()` with a ReLife agent and a CrewAI agent on `ClaudeMaxLLM`, zero model calls. CI's
+  `full` job adds `[crewai]`. Smokes (no budget): stdio MCP via the SDK's own client on Windows;
+  `relife crew --spec crew.yaml --plan-only` + `relife crews ID`; doctor on both interpreters.
+  **Live crew smokes (2026-10-10, scratch `RELIFE_HOME`, 3.12 venv) — ✅ PASSED.** (1) `relife crew
+  --plan-only` on a "slugify module + tests + edge-case review" task: valid plan first try (a ReLife
+  `python-dev` + a `claude-max` `code-reviewer`, review ← implement), 18 s, $0.26. (2) That plan as
+  `--spec`, with `inherit: [python-dev]` added to the reviewer, confirmed via the real `[y/N]` prompt:
+  agents created with the lineage; the builder wrote `slugify.py` + `test_slugify.py` in
+  `workspace/crews/<id>/` (14 tests pass); the reviewer got the output as context, called
+  `memory_context`, and wrote a substantive review (found real bugs: `ß/ø/ł` dropped, em-dash words
+  merged); `relife crews <id>` showed both outcomes; status `done`, $0.47. Isolation held: the builder's
+  events + episode in `python-dev`, the reviewer's journaled step in `code-reviewer`, `default`
+  untouched. Fixed from what it surfaced: CrewAI's "function callbacks cannot be serialized" warning on
+  every run (our step callback is necessarily a closure; ReLife never checkpoints — silenced at agent
+  construction only), and crew episodes all reading "Task: You are working on a crew as …" (the crew
+  prompt now leads with the task, which is what the episode keeps).
+- **Platform pass 2 — the platform in the server (2026-10-10, branch `feat/platform-server`).**
+  (1) **Routes:** `GET /spaces`; `GET/POST /agents`, `GET/DELETE /agents/{name}`,
+  `POST /agents/{name}/attach|detach|promote` (the `relife agent` operations; registry re-read per
+  request, memory work off the loop; token minting stays CLI-only); `GET/POST /crews` (plan a task —
+  one model call — or record a spec; over HTTP a spec may only name `RELIFE_CREW_LLMS` + `claude-max`),
+  `GET /crews/{id}`, `POST /crews/{id}/run|stop`, `DELETE /crews/{id}` (discard a plan). Same auth +
+  same-origin guard as every route. (2) **Crews hosted like sessions** (`server/crews.py`): a
+  `CrewHost` publishes through the `EventStream` base now shared with `AgentSession`, and is adopted
+  by the `SessionManager` — so `/sessions/{id}/events`, the approval route, the UI's watch and the
+  scheduler's recorder all work on a crew unchanged, and a crew counts against the session ceiling,
+  reaper (never reaped while running) and shutdown. `kickoff()` runs on a daemon thread; events cross
+  back with `run_coroutine_threadsafe`; a member's `can_use_tool` is the ordinary
+  `make_approval_callback` over a `LoopBroker` that hops each ask onto the server loop's broker — so an
+  outward action is an approval card, and unattended it times out to deny. Members' `result`/`error`
+  become `member_done`/`member_error` (one `result` per crew). Stop is cooperative: pending approvals
+  denied at once, no new member task starts. `AGENT_MAX_CREWS` (default 1). `run_crew` split into
+  `prepare_crew` + `execute_crew` for this. (3) **Crew schedules:** a schedule may carry a validated
+  crew spec (`crew`); each firing re-validates it against the live registry (no model call), hosts it
+  and records the run like any other; no grants on a crew schedule, never both crew and work.
+  (4) **UI:** Agents panel (list with memory counts + what each reads, add with inherit/fork/isolated,
+  attach/detach chips, promote, delete) and Crews panel (plan → review → run/discard, watch, stop, run
+  again, per-task outcomes, schedule it); crew events name the member; leaving a crew's stream with
+  "new session" never stops it. Found on the way: `asyncio.to_thread` copies context variables, so
+  `anyio.run` inside the worker believed it was already in the loop ("Already running asyncio in this
+  thread") — the planner now runs via `run_in_executor`, the crew on a plain thread; and a fast second
+  `run` could read the record as still `planned` before the worker saved `running` — the live host is
+  checked first. Tests: 14 new (`tests/test_server_platform.py`, 4 need CrewAI): 811 on the 3.12 venv,
+  800 on 3.14 (full suite 10× in a row clean after the race fix below).
+  **Live check from the browser (2026-10-10, scratch `RELIFE_HOME`, 3.12 venv) — ✅ PASSED** (~$1.15 in all).
+  Planned in the crews panel (valid first try, a ReLife `python-builder` + a `claude-max` `code-reviewer`,
+  $0.25); run: the console switched to the crew's stream, events labelled per member; the builder wrote
+  greet.py + tests (pass) and its `curl -X POST http://127.0.0.1:8612/health` came up as an approval
+  card naming the member — approved, it ran (405, as expected); the reviewer called `memory_context` and
+  reviewed the builder's output; status `done`, $0.65. Memory: the builder's episode in its own space,
+  `default` untouched. Found and fixed: (a) **stop didn't stop a CrewAI member** — it only refused the
+  next *ReLife* turn, so the reviewer still ran and the crew ended `done`; the crew's `task_callback`
+  now raises once stop is set (`build_crew(should_stop=)`), so no task of any kind starts after the
+  one in flight — re-checked live: card denied, builder finished, reviewer never called, record
+  `error: crew stopped by the user` with only the builder's task; (b) the crew card read `planned`
+  (offering *run*) until the worker saved `running` — the live host now overrides the status;
+  (c) the full suite then exposed a **Windows read/replace race**: a route reading `record.json` while
+  the worker `os.replace`s it raises `PermissionError` on one side — `CrewRunStore` retries both
+  briefly. Also: the panel buttons now appear once auth passes, not when the chat stream opens.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
@@ -552,4 +691,4 @@ relife chat
 
 - GitHub account: **`anishkun`** (= anish03anish@gmail.com). `gh` authed, `repo` scope, HTTPS.
 - Approved plan lives at `C:\Users\HP\.claude\plans\witty-enchanting-fountain.md`.
-- Memory about auth constraint: `…/.claude/projects/D--ReLife/memory/auth-via-max-subscription.md`.
+- Memory about auth constraint: `…/.claude/projects/D--relife/memory/auth-via-max-subscription.md`.

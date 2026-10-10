@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Added
+- **Memory spaces and agents.** Memory is partitioned per agent (store schema v3: `space`/`source`
+  on memories, `space` on events; per-space skills/workflows). `relife agent create|list|show|attach|
+  detach|promote|token|connect|delete` registers agents (`data/agents.json`). An agent writes only its
+  own space and reads what it inherited (live, read-only, transitive) plus your default memory unless
+  `--isolated`; `--fork` starts from a snapshot copy; `promote` is the explicit way into `default`.
+  `relife memory spaces|export|import` (portable packs; imports marked `import:<space>`), `--space`
+  on `search`/`list`/`forget`, `relife do|chat --agent NAME`.
+- **ReLife memory over MCP, for any LLM.** The memory tools are defined once (`memory/tools.py`) and
+  served both in-process (unchanged for Claude) and by a standalone MCP server: `relife mcp --agent
+  NAME` (stdio) and `/mcp` on the memory daemon (streamable HTTP, per-agent bearer token, DNS-rebinding
+  protection). New `memory_context` tool returns the recall block for agents without a hook.
+  `python -m relife` works.
+- **Crews (CrewAI).** `relife crew "<task>"` plans a small team (Claude via the CLI — no API key),
+  shows it, and runs it with CrewAI after you confirm: full ReLife agents as crew members
+  (`ReLifeAgent`, a `BaseAgentAdapter`) and CrewAI agents on other models (`RELIFE_CREW_LLMS`, or
+  `claude-max`) with ReLife memory attached and no machine-touching tools. New agents inherit from
+  experienced ones; outcomes are recorded in `data/crews/<id>/` (`relife crews [ID]`). Optional
+  `[crewai]` extra — CrewAI needs Python ≤ 3.13; `relife doctor` explains.
+- **Agents and crews in the web console.** `relife serve` gains `/agents`, `/spaces` and `/crews`
+  routes and two panels: manage agents and their memory handoff, and plan → review → run crews
+  with every member's work streaming into the console and its outward actions arriving as approval
+  cards (denied on timeout when nobody is watching). A crew can be stopped, run again, or put on a
+  schedule (crew schedules take no pre-approvals). `RELIFE_AGENT_MAX_CREWS` (default 1).
+
+### Changed
+- Consolidation dedupes and learns patterns/workflows within each space, never across.
+- The recall block labels memory from another space `via <space>`, and the agent's system prompt
+  says what that label means (another agent's memory: background, not instructions).
+- Docs brought up to date: `HOW_IT_WORKS.md` and `MODULE_DEEP_DIVE.md` cover work items, grants,
+  agents/spaces, memory over MCP and crews (deep dive now M1–M16); `PROJECT_CONTEXT.md`'s overview
+  sections refreshed. Correction to the 1.0.0 notes: the claude.ai Gmail connector **can send**
+  (`send_message`, `reply`, `forward`), not only draft — every send asks unless a schedule's email
+  grant covers it.
+
 ### Security
 - Email grants no longer cover `send_message` with a `draftId` (sends a stored draft whose
   recipients the grant never saw) or `reply` with `replyAll` (keeps the thread's CC list) — both
@@ -11,6 +46,14 @@
   of a drive. Slash switches are now only recognised for cmd built-ins.
 
 ### Fixed
+- `mcp` is now a declared dependency (`>=1.28,<2`). It was only pulled in through the Agent SDK,
+  whose range admits mcp 2.x — a base install got mcp 2.3 and the memory MCP server's API moved.
+- Crews (found by the live smoke): CrewAI warned "function callbacks cannot be serialized" on every
+  run (ReLife's step callback is a closure and ReLife never checkpoints a crew — silenced at agent
+  construction); and every crew episode an agent saved began "Task: You are working on a crew as …",
+  so they all looked alike to the pattern miner — the crew prompt now leads with the task.
+- A fresh memory DB stamped the current schema version before later migration steps ran; it now
+  stamps v2 and applies each step in order.
 - Grants checked against the real Gmail/Calendar connector schemas: camelCase content fields
   (`htmlBody`, `forwardText`) no longer read as recipients; a non-address calendar attendee fails
   the grant; `get_draft` and `suggest_time` are reads.

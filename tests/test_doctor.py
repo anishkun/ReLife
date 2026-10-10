@@ -283,3 +283,24 @@ def test_connector_needing_auth_says_to_link_in_session_not_re_enable():
     c = by_name(run_checks(p))["connector google calendar"]
     assert c.status == "warn" and "isn't linked" in c.detail
     assert "connect my calendar" in c.fix and "re-enable" not in c.fix
+
+
+# --- crews / agents ---------------------------------------------------------------
+def test_crews_check_explains_python_314():
+    c = by_name(run_checks(healthy(import_ok=lambda m: m != "crewai", python_version=(3, 14, 0))))["crews"]
+    assert c.status == "skip" and "3.14" in c.detail and "3.12" in c.fix
+    c = by_name(run_checks(healthy(import_ok=lambda m: m != "crewai")))["crews"]
+    assert c.status == "skip" and c.fix == 'pip install -e ".[crewai]"'
+    assert by_name(run_checks(healthy()))["crews"].status == "ok"
+
+
+def test_agents_check():
+    assert by_name(run_checks(healthy()))["agents"].status == "skip"
+    agents = [
+        {"name": "coder", "runtime": "relife", "has_token": False},
+        {"name": "cursor", "runtime": "external", "has_token": True},
+    ]
+    c = by_name(run_checks(healthy(agents=agents)))["agents"]
+    assert c.status == "ok" and "2 registered" in c.detail and "1 with an HTTP MCP token" in c.detail
+    c = by_name(run_checks(healthy(agents_problem="1 unreadable agent record(s) skipped")))["agents"]
+    assert c.status == "warn"

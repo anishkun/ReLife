@@ -42,6 +42,8 @@ DATA_DIR = PROJECT_ROOT / "data"          # gitignored: db + logs
 BUILDS_DIR = DATA_DIR / "builds"          # one subdir per orchestrated `relife build`
 SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
 WORKFLOWS_DIR = DATA_DIR / "workflows"    # one Markdown file per learned workflow
+AGENTS_PATH = DATA_DIR / "agents.json"    # agent registry (identity + memory scope per agent)
+CREWS_DIR = DATA_DIR / "crews"            # one subdir per `relife crew` run (plan + outcome)
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
 WEB_DIR = PACKAGE_DIR / "web"              # self-contained web UI served by `relife serve`
@@ -214,6 +216,9 @@ AGENT_MAX_SUBSCRIBERS = int(os.environ.get("RELIFE_AGENT_MAX_SUBSCRIBERS", "8"))
 AGENT_SCHEDULER = os.environ.get("RELIFE_AGENT_SCHEDULER", "1") != "0"
 AGENT_SCHEDULER_TICK = float(os.environ.get("RELIFE_AGENT_SCHEDULER_TICK", "30"))
 AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
+# Crews running at once inside `relife serve` (each member turn is a CLI
+# subprocess and spends Max budget; a crew is also one session slot).
+AGENT_MAX_CREWS = int(os.environ.get("RELIFE_AGENT_MAX_CREWS", "1"))
 # Floor on the interval form ("every 30m"): every run spends Max budget, so a
 # one-minute schedule is a mistake to refuse, not a wish to honour.
 AGENT_SCHEDULE_MIN_INTERVAL = float(os.environ.get("RELIFE_AGENT_SCHEDULE_MIN_INTERVAL", "300"))
@@ -231,6 +236,22 @@ AGENT_SCHEDULE_RUN_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SCHEDULE_RUN_TIM
 # me") before further matching actions fall back to asking. Bounds a runaway loop
 # — or an email that talks the agent into mailing you fifty times.
 AGENT_GRANT_MAX_USES = int(os.environ.get("RELIFE_AGENT_GRANT_MAX_USES", "3"))
+
+# Crews (`relife crew`, optional [crewai] extra). CrewAI plans a team and runs
+# it; each member is a full ReLife (Claude) agent or a CrewAI agent on another
+# model with ReLife memory attached. Every member spends budget (Max for Claude
+# members, the provider's for others), so a crew is small by construction.
+CREW_MAX_AGENTS = int(os.environ.get("RELIFE_CREW_MAX_AGENTS", "5"))
+CREW_MAX_TASKS = int(os.environ.get("RELIFE_CREW_MAX_TASKS", "8"))
+# Non-Claude models the planner may staff a crew with (comma-separated CrewAI /
+# LiteLLM model strings, e.g. "ollama/llama3.1,gpt-4.1"). Their keys, if any,
+# are read by CrewAI/LiteLLM from the environment — ReLife never stores them.
+# Empty: the planner uses only ReLife agents and Claude (via your Max login).
+CREW_LLMS = tuple(
+    m.strip() for m in os.environ.get("RELIFE_CREW_LLMS", "").split(",") if m.strip()
+)
+# The model string that means "Claude through the logged-in CLI" (no API key).
+CREW_CLAUDE_LLM = "claude-max"
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
@@ -277,13 +298,16 @@ def agent_env() -> dict[str, str]:
 
 
 # --- MCP servers -----------------------------------------------------------
-def default_mcp_servers() -> dict:
+def default_mcp_servers(memory_client=None) -> dict:
     """MCP servers attached to every run.
 
     'browser' = Microsoft's Playwright MCP (navigate/read/click/fill). Launched
     on demand via npx; first run downloads the package and a Chromium build.
     Tools surface to the agent as ``mcp__browser__*`` and are allowed by the
     permission policy (browsing is a core v1 capability).
+
+    ``memory_client`` binds the memory tools to one agent's scoped client (see
+    ``relife/agents.py``); omitted, they serve the main agent.
     """
     # Lazy import: server.py imports the SDK; keep config import-light.
     from .memory.server import memory_server
@@ -294,7 +318,7 @@ def default_mcp_servers() -> dict:
             "command": "npx",
             "args": ["-y", "@playwright/mcp@latest"],
         },
-        "relife_memory": memory_server(),
+        "relife_memory": memory_server(memory_client),
     }
 
 

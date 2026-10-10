@@ -50,6 +50,11 @@ class TurnQueueFull(Exception):
     """Raised when a session's inbound turn queue is saturated."""
 
 
+class SessionReadOnly(Exception):
+    """Raised when a turn is submitted to a session that takes none (a crew run
+    streams and asks for approvals like a chat, but its work is its plan)."""
+
+
 class ApprovalBroker:
     """Routes ask-case tool approvals to the UI and awaits the user's decision.
 
@@ -69,7 +74,9 @@ class ApprovalBroker:
         reason: str,
         *,
         timeout: float,
+        extra: dict[str, Any] | None = None,
     ) -> bool:
+        """``extra`` fields ride on both events (a crew names the member asking)."""
         approval_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[bool] = loop.create_future()
@@ -83,6 +90,7 @@ class ApprovalBroker:
                 # Roomier than the transcript hint: the card is where the user
                 # decides whether an email/event/etc. leaves the machine.
                 "brief": _tool_brief(tool_input, limit=400),
+                **(extra or {}),
             }
         )
         try:
@@ -96,6 +104,7 @@ class ApprovalBroker:
                 "type": "approval_resolved",
                 "approval_id": approval_id,
                 "approved": approved,
+                **(extra or {}),
             }
         )
         return approved
@@ -108,28 +117,94 @@ class ApprovalBroker:
         fut.set_result(approved)
         return True
 
+    def deny_all(self) -> int:
+        """Settle every pending approval as denied (a stopped run). Returns how many."""
+        n = 0
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_result(False)
+                n += 1
+        return n
 
-class AgentSession:
+
+class EventStream:
+    """The streaming half of a session: numbered events, a replay ring, bounded
+    SSE subscribers, and the activity clock the idle reaper reads. A chat
+    session and a crew run both publish through it, so the same SSE and
+    approval routes (and the UI's watch path) serve either."""
+
+    def __init__(self, session_id: str | None = None) -> None:
+        self.id = session_id or uuid.uuid4().hex
+        self._subscribers: set[asyncio.Queue[tuple[int, dict[str, Any]]]] = set()
+        self._ring: deque[tuple[int, dict[str, Any]]] = deque(maxlen=_RING_MAX)
+        self._seq = 0
+        self.last_active = time.monotonic()
+
+    def subscribe(
+        self, last_id: int | None = None
+    ) -> tuple[asyncio.Queue[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]]]:
+        """Register an SSE subscriber. Returns its live queue plus a backlog of
+        buffered events with id > ``last_id`` (for reconnect/replay).
+
+        Snapshot + registration happen with no ``await`` between them, so on the
+        single event loop no event can slip between the backlog and the queue.
+        """
+        if len(self._subscribers) >= config.AGENT_MAX_SUBSCRIBERS:
+            raise TooManySubscribers("too many event streams open for this session")
+        q: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue(maxsize=_SUB_QUEUE_MAX)
+        backlog = [(sid, ev) for sid, ev in self._ring if last_id is None or sid > last_id]
+        self._subscribers.add(q)
+        return q, backlog
+
+    def unsubscribe(self, q: asyncio.Queue[tuple[int, dict[str, Any]]]) -> None:
+        self._subscribers.discard(q)
+
+    async def _publish(self, ev: dict[str, Any]) -> None:
+        # Anything the agent emits is activity: a turn that streams for longer
+        # than the idle timeout with no browser attached must not be reaped
+        # out from under itself.
+        self.touch()
+        self._seq += 1
+        item = (self._seq, ev)
+        self._ring.append(item)
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(item)
+            except asyncio.QueueFull:
+                # Drop this subscriber's oldest event; the ring + Last-Event-ID
+                # replay is how a lagging client catches back up.
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - racy, harmless
+                    pass
+                q.put_nowait(item)
+
+    def touch(self) -> None:
+        """Mark the session active (defers idle reaping)."""
+        self.last_active = time.monotonic()
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
+
+
+class AgentSession(EventStream):
     """One long-lived agent conversation bound to a workspace."""
 
     def __init__(self, workspace: Path, *, session_id: str | None = None) -> None:
-        self.id = session_id or uuid.uuid4().hex
+        super().__init__(session_id)
         self.workspace = workspace
         # Each queued turn carries the grants that apply to it (a scheduled turn's
         # pre-authorizations; ``[]`` for anything typed).
         self._inbound: asyncio.Queue[tuple[str, list[dict[str, Any]]]] = asyncio.Queue(
             maxsize=config.AGENT_MAX_QUEUED_TURNS
         )
-        self._subscribers: set[asyncio.Queue[tuple[int, dict[str, Any]]]] = set()
-        self._ring: deque[tuple[int, dict[str, Any]]] = deque(maxlen=_RING_MAX)
-        self._seq = 0
         self._broker = ApprovalBroker(self._publish)
         self._client: ClaudeSDKClient | None = None
         self._worker: asyncio.Task[None] | None = None
         self._turn_active = False
         self._turn_grants: list[dict[str, Any]] = []
         self._grant_uses = 0
-        self.last_active = time.monotonic()
 
     # --- lifecycle ----------------------------------------------------------
     async def start(self) -> None:
@@ -196,53 +271,6 @@ class AgentSession:
             }
         )
         return grant
-
-    def subscribe(
-        self, last_id: int | None = None
-    ) -> tuple[asyncio.Queue[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]]]:
-        """Register an SSE subscriber. Returns its live queue plus a backlog of
-        buffered events with id > ``last_id`` (for reconnect/replay).
-
-        Snapshot + registration happen with no ``await`` between them, so on the
-        single event loop no event can slip between the backlog and the queue.
-        """
-        if len(self._subscribers) >= config.AGENT_MAX_SUBSCRIBERS:
-            raise TooManySubscribers("too many event streams open for this session")
-        q: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue(maxsize=_SUB_QUEUE_MAX)
-        backlog = [(sid, ev) for sid, ev in self._ring if last_id is None or sid > last_id]
-        self._subscribers.add(q)
-        return q, backlog
-
-    def unsubscribe(self, q: asyncio.Queue[tuple[int, dict[str, Any]]]) -> None:
-        self._subscribers.discard(q)
-
-    async def _publish(self, ev: dict[str, Any]) -> None:
-        # Anything the agent emits is activity: a turn that streams for longer
-        # than the idle timeout with no browser attached must not be reaped
-        # out from under itself.
-        self.touch()
-        self._seq += 1
-        item = (self._seq, ev)
-        self._ring.append(item)
-        for q in list(self._subscribers):
-            try:
-                q.put_nowait(item)
-            except asyncio.QueueFull:
-                # Drop this subscriber's oldest event; the ring + Last-Event-ID
-                # replay is how a lagging client catches back up.
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:  # pragma: no cover - racy, harmless
-                    pass
-                q.put_nowait(item)
-
-    def touch(self) -> None:
-        """Mark the session active (defers idle reaping)."""
-        self.last_active = time.monotonic()
-
-    @property
-    def subscriber_count(self) -> int:
-        return len(self._subscribers)
 
     @property
     def busy(self) -> bool:
@@ -323,11 +351,24 @@ class SessionManager:
                 f"at most {self.max_sessions} concurrent sessions "
                 "(close one, or raise RELIFE_AGENT_MAX_SESSIONS)"
             )
-        session = self._factory(workspace)
+        return await self.adopt(self._factory(workspace))
+
+    async def adopt(self, session: Any) -> Any:
+        """Start and host a session built elsewhere (a crew run), under the same
+        ceiling, reaper and shutdown as a chat session."""
+        await self.reap_idle()
+        if self.max_sessions and len(self._sessions) >= self.max_sessions:
+            raise SessionLimitReached(
+                f"at most {self.max_sessions} concurrent sessions "
+                "(close one, or raise RELIFE_AGENT_MAX_SESSIONS)"
+            )
         await session.start()
         self.touch(session)
         self._sessions[session.id] = session
         return session
+
+    def all(self) -> list[Any]:
+        return list(self._sessions.values())
 
     def get(self, session_id: str) -> AgentSession | None:
         return self._sessions.get(session_id)
@@ -351,12 +392,16 @@ class SessionManager:
 
         An open SSE connection counts as activity (the stream heartbeat touches
         the session), so a watching browser never has its agent reaped mid-run.
+        Nor is a running crew: closing its host can't stop the worker thread,
+        only orphan the run from its stream and approvals.
         """
         if not self.idle_timeout:
             return []
         stale = []
         for sid, session in self._sessions.items():
             if getattr(session, "subscriber_count", 0):
+                continue
+            if getattr(session, "kind", "") == "crew" and getattr(session, "busy", False):
                 continue
             last = getattr(session, "last_active", now)
             if now - last >= self.idle_timeout:

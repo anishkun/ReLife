@@ -5,6 +5,11 @@ description = "A personal agent that acts through MCP and learns over time."
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.2.105",
+    # Imported directly (relife/memory/mcp_server.py: the standalone memory MCP
+    # server). Declared, not left to the SDK's range (mcp>=1.23,<3): mcp 2.x is a
+    # restructured major and our server + tests are written against 1.x — which
+    # is also what CrewAI pins (mcp~=1.28.1).
+    "mcp>=1.28,<2",
     "typer>=0.12",
     "rich>=13.0",
 ]
@@ -39,6 +44,14 @@ daemon = [
 server = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
+]
+# Crews (`relife crew`): CrewAI plans a team for a task and ReLife staffs it —
+# ReLife agents (Claude, tools, memory) and CrewAI agents on other models with
+# ReLife memory attached. CrewAI doesn't support Python 3.14 yet: there this
+# extra installs nothing and `relife doctor` says to use a 3.12/3.13 venv.
+#   pip install -e ".[crewai]"
+crewai = [
+    "crewai>=1.15,<2; python_version < '3.14'",
 ]
 
 [project.scripts]

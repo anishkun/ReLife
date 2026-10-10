@@ -91,6 +91,9 @@ def test_v1_db_migrates_and_stamps(tmp_path):
 
     store_mod.MemoryStore(db).init_db()
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        # v1 → v2 → v3 in one pass: an unversioned store gets every later step.
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_mod.MemoryStore.SCHEMA_VERSION
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
         assert {"importance", "last_used_at", "use_count", "status", "embedding"} <= cols
+        assert {"space", "source"} <= cols
+        assert conn.execute("SELECT space FROM memories").fetchone()[0] == "default"

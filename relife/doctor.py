@@ -69,6 +69,9 @@ class Probes:
     schedules: list[dict] = field(default_factory=list)  # raw records from data/schedules.json
     schedules_problem: str | None = None  # the store couldn't fully read the file
     sidecar_exists: bool = False
+    # --- agents / crews (defaults keep older probe bundles valid) ---
+    agents: list[dict] = field(default_factory=list)  # public agent records
+    agents_problem: str | None = None  # the registry couldn't fully read agents.json
 
 
 # --- the real machine --------------------------------------------------------
@@ -134,6 +137,17 @@ def default_probes() -> Probes:
 
     schedule_records, schedule_problem = schedules()
 
+    def agents() -> tuple[list[dict], str | None]:
+        try:
+            from .agents import AgentStore
+
+            store = AgentStore(config.AGENTS_PATH)
+            return [a.public() for a in store.list()], store.problem
+        except Exception as e:  # noqa: BLE001
+            return [], f"could not load ({e})"
+
+    agent_records, agents_problem = agents()
+
     return Probes(
         which=shutil.which,
         run=run,
@@ -156,6 +170,8 @@ def default_probes() -> Probes:
         schedules=schedule_records,
         schedules_problem=schedule_problem,
         sidecar_exists=config.MEMORY_SIDECAR_PATH.exists(),
+        agents=agent_records,
+        agents_problem=agents_problem,
     )
 
 
@@ -299,6 +315,38 @@ def _check_extras(p: Probes) -> list[Check]:
                 )
             )
     return out
+
+
+def _check_crews(p: Probes) -> Check:
+    """`relife crew` needs CrewAI, which doesn't support Python 3.14 yet."""
+    if p.import_ok("crewai"):
+        return Check("crews", "ok", "CrewAI installed — `relife crew` is available")
+    if p.python_version[:2] >= (3, 14):
+        return Check(
+            "crews", "skip",
+            f"CrewAI needs Python ≤ 3.13 (this is {'.'.join(map(str, p.python_version))})",
+            r'py -3.12 -m venv .venv  then  .venv\Scripts\pip install -e ".[crewai]"',
+        )
+    return Check("crews", "skip", "CrewAI not installed — `relife crew` unavailable", 'pip install -e ".[crewai]"')
+
+
+def _check_agents(p: Probes) -> Check:
+    if p.agents_problem:
+        return Check(
+            "agents", "warn", f"agents.json: {p.agents_problem}",
+            "fix or remove the unreadable records; `relife agent list` shows what loaded",
+        )
+    if not p.agents:
+        return Check("agents", "skip", "none registered — only the main agent (default memory space)")
+    tokens = sum(1 for a in p.agents if a.get("has_token"))
+    kinds: dict[str, int] = {}
+    for a in p.agents:
+        kinds[a.get("runtime", "?")] = kinds.get(a.get("runtime", "?"), 0) + 1
+    mix = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+    return Check(
+        "agents", "ok",
+        f"{len(p.agents)} registered ({mix})" + (f" · {tokens} with an HTTP MCP token" if tokens else ""),
+    )
 
 
 def _check_model(p: Probes) -> Check:
@@ -501,6 +549,8 @@ def run_checks(p: Probes) -> list[Check]:
     checks.append(_check_data_dir(p))
     checks.append(_check_workspace_root(p))
     checks.extend(_check_extras(p))
+    checks.append(_check_crews(p))
+    checks.append(_check_agents(p))
     checks.append(_check_memory_daemon(p))
     enabled = sum(1 for s in p.schedules if s.get("enabled", True))
     checks.append(_check_agent_server(p, enabled))
