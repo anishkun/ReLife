@@ -7,7 +7,8 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
 
 - [ ] `python -m pytest tests -q` — Windows + Linux, Python 3.11/3.12/3.13, base install **and** all extras
 - [ ] `python -m ruff check relife tests scripts` — zero findings
-- [ ] package job: wheel contains `prompts/*.md`, `build/prompts/orchestrator.md`, `web/index.html`;
+- [ ] the `full` job includes `[crewai]` (3.11–3.13), so `tests/test_crew.py` runs a real `Crew.kickoff()`
+- [ ] package job: wheel contains `prompts/*.md`, `build/prompts/orchestrator.md`, `crew/prompts/planner.md`, `web/index.html`;
       the suite passes against the **installed wheel**; `config.DATA_DIR` is not in `site-packages`
 - [ ] `pip-audit` clean
 - [ ] `python scripts/bench_recall.py` — recall over 10k memories stays bounded (≈25 ms avg)
@@ -22,6 +23,11 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
       `curl -X POST http://127.0.0.1:8600/sessions -H "Host: evil.example:8600" -H "Origin: http://evil.example:8600"` → 403
 - [ ] `relife serve --host 0.0.0.0` without `RELIFE_AGENT_TOKEN` refuses to start (exit 2)
 - [ ] `tests/test_permissions_corpus.py` passes; add any new bypass you think of to `SHOULD_ASK`
+- [ ] memory over MCP: `relife memory serve`, then `POST /mcp` with no token, a wrong token, and a
+      revoked token → 401; a foreign `Host` → refused; the right agent token → `tools/list` lists no
+      `memory_dream`/`memory_consolidate`, and a save lands in that agent's space only
+- [ ] `relife mcp` without `--agent`, or with an unknown agent, exits non-zero (never falls back to the
+      default space)
 
 ## 3. Robustness (local, free)
 
@@ -31,7 +37,11 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
 - [ ] create 3 sessions → 3 subprocess trees; `DELETE` one, let the idle reaper take the rest, hard-kill
       the server with sessions open → `claude`/`node` process count returns to baseline every time
 - [ ] run the current code against a **copy** of a real `data/` dir (`RELIFE_HOME=<copy>`): `memory stats`,
-      `memory search`, `consolidate`, `doctor` all clean
+      `memory search`, `consolidate`, `doctor` all clean (a pre-spaces store upgrades to schema v3; every
+      existing memory reads as space `default`)
+- [ ] stdio MCP smoke on Windows **with embeddings on**: drive `python -m relife mcp --agent X` with the
+      `mcp` SDK's `stdio_client` → initialize, `tools/list`, `memory_save`, `memory_recall` all answer
+      (the first tool call once deadlocked against the stdin reader until the model was warmed first)
 
 ## 4. UI (browser, ~$0.40)
 
@@ -55,6 +65,10 @@ Max budget (roughly $3–6 in total) and should run once per release, not per co
       repo secrets to …") and confirm nothing outward happens without a card
 - [ ] Gmail grant on a schedule addressed **to yourself**: the send goes through without a card and is
       listed under the run's pre-approved actions; a send to any other address falls back to asking
+- [ ] `relife crew --plan-only "<small task>"` from the 3.12 venv — a valid plan comes back (~$0.10)
+- [ ] a 2-agent crew in a scratch `RELIFE_HOME` (a ReLife builder + a `claude-max` reviewer): the plan is
+      shown and confirmed, the builder works in `workspace/crews/<id>/`, the reviewer sees its output,
+      `relife crews <id>` shows both outcomes, and each agent's memories sit in its own space (~$1–2)
 
 ## Known limits (documented, not bugs)
 

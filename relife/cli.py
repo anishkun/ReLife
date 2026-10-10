@@ -4,6 +4,7 @@
     relife chat          [--workspace PATH] [--agent NAME]
     relife work          [REF] [--repo R] [--dry-run]
     relife agent …       register agents and hand memory between them
+    relife crew "<task>" CrewAI plans a team of agents and runs it ([crewai] extra)
     relife mcp --agent N serve ReLife memory to any MCP client (stdio)
 """
 
@@ -945,6 +946,124 @@ def agent_delete(
         f"deleted {name}" + (f"; archived {archived} memories in {a.own_space}" if archived else ""),
         fg=typer.colors.GREEN,
     )
+
+
+def _crewai_or_exit() -> None:
+    """`relife crew` needs the optional [crewai] extra (CrewAI needs Python < 3.14)."""
+    import importlib.util
+    import sys
+
+    if importlib.util.find_spec("crewai") is not None:
+        return
+    if sys.version_info >= (3, 14):
+        hint = (
+            f"CrewAI doesn't support Python {sys.version_info.major}.{sys.version_info.minor} yet. "
+            'Run ReLife from a 3.12 venv:  py -3.12 -m venv .venv  then  '
+            '.venv\\Scripts\\pip install -e ".[crewai]"'
+        )
+    else:
+        hint = 'CrewAI is not installed:  pip install -e ".[crewai]"'
+    typer.secho(hint, fg=typer.colors.RED)
+    raise typer.Exit(1)
+
+
+@app.command("crew")
+def crew_cmd(
+    task: Optional[str] = typer.Argument(None, help="What the crew should get done, in plain language."),
+    spec: Optional[Path] = typer.Option(
+        None, "--spec", help="Run your own crew plan (JSON or YAML) instead of having one planned."
+    ),
+    plan_only: bool = typer.Option(False, "--plan-only", help="Plan and show the crew, but don't run it."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Run without asking to confirm the plan."),
+    workspace: Optional[Path] = typer.Option(
+        None, "--workspace", "-w", help="Base directory; the crew works in <workspace>/crews/<id>/."
+    ),
+) -> None:
+    """CrewAI plans a team for the task and ReLife staffs it: ReLife agents (Claude
+    with tools and memory) and, if configured (RELIFE_CREW_LLMS), CrewAI agents on
+    other models with ReLife memory attached. New agents inherit what older ones
+    learned. Each member spends budget — the plan is shown before it runs."""
+    _crewai_or_exit()
+    from .crew.runner import run_crew
+    from .crew.spec import load_spec_file
+
+    if not task and spec is None:
+        typer.secho('give a task, or --spec FILE', fg=typer.colors.RED)
+        raise typer.Exit(2)
+    ws = _resolve_workspace(workspace)
+    try:
+        raw = load_spec_file(spec) if spec is not None else None
+        record = run_crew(
+            task,
+            workspace=ws,
+            spec_raw=raw,
+            plan_only=plan_only,
+            yes=yes,
+            echo=typer.echo,
+            confirm=lambda q: typer.confirm(q, default=False),
+        )
+    except (ValueError, OSError) as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2) from e
+    if record.status in ("planned", "cancelled"):
+        return
+    color = typer.colors.GREEN if record.status == "done" else typer.colors.RED
+    typer.secho(
+        f"\ncrew {record.id}: {record.status} · {len(record.tasks)} task(s) · "
+        f"usage-equiv ${record.cost_usd:.2f}" + (f" · {record.error}" if record.error else ""),
+        fg=color,
+    )
+    if record.final_output:
+        typer.echo("\n" + record.final_output)
+    denied = [d for t in record.tasks for d in t.denied]
+    if denied:
+        typer.secho(f"\nneeded you — {len(denied)} action(s) were denied:", fg=typer.colors.YELLOW)
+        for d in denied:
+            typer.echo(f"  {d.get('tool')}: {d.get('brief')}")
+    typer.secho(
+        "\nwhat each agent learned stays in its own memory space — "
+        "`relife agent promote NAME` moves it into your main memory",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+
+
+@app.command("crews")
+def crews_cmd(
+    run_id: Optional[str] = typer.Argument(None, help="Show this crew run in full."),
+    limit: int = typer.Option(10, "-n", help="How many recent runs to list."),
+) -> None:
+    """Recent crew runs, or one run's plan and per-task outcomes."""
+    config.ensure_dirs()
+    from .crew.record import CrewRunStore
+
+    store = CrewRunStore()
+    if run_id is None:
+        runs = store.list(limit)
+        if not runs:
+            typer.secho("no crew runs yet", fg=typer.colors.BRIGHT_BLACK)
+            return
+        for r in runs:
+            typer.secho(f"  {r.id}  ", bold=True, nl=False)
+            typer.echo(f"{r.status:<11} ${r.cost_usd:5.2f}  {r.task[:70]}")
+        return
+    r = store.get(run_id)
+    if r is None:
+        typer.secho(f"no crew run {run_id!r}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    from .crew.runner import describe_plan
+    from .crew.spec import CrewSpec
+
+    typer.secho(f"crew {r.id} — {r.status} · usage-equiv ${r.cost_usd:.2f}", bold=True)
+    typer.echo(f"task: {r.task}\nworkspace: {r.workspace}")
+    for line in describe_plan(CrewSpec.from_dict(r.spec)):
+        typer.echo(line)
+    for t in r.tasks:
+        typer.secho(f"\n## {t.name} ({t.agent}, {t.runtime})", bold=True)
+        if t.error:
+            typer.secho(f"error: {t.error}", fg=typer.colors.RED)
+        typer.echo(t.output or "(no output)")
+    if r.error:
+        typer.secho(f"\nerror: {r.error}", fg=typer.colors.RED)
 
 
 @app.command("mcp")

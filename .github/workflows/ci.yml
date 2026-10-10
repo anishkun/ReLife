@@ -42,7 +42,8 @@ jobs:
         run: pip install -e . pytest
       - name: Install (all extras)
         if: matrix.deps == 'full'
-        run: pip install -e ".[embeddings,vector,daemon,server]" pytest pytest-cov
+        # crewai: every Python in this matrix is <= 3.13 (CrewAI doesn't support 3.14 yet)
+        run: pip install -e ".[embeddings,vector,daemon,server,crewai]" pytest pytest-cov
       - name: Cache embedding model
         if: matrix.deps == 'full'
         uses: actions/cache@v4
@@ -73,7 +74,8 @@ jobs:
           import glob, zipfile
           names = set(zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist())
           need = {"relife/prompts/system.md", "relife/prompts/rem.md",
-                  "relife/build/prompts/orchestrator.md", "relife/web/index.html"}
+                  "relife/build/prompts/orchestrator.md", "relife/web/index.html",
+                  "relife/crew/prompts/planner.md"}
           missing = need - names
           assert not missing, f"missing from wheel: {missing}"
           junk = [n for n in names if n.startswith(("data/", "workspace/", "tests/"))]

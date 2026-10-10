@@ -13,7 +13,10 @@ pip install -e .                  # install (editable); creates the `relife` ent
 pip install -e ".[embeddings]"    # + optional LOCAL semantic recall (fastembed; no API key)
 pip install -e ".[daemon]"        # + optional out-of-process memory daemon (fastapi/uvicorn/httpx)
 pip install -e ".[server]"        # + optional always-on agent server + web UI (fastapi/uvicorn)
-python -m pytest tests/           # run all tests (672: deterministic + 4 semantic) — use the interpreter
+pip install -e ".[crewai]"        # + `relife crew` (CrewAI). CrewAI needs Python <= 3.13: on this machine
+                                  #   use the 3.12 venv (`py -3.12 -m venv .venv`; `.venv\Scripts\python`);
+                                  #   on 3.14 the extra installs nothing and tests/test_crew.py skips
+python -m pytest tests/           # run all tests (~800: deterministic + 4 semantic) — use the interpreter
                                   #   ReLife is installed into (plain `python` may lack the SDK; `py -3` here)
 python -m ruff check relife tests scripts   # lint baseline ([tool.ruff] in pyproject); kept at zero findings
 python -m pytest tests/test_permissions.py::test_name -v   # single test
@@ -36,8 +39,13 @@ relife memory search "<q>" [-k N] [--archived]   # what the agent would be shown
 relife memory list [--kind K] [--archived] [-n N] [--sort recent|strong|oldest]
 relife memory show <id>           # full record: text, tags, importance, activation, use history
 relife memory forget <id>... | --query "<q>"  [--yes]   # archive (reversible); confirms unless --yes
-relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra)
+relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra); also serves /mcp
 relife memory ping                # check the daemon is reachable (GET /health)
+relife memory spaces | export SPACE -o F | import F --space S   # per-agent spaces; portable packs
+relife agent list|create|show|attach|detach|promote|token|connect|delete   # agents + memory handoff
+relife mcp --agent NAME           # ReLife memory as a stdio MCP server, scoped to that agent (any MCP client)
+relife crew "<task>" [--spec F] [--plan-only] [--yes]   # CrewAI plans a team; ReLife staffs + runs it
+relife crews [ID]                 # recent crew runs / one run's per-task outcomes (data/crews/<id>/)
 relife serve [--host --port]      # always-on agent server + web UI (needs [server] extra; default :8600)
 # RELIFE_HOME: where data/ and workspace/ live. Default: beside the code in a source checkout, ~/.relife for an
 #   installed wheel (never site-packages — an upgrade would wipe memory)
@@ -52,6 +60,9 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 # a schedule may carry grants (pre-approved "email me" / "calendar events"); RELIFE_AGENT_GRANT_MAX_USES
 # (default 3) caps how many times one run may use them before it falls back to asking
 # do/chat/build accept --workspace/-w PATH (default ./workspace) — the dir the agent works in
+# do/chat accept --agent/-a NAME — run as a registered agent (its own memory space; see agents.py)
+# RELIFE_CREW_LLMS=ollama/llama3.1,gpt-4.1 — non-Claude models a crew planner may staff (keys come from the
+#   env, read by CrewAI/LiteLLM; ReLife never stores them); `claude-max` (Claude via the CLI) is always available
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 ```
 
@@ -83,6 +94,50 @@ Memory behaves like a brain: each item's relevance **rises when used** and **fad
 - `server.py` — MCP tools `memory_save` (now takes `importance`), `memory_recall`, `memory_forget`, `skill_write`/`skill_find`, `workflow_save`/`workflow_find`, `memory_consolidate`, `memory_dream` (the opt-in REM pass). Server `relife_memory` → `mcp__relife_memory__*` (trusted `mcp__relife` prefix → auto-allowed; **no permission changes**).
 - `_text.py` — shared stopword tokenizer used by every keyword path.
 
+### Agents and memory spaces (`relife/agents.py`, `memory/spaces.py`)
+Memory is partitioned into **spaces** (store schema v3: `memories.space`/`source`, `events.space`; skills/workflows
+under `data/spaces/<s>/{skills,workflows}`, the `default` space keeping the historical `data/skills|workflows` so no
+files moved). `default` is the main agent's (the user's) memory — everything pre-spaces is there. An `AgentProfile`
+(registry at `data/agents.json`, `AgentStore` with the `ScheduleStore` discipline: lazy, atomic, unreadable records
+dropped, original kept aside) resolves to a `MemoryScope(read, write, source)`: it **writes only its own space**
+(`space` or its name; never `default` — rejected at the record level) and **reads** own + `inherits` + `default`
+(unless `isolated`). Handoff: `create_agent(inherit=…)` attaches parents' spaces read-only (flattened, so lineage is
+transitive), `fork=` snapshots via `copy_space` (memories keep strength + provenance; skills/workflows copied unless
+present), `promote` copies an agent's space into `default` (the only path in besides the main agent and an
+explicit import), packs via `export_space`/`import_pack` (validated in full first; imports stamped `import:<space>`).
+Attachments are read-only by design — a save can only land in one place, so agents that should share writes get the
+same `space`. Tokens for HTTP MCP are `rla_…`, stored as sha256 only. **`ScopedMemoryClient`** (client.py) is the
+enforcement point: its agent-facing methods take **no** space argument (passing one is a `TypeError`, not an
+override), `forget`/`archive` reach only `scope.write`, admin ops (`copy/export/import/archive_space`) and `dream`
+raise `PermissionError`. `memory_hooks(client)` / `memory_server(client)` / `config.default_mcp_servers(memory_client)`
+bind one agent's scoped client; with no client they resolve the module's `default_client` at call time (tests
+monkeypatch `hooks.default_client` / `memory.server.default_client`).
+
+### Memory over MCP for any LLM (`memory/tools.py`, `memory/mcp_server.py`)
+The memory tools are defined **once** as transport-neutral `ToolSpec`s (name, description, schema, async
+`handler(client, args)`); `server.py` wraps `INTERNAL_TOOLS` as the in-process SDK server (names/schemas unchanged),
+and `mcp_server.build_server` serves `EXTERNAL_TOOLS` (no `memory_consolidate`, no `memory_dream`; adds
+`memory_context`, the same block the recall hook injects — `memory/context.build_context`) over the low-level `mcp`
+`Server`: **stdio** (`relife mcp --agent NAME`, `--agent` required, unknown ⇒ exit 2) and **streamable HTTP** at
+`/mcp` on the memory daemon (stateless + JSON responses; `McpHttpEndpoint` authenticates a registered agent's bearer
+token — registry re-read per request, so revoke is immediate — and stashes that agent's scoped client in the ASGI
+scope, which the tool handler reads back from `server.request_context.request`; DNS-rebinding protection via
+`allowed_hosts_for(bind)`). The daemon's only lifespan runs the MCP session manager; REST routes still need none.
+
+### Crews (`relife/crew/`, `[crewai]` extra)
+`relife crew` = `planner.plan_crew` (one tool-less `ask_model_oneshot` call → JSON → `spec.normalize_spec`; one retry
+with the validation error, then a single-ReLife-agent fallback) → `CrewRunRecord` (`data/crews/<id>/record.json`) →
+plan shown + confirm → `build.ensure_profiles` (reuse existing agents, create new ones with the plan's inherit/fork —
+**this is where memory is handed down**) → `build.build_crew` → `Crew.kickoff()` → per-task outcomes. Members:
+`runtime: relife` → **`agent.ReLifeAgent(BaseAgentAdapter)`**, each task one fresh `ClaudeSDKClient` turn
+(`turns.run_relife_turn`) in `<workspace>/crews/<id>/` with ReLife's permission callback, scoped hooks and scoped
+memory server; `runtime: llm` → a CrewAI `Agent` on the model string (or `claude-max` → **`llm.ClaudeMaxLLM(BaseLLM)`**,
+Claude via the CLI, no function calling ⇒ CrewAI's ReAct text, stop words applied by truncation) with ReLife memory as
+in-process CrewAI tools (`memory_tools.py`, same specs) and the recall block prepended to its tasks — **no
+machine-touching tools** (classify() can't gate CrewAI's loop). `spec.py`/`planner.py`/`record.py` are pure (no
+CrewAI import); the turn runner and the LLM's model call are injected, so `tests/test_crew.py` runs a real
+`Crew.kickoff()` with zero model calls.
+
 The system prompt uses the **`claude_code` preset** with `prompts/system.md` appended (persona + safety + memory/skill/workflow instructions). `setting_sources=None` deliberately prevents inheriting the surrounding repo's Claude Code settings.
 
 ### Work items (`relife/workitems.py`)
@@ -113,6 +168,28 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - **Still local-first (by design), but fail-closed:** `serve()` **refuses** to bind a non-loopback address without a token rather than warning — this process runs shell commands and edits files. There is **still no TLS and no multi-user model**, so exposing it beyond `127.0.0.1` means a token *and* a reverse proxy in front; treat that as a deliberate future step, not a supported configuration.
 
 ## Non-obvious constraints
+
+- **A fresh memory DB stamps schema v2, not the current version.** `MemoryStore.init_db`'s `version == 0` branch
+  builds the v2 table then lets `_apply_migrations` run every later step (v3 = spaces). Stamping `SCHEMA_VERSION`
+  there skipped the new columns on fresh DBs. Each step is idempotent (column-exists checks).
+- **Space semantics differ by layer, deliberately.** At the store, `spaces=None` means *unfiltered* (mechanism —
+  consolidation and admin listings need every space); at the service/client, an agent-facing read with no spaces
+  means the **`default` space** (pre-spaces behaviour), while `all_memories`/`count` default to every space. An
+  empty `spaces` list matches nothing, never everything. Agents never choose: their scope comes from
+  `ScopedMemoryClient`, and no MCP tool schema has a space property (a test enforces it).
+- **Consolidation never crosses a space.** `_dedupe` groups by space, episodes and tool n-grams are mined per space,
+  and patterns/workflows are written into the originating space — otherwise one agent's sweep could merge away
+  another's memory or learn another agent's habits.
+- **stdio MCP on Windows must warm the embedding model before serving.** With the stdio reader thread blocked in a
+  read on the stdin pipe, constructing fastembed/onnxruntime on a worker thread deadlocked: `initialize` and
+  `tools/list` answered, the first `tools/call` never did. `mcp_server._warm_up` loads it on the main thread first.
+  Tests run with embeddings off, so only the release smoke (`RELEASE_TESTING.md`) can catch a regression.
+- **`crew_tools` is outside the trusted prefix on purpose.** CrewAI tools handed to a `ReLifeAgent` are exposed as an
+  SDK MCP server named `crew_tools` so each call is an unknown tool to `classify()` (ask). Never name it `relife_*`.
+- **CrewAI's own memory, planning and knowledge stay off** (`Crew(memory=False, planning=False)`): they default to
+  OpenAI embeddings/models and would demand a key; ReLife memory is the memory. Telemetry is off by default too.
+- **CrewAI requires Python < 3.14** (1.15.x). The `[crewai]` extra is marker-gated; crew code that imports CrewAI
+  (`llm`, `agent`, `native`, `memory_tools`, `build`) is only imported after `_crewai_or_exit()`.
 
 - **`can_use_tool` requires streaming mode.** Use `ClaudeSDKClient` + `receive_response()`; the one-shot `query(prompt=str)` helper raises with a permission callback.
 - **Windows console encoding.** `agent.py` reconfigures stdout/stderr to UTF-8 and uses `Console(legacy_windows=False)` — Rich otherwise crashes on glyphs like `→`/`✓` under cp1252.

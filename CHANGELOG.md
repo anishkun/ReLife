@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added
+- **Memory spaces and agents.** Memory is partitioned per agent (store schema v3: `space`/`source`
+  on memories, `space` on events; per-space skills/workflows). `relife agent create|list|show|attach|
+  detach|promote|token|connect|delete` registers agents (`data/agents.json`). An agent writes only its
+  own space and reads what it inherited (live, read-only, transitive) plus your default memory unless
+  `--isolated`; `--fork` starts from a snapshot copy; `promote` is the explicit way into `default`.
+  `relife memory spaces|export|import` (portable packs; imports marked `import:<space>`), `--space`
+  on `search`/`list`/`forget`, `relife do|chat --agent NAME`.
+- **ReLife memory over MCP, for any LLM.** The memory tools are defined once (`memory/tools.py`) and
+  served both in-process (unchanged for Claude) and by a standalone MCP server: `relife mcp --agent
+  NAME` (stdio) and `/mcp` on the memory daemon (streamable HTTP, per-agent bearer token, DNS-rebinding
+  protection). New `memory_context` tool returns the recall block for agents without a hook.
+  `python -m relife` works.
+- **Crews (CrewAI).** `relife crew "<task>"` plans a small team (Claude via the CLI — no API key),
+  shows it, and runs it with CrewAI after you confirm: full ReLife agents as crew members
+  (`ReLifeAgent`, a `BaseAgentAdapter`) and CrewAI agents on other models (`RELIFE_CREW_LLMS`, or
+  `claude-max`) with ReLife memory attached and no machine-touching tools. New agents inherit from
+  experienced ones; outcomes are recorded in `data/crews/<id>/` (`relife crews [ID]`). Optional
+  `[crewai]` extra — CrewAI needs Python ≤ 3.13; `relife doctor` explains.
+
+### Changed
+- Consolidation dedupes and learns patterns/workflows within each space, never across.
+- The recall block labels memory from another space `via <space>`.
+
 ### Security
 - Email grants no longer cover `send_message` with a `draftId` (sends a stored draft whose
   recipients the grant never saw) or `reply` with `replyAll` (keeps the thread's CC list) — both
@@ -11,6 +35,8 @@
   of a drive. Slash switches are now only recognised for cmd built-ins.
 
 ### Fixed
+- A fresh memory DB stamped the current schema version before later migration steps ran; it now
+  stamps v2 and applies each step in order.
 - Grants checked against the real Gmail/Calendar connector schemas: camelCase content fields
   (`htmlBody`, `forwardText`) no longer read as recipients; a non-address calendar attendee fails
   the grant; `get_draft` and `suggest_time` are reads.

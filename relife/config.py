@@ -234,6 +234,22 @@ AGENT_SCHEDULE_RUN_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SCHEDULE_RUN_TIM
 # — or an email that talks the agent into mailing you fifty times.
 AGENT_GRANT_MAX_USES = int(os.environ.get("RELIFE_AGENT_GRANT_MAX_USES", "3"))
 
+# Crews (`relife crew`, optional [crewai] extra). CrewAI plans a team and runs
+# it; each member is a full ReLife (Claude) agent or a CrewAI agent on another
+# model with ReLife memory attached. Every member spends budget (Max for Claude
+# members, the provider's for others), so a crew is small by construction.
+CREW_MAX_AGENTS = int(os.environ.get("RELIFE_CREW_MAX_AGENTS", "5"))
+CREW_MAX_TASKS = int(os.environ.get("RELIFE_CREW_MAX_TASKS", "8"))
+# Non-Claude models the planner may staff a crew with (comma-separated CrewAI /
+# LiteLLM model strings, e.g. "ollama/llama3.1,gpt-4.1"). Their keys, if any,
+# are read by CrewAI/LiteLLM from the environment — ReLife never stores them.
+# Empty: the planner uses only ReLife agents and Claude (via your Max login).
+CREW_LLMS = tuple(
+    m.strip() for m in os.environ.get("RELIFE_CREW_LLMS", "").split(",") if m.strip()
+)
+# The model string that means "Claude through the logged-in CLI" (no API key).
+CREW_CLAUDE_LLM = "claude-max"
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 

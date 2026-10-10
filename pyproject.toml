@@ -40,6 +40,14 @@ server = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]
+# Crews (`relife crew`): CrewAI plans a team for a task and ReLife staffs it —
+# ReLife agents (Claude, tools, memory) and CrewAI agents on other models with
+# ReLife memory attached. CrewAI doesn't support Python 3.14 yet: there this
+# extra installs nothing and `relife doctor` says to use a 3.12/3.13 venv.
+#   pip install -e ".[crewai]"
+crewai = [
+    "crewai>=1.15,<2; python_version < '3.14'",
+]
 
 [project.scripts]
 relife = "relife.cli:main"
