@@ -5,6 +5,11 @@ description = "A personal agent that acts through MCP and learns over time."
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.2.105",
+    # Imported directly (relife/memory/mcp_server.py: the standalone memory MCP
+    # server). Declared, not left to the SDK's range (mcp>=1.23,<3): mcp 2.x is a
+    # restructured major and our server + tests are written against 1.x — which
+    # is also what CrewAI pins (mcp~=1.28.1).
+    "mcp>=1.28,<2",
     "typer>=0.12",
     "rich>=13.0",
 ]

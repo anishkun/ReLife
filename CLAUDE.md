@@ -188,6 +188,9 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
   SDK MCP server named `crew_tools` so each call is an unknown tool to `classify()` (ask). Never name it `relife_*`.
 - **CrewAI's own memory, planning and knowledge stay off** (`Crew(memory=False, planning=False)`): they default to
   OpenAI embeddings/models and would demand a key; ReLife memory is the memory. Telemetry is off by default too.
+- **`mcp` is a declared dependency, pinned `<2`.** ReLife imports it directly (`memory/mcp_server.py`), and the SDK
+  alone allows `mcp<3`: a base install picked up mcp 2.3 (a restructured major) and the MCP tests failed to import
+  in CI while every all-extras job — where CrewAI pins `mcp~=1.28.1` — passed. Porting to 2.x is a separate change.
 - **CrewAI requires Python < 3.14** (1.15.x). The `[crewai]` extra is marker-gated; crew code that imports CrewAI
   (`llm`, `agent`, `native`, `memory_tools`, `build`) is only imported after `_crewai_or_exit()`.
 

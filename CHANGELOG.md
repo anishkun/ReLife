@@ -41,6 +41,8 @@
   of a drive. Slash switches are now only recognised for cmd built-ins.
 
 ### Fixed
+- `mcp` is now a declared dependency (`>=1.28,<2`). It was only pulled in through the Agent SDK,
+  whose range admits mcp 2.x — a base install got mcp 2.3 and the memory MCP server's API moved.
 - Crews (found by the live smoke): CrewAI warned "function callbacks cannot be serialized" on every
   run (ReLife's step callback is a closure and ReLife never checkpoints a crew — silenced at agent
   construction); and every crew episode an agent saved began "Task: You are working on a crew as …",
