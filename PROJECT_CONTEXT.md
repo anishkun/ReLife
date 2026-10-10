@@ -13,35 +13,53 @@ measurably better at recurring tasks.
 - **v1 (built):** terminal agent that builds projects, pushes to git, drives a browser —
   autonomous for code/git, asks approval for outward actions. Memory of facts + reusable
   skills.
-- **Future:** complete assigned work items, reply to email/messages, plan the calendar;
-  an always-on daemon + UI.
+- **Since v1 (built, released as 1.0.0 on 2026-10-08):** cognitive memory (decay,
+  consolidation, opt-in "dream"), orchestrated resumable builds, an always-on server +
+  web console with schedules and run records, GitHub work items (`relife work`, work
+  schedules), Gmail/Calendar/Drive via the claude.ai connectors with narrow
+  pre-approvals, `relife doctor`.
+- **Platform pass (built 2026-10-10, unreleased):** agents with their own memory spaces,
+  memory handoff (inherit/fork/promote/packs), ReLife memory over MCP for any LLM, and
+  `relife crew` (CrewAI plans a team, ReLife staffs it).
+- **Next:** agents/crews in the server + web UI, schedules that fire crews, ReLife-gated
+  machine tools for non-Claude agents; hosting (Managed Agents) later.
 
 ## 2. Locked decisions (with rationale)
 
 | Area | Choice | Why |
 |---|---|---|
-| Foundation | **Claude Agent SDK** (Python, `claude-agent-sdk` v0.2.105) | Same engine as Claude Code: inherits the production agent loop, native MCP, hooks, permissions. The model is the same across any foundation, so effort goes into memory (the real edge), not plumbing. |
+| Foundation | **Claude Agent SDK** (Python, `claude-agent-sdk` ≥ 0.2.105) | Same engine as Claude Code: inherits the production agent loop, native MCP, hooks, permissions. The model is the same across any foundation, so effort goes into memory (the real edge), not plumbing. |
 | Language | **Python** (≥3.11; dev machine has 3.14) | Best ecosystem for the memory/embeddings side. |
 | Model | **`claude-opus-4-8`**, effort `high` | Strong agentic work. |
 | **Auth / billing** | **Claude Code Max subscription** — NOT a metered API key | User explicitly does not want to buy API tokens. The SDK drives the logged-in `claude` CLI, so it uses the subscription. Verified: `ANTHROPIC_API_KEY` unset, queries still succeed. **Caveat:** agent runs consume the same Max usage limits as interactive Claude Code (we hit the limit once mid-build). |
 | Memory | **A + B: retrieval (facts/episodes) + procedural skills.** No fine-tuning. | Retrieval shrinks re-derivation; skills replace re-planning → improvement without training. |
-| Interface | **Terminal CLI** now; daemon + UI later | |
-| Security | Code + git push **autonomous**; outward actions (mail/messages/etc.) **require approval** | User's stated autonomy model. |
+| Interface | **Terminal CLI** + an always-on local server and web console (`relife serve`) | CLI first; the server came once the core was proven. |
+| Security | Code + git push **autonomous**; outward actions (mail/messages/etc.) **require approval** | User's stated autonomy model. Narrow per-schedule pre-approvals are the only exception. |
+| Other LLMs (2026-10-10) | **Any provider, keys optional** — via CrewAI/LiteLLM, keys read from the env; Claude always via Max (`ClaudeMaxLLM`) | ReLife never stores or requires a key. |
+| Memory handoff (2026-10-10) | **Own space + inherit read-only**; fork, promote and packs on top | An agent can never write the user's memory; trusting it is an explicit `promote`. |
+| Crews' Python (2026-10-10) | **Python 3.12 `.venv`** for `[crewai]` | CrewAI 1.15 requires `<3.14`; ReLife's core stays 3.11–3.14. |
 
 ## 3. Architecture
 
 ```
-relife (CLI, Typer)
+relife (CLI, Typer)  ·  relife serve (FastAPI + web console, schedules)
   └─ ClaudeSDKClient (streaming)  ── Claude Opus 4.8, Claude Code preset + ReLife persona
        ├─ built-in tools: Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebFetch/WebSearch
-       ├─ can_use_tool  → permission policy (auto-allow code/git, ask for outward)
-       ├─ UserPromptSubmit hook → auto-inject recalled memories + skills
+       ├─ can_use_tool  → permission policy (auto-allow code/git, ask for outward; grants)
+       ├─ hooks: UserPromptSubmit (inject recalled memory + skills + workflows),
+       │         PostToolUse (journal), Stop (episode)
        └─ MCP servers:
             ├─ browser        (Playwright, npx @playwright/mcp)  → mcp__browser__*
-            └─ relife_memory  (in-process SDK MCP server)        → mcp__relife_memory__*
-                 ├─ memory_save / memory_recall   (facts/preferences/episodes)
-                 └─ skill_write / skill_find       (reusable procedures)
-GitHub: via `gh` CLI (build → commit → gh repo create → push)
+            ├─ relife_memory  (in-process SDK MCP server)        → mcp__relife_memory__*
+            │    memory_save/recall/forget, skill_write/find, workflow_save/find,
+            │    memory_consolidate, memory_dream
+            └─ claude.ai connectors (Gmail / Calendar / Drive, from the account)
+memory: MemoryClient seam → Local (default) | Http daemon (RELIFE_MEMORY_URL);
+        spaces per agent (ScopedMemoryClient); also served to ANY MCP client:
+        `relife mcp --agent NAME` (stdio) and /mcp on the daemon (agent token)
+crews:  `relife crew` → CrewAI Crew of ReLifeAgent (a ReLife turn per task) +
+        CrewAI agents on other models (ReLife memory, no machine tools)
+GitHub: via `gh` CLI (build → commit → gh repo create → push; `relife work` → PR)
 ```
 
 **Why memory is an MCP server (even in-process):** the agent-facing contract stays identical
@@ -62,8 +80,9 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** 360 passing (`python -m pytest tests/`; later phases below added the daemon, server,
-scheduler, run-outcome and doctor suites). The original set covers permission classify, store
+**Tests:** ~800 passing — 790 on Python 3.14 (the CrewAI module skips), 796 in the 3.12 `.venv`
+with `[crewai]` (`python -m pytest tests/`; later phases below added the daemon, server,
+scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP and crew suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -100,18 +119,22 @@ session limit hit), but `session_id` is persisted for it.
 ## 5. File map (`D:\ReLife`)
 
 ```
-pyproject.toml              # deps: claude-agent-sdk, typer, rich
+pyproject.toml              # deps: claude-agent-sdk, typer, rich; extras embeddings/vector/daemon/server/crewai
 PROJECT_CONTEXT.md          # this file
-README.md
+README.md / CHANGELOG.md / RELEASE_TESTING.md / CLAUDE.md
+HOW_IT_WORKS.md             # plain-English guide;  MODULE_DEEP_DIVE.md — architecture + reasoning (M1–M16)
 relife/
   cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */mcp/crew/crews
+  __main__.py               # `python -m relife` (what MCP client configs launch)
   agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens
-  agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming)
-  config.py                 # MODEL, EFFORT, paths, agent_env() (gh PATH), default_mcp_servers()
-  permissions.py            # classify() + make_permission_callback() (can_use_tool); connector verb policy
+  agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming), to_event
+  config.py                 # MODEL, EFFORT, paths (RELIFE_HOME), agent_env() (gh PATH), default_mcp_servers()
+  permissions.py            # classify() + callbacks (TTY / UI); gh + connector verb policy; schedule grants
+  workitems.py              # `relife work`: GitHub issue plumbing (parse/list/fetch/checkout/branch/prompt)
   doctor.py                 # `relife doctor`: pure run_checks() over injected Probes
-  hooks.py                  # UserPromptSubmit recall hook (memory + skills)
+  hooks.py                  # recall (UserPromptSubmit), journal (PostToolUse), episode (Stop); per-client factory
   prompts/system.md         # persona + safety + memory/skill instructions
+  web/index.html            # self-contained web console served by `relife serve`
   memory/                   # cognitive memory: relevance rises w/ use, fades when idle
     cognitive.py            # pure ACT-R-style activation/fused_score/should_archive/should_hard_delete
     store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay
@@ -140,19 +163,21 @@ relife/
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
     server.py               # relife_build MCP server (plan_set/milestone_update/status)
-  server/
-    session.py              # AgentSession (busy flag) / ApprovalBroker / SessionManager
-    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
-    security.py             # pure auth/CSRF/bind/workspace-confinement policy
-    schedules.py            # Schedule record, spec parsing, next_run(), JSON ScheduleStore
-    scheduler.py            # lifespan tick loop: fire due schedules into sessions + record outcomes
-    runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
     agents.py               # `builder` subagent definition (Task-delegated milestones)
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
-data/                       # gitignored runtime: relife.db, skills/, builds/, logs
+  server/
+    session.py              # AgentSession (busy flag, per-turn grants) / ApprovalBroker / SessionManager
+    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
+    security.py             # pure auth/CSRF/bind/DNS-rebinding/workspace-confinement policy
+    schedules.py            # Schedule record (grants, work), spec parsing, next_run(), JSON ScheduleStore
+    scheduler.py            # lifespan tick loop: fire due schedules (incl. work schedules) + record outcomes
+    runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
+data/                       # gitignored runtime: relife.db, skills/, workflows/, spaces/, agents.json,
+                            #   builds/, crews/, runs/, schedules.json
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # 252 tests (248 deterministic + 4 semantic, embeddings forced off)
+tests/                      # ~800 tests (deterministic + 4 semantic, embeddings forced off)
+.venv/                      # gitignored Python 3.12 env for `[crewai]` (CrewAI needs < 3.14)
 ```
 
 ## 6. Setup / run
@@ -161,10 +186,16 @@ Prereqs: Python ≥3.11, Node.js (npx for browser MCP), logged-in `claude` CLI (
 `gh` authenticated.
 
 ```sh
-pip install -e .
+pip install -e .                  # extras: ".[embeddings]", ".[vector]", ".[daemon]", ".[server]"
+relife doctor                     # what's missing, with the fix for each
 relife do "scaffold a Python CLI that prints the weather for a city"
 relife chat
 # --workspace PATH chooses the dir the agent works in (default ./workspace)
+
+# crews (CrewAI needs Python <= 3.13):
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -e ".[crewai]"
+.venv\Scripts\relife crew --plan-only "<task>"
 ```
 
 ## 7. Non-obvious gotchas (learned the hard way)
@@ -180,8 +211,9 @@ relife chat
 - **Max session limits.** Heavy multi-step agent runs can hit the subscription limit
   ("You've hit your session limit · resets …"). Prefer cheap/deterministic verification;
   don't re-burn budget hammering live runs.
-- **Inherited claude.ai MCP connectors.** The subscription surfaces Gmail/Calendar/Drive MCP
-  servers (status `needs-auth`). Useful later; our policy gates them (not in trusted prefixes).
+- **Inherited claude.ai MCP connectors.** The subscription attaches Gmail/Calendar/Drive MCP
+  servers to every session (`setting_sources=None` doesn't exclude them). Linked in-session
+  on first use; gated by the verb-based connector policy (see MVP pass 2 and post-1.0 below).
 - **git author identity.** This machine's *global* git config is `tezoo2002@live.com` /
   "ReLife" (the system email) — so commits ReLife makes are authored as that unless changed.
   See open items.
@@ -605,4 +637,4 @@ relife chat
 
 - GitHub account: **`anishkun`** (= anish03anish@gmail.com). `gh` authed, `repo` scope, HTTPS.
 - Approved plan lives at `C:\Users\HP\.claude\plans\witty-enchanting-fountain.md`.
-- Memory about auth constraint: `…/.claude/projects/D--ReLife/memory/auth-via-max-subscription.md`.
+- Memory about auth constraint: `…/.claude/projects/D--relife/memory/auth-via-max-subscription.md`.

@@ -45,6 +45,12 @@ running on the **Claude Code Max subscription** (no metered API key).
   one PR for the issue it worked) so an unattended run can finish.
 - **Memory as a service (optional)** — `relife memory serve` runs the memory layer as a
   standalone daemon so several ReLife processes share one brain (`RELIFE_MEMORY_URL`).
+- **`relife doctor`** — checks the CLI login, Node, `gh`, FTS5, extras, connectors, the memory
+  daemon, the agent server and whether your schedules will actually fire.
+
+**Since 1.0 (unreleased — see `CHANGELOG.md`).** Tested deterministically (including a real
+CrewAI run with stand-in models) but not yet live-tested with real model calls:
+
 - **Many agents, handed-down memory** — register agents (`relife agent create`); each writes its
   own memory space and reads what it **inherited** from older agents (live, read-only), can start
   from a **fork** (snapshot copy), and only reaches your main memory when you **promote** it.
@@ -56,8 +62,6 @@ running on the **Claude Code Max subscription** (no metered API key).
   small team, CrewAI runs it, and ReLife staffs it with full ReLife agents (Claude + tools +
   memory) and, if you configure them, CrewAI agents on other models (Ollama, OpenAI, Gemini…) with
   ReLife memory attached. New team members inherit what experienced agents learned.
-- **`relife doctor`** — checks the CLI login, Node, `gh`, FTS5, extras, connectors, the memory
-  daemon, the agent server and whether your schedules will actually fire.
 
 ## Setup
 
@@ -126,7 +130,8 @@ relife crews [ID]          # recent crew runs, or one run's per-task outcomes
 `do`/`chat`/`build` accept `--workspace PATH` (default: `./workspace`) — the directory
 the agent works in.
 
-See **`HOW_IT_WORKS.md`** for a friendly, top-to-bottom walkthrough of the whole system.
+See **`HOW_IT_WORKS.md`** for a friendly, top-to-bottom walkthrough of the whole system, and
+**`MODULE_DEEP_DIVE.md`** for the architecture module by module, with the reasoning behind it.
 
 ## Agents, memory handoff and crews
 
@@ -173,6 +178,7 @@ relife/
   config.py     model, paths, permission mode, MCP servers, every tunable and env knob
   permissions.py allow/ask policy gating every tool call (shell, files, connectors)
   hooks.py      auto-recall before each prompt, tool journaling, episode capture on Stop
+  workitems.py  `relife work`: GitHub issue plumbing (find, fetch, clone, branch, task prompt)
   doctor.py     `relife doctor`: environment + always-on checks, each with a fix
   prompts/      system prompt (persona + safety rules) + the REM critic prompt
   web/          the self-contained web console served by `relife serve`
@@ -183,6 +189,6 @@ relife/
   crew/         `relife crew`: CrewAI planner/adapter, ReLife agents as crew members, run records
   build/        orchestrated, resumable large builds (decompose → delegate → resume)
   server/       always-on agent server: sessions, SSE, approvals, security, scheduler, run outcomes
-data/           runtime db, schedules, run outcomes, logs (gitignored)
+data/           runtime db, agents, schedules, run and crew records, logs (gitignored)
 tests/          ~800 tests (no live model calls; CI runs them on Windows + Linux, py3.11-3.13)
 ```

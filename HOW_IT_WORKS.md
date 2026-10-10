@@ -24,7 +24,14 @@ sharp, what it ignores quietly fades, and it even **invents its own workflows**
 from things it finds itself repeating. It runs on your **Claude Code Max
 subscription**, not a paid-per-call API key.
 
-That's the whole product. Everything below is *how* that paragraph is true.
+It can also stay running (a web console, tasks on a schedule, working the GitHub
+issues assigned to you), and it has grown into a small **platform**: you can register
+several agents, each with its own memory; hand one agent's memory to a new one; let
+*other* AI apps (Cursor, Gemini CLI, a model running on your own machine) use
+ReLife's memory; and have CrewAI plan a team of agents for a job that ReLife then
+staffs and runs.
+
+That's the whole product. Everything below is *how* those paragraphs are true.
 
 ---
 
@@ -40,11 +47,12 @@ Claude**. Picture three layers:
    └───────────────────────────┬─────────────────────────────┘
                                │
    ┌───────────────────────────▼─────────────────────────────┐
-   │  ReLife (this Python project — ~10 small files)         │
+   │  ReLife (this Python project — a few dozen small files) │
    │   • decides what Claude is allowed to do (permissions)  │
    │   • gives Claude extra abilities (MCP servers)          │
    │   • feeds Claude its past memories (hooks)              │
    │   • for big jobs, splits work into milestones (build)   │
+   │   • lets other agents & models share its memory         │
    └───────────────────────────┬─────────────────────────────┘
                                │  (Claude Agent SDK)
    ┌───────────────────────────▼─────────────────────────────┐
@@ -66,6 +74,7 @@ Three things ReLife *adds* on top of raw Claude:
 | **Permissions** | Lets Claude act autonomously on safe stuff (code, git) while still stopping at anything that could affect the outside world. |
 | **Memory** | Raw Claude forgets everything between runs. ReLife gives it a notebook (facts + skills) it can re-read. |
 | **Build orchestration** | A single Claude conversation can only hold so much. Big projects are split into milestones, each done in a *fresh* conversation. |
+| **Agents & crews** | Several agents, each with its own memory, that can inherit from each other — and teams of them, planned by CrewAI. |
 
 ### What is the "Claude Agent SDK"?
 
@@ -82,12 +91,18 @@ name and inputs). When attached, Claude can call them like any built-in. ReLife
 uses MCP three ways:
 - **browser** — an off-the-shelf server (Microsoft's Playwright) that lets Claude
   open web pages, click, and type.
-- **relife_memory** — ReLife's *own* server exposing `memory_save` / `memory_recall` /
-  `skill_write` / `skill_find`. It runs **in-process** (same Python program), but
-  is dressed up as an MCP server so it can be split into a separate service later
-  without changing how the agent calls it.
+- **relife_memory** — ReLife's *own* server exposing the memory tools
+  (`memory_save`, `memory_recall`, `memory_forget`, `skill_write`/`skill_find`,
+  `workflow_save`/`workflow_find`, `memory_consolidate`, `memory_dream`). It runs
+  **in-process** (same Python program), but is dressed up as an MCP server so it
+  could be split into a separate service later without changing how the agent calls
+  it. That bet paid off twice: once for the memory daemon, and again when other AI
+  apps needed to use the same memory (see §6d).
 - **relife_build** — a per-build server exposing the ledger tools (only during
   `relife build`).
+
+And it works the other way round too: `relife mcp --agent NAME` turns ReLife's memory
+into an MCP server *for other programs* (Cursor, Claude Desktop, Gemini CLI, …).
 
 ---
 
@@ -96,25 +111,33 @@ uses MCP three ways:
 ```sh
 relife do "<task>"     # one shot: do this task to completion, then stop
 relife chat            # back-and-forth conversation in one workspace
+relife work [ISSUE]    # list your assigned GitHub issues, or fix one → branch → PR (see §6c)
 relife build "<spec>"  # BIG job: plan → split into milestones → build each
 relife build --resume  # continue a build that was interrupted
 relife serve           # ALWAYS-ON: agent server + web console + schedules (see §6b)
-relife doctor          # is everything set up? (login, node, gh, connectors, server, schedules)
+relife doctor          # is everything set up? (login, node, gh, connectors, server, schedules, crews)
 relife consolidate     # run the cheap "sleep" pass now (fade/merge/learn) — no AI
 relife dream           # opt-in DEEP review: AI critiques & tidies memory (spends budget)
 relife memory stats    # peek at what's remembered and what has faded
 relife memory search|list|show|forget   # look at — and correct — what it learned
+relife memory spaces|export|import      # each agent's memory; move it between machines
+relife agent create|list|show|promote|… # register agents and hand memory between them (§6d)
+relife mcp --agent NAME                 # give another AI app ReLife's memory (§6d)
+relife crew "<task>"   # CrewAI plans a team; ReLife staffs and runs it (§6d)
+relife crews [ID]      # what past crews did
 ```
 
-All of them take `--workspace PATH` (default `./workspace`) — **the only folder
-the agent is allowed to freely write into.** Think of the workspace as the
-agent's desk: it can do whatever it wants on its own desk, but needs your nod to
-touch anything off it.
+All the commands that run the agent take `--workspace PATH` (default `./workspace`)
+— **the only folder the agent is allowed to freely write into.** Think of the
+workspace as the agent's desk: it can do whatever it wants on its own desk, but needs
+your nod to touch anything off it. `do` and `chat` also take `--agent NAME`, to run
+as one of your registered agents with *its* memory instead of yours.
 
 `do` and `chat` are for normal-sized tasks (one Claude conversation is enough).
 `build` exists for projects too large to fit in a single conversation — see §6.
 `serve` is for when you want the agent *around* — in a browser tab, and running
-tasks on a schedule while you're not — see §6b.
+tasks on a schedule while you're not — see §6b. `work` is for GitHub issues — §6c.
+`agent`, `mcp` and `crew` are the platform side — §6d.
 
 ---
 
@@ -168,7 +191,8 @@ most useful thing to understand; everything else is a variation.
 
 The whole architecture is just: **assemble options → stream Claude → gate every
 tool call → render → consolidate.** `do` and `chat` differ only in step 5 (chat
-loops, asking you for the next message each time).
+loops, asking you for the next message each time). With `--agent NAME`, steps 3–4
+hand Claude that agent's memory instead of yours; nothing else changes.
 
 ---
 
@@ -178,10 +202,11 @@ The package lives in `relife/`. Here's what each file is responsible for. They'r
 listed in rough order of how central they are.
 
 ### `cli.py` — the front door
-Defines the `relife do` / `chat` / `build` commands using **Typer** (a library
-that turns Python functions into a CLI). Each command does the same three-step
-setup (resolve workspace → build the permission callback → attach MCP servers +
-hooks) then calls into `agent.py` or `build/orchestrator.py`. Thin glue, no logic.
+Defines every `relife …` command using **Typer** (a library that turns Python
+functions into a CLI). The agent-running commands do the same three-step setup
+(resolve workspace → build the permission callback → attach MCP servers + hooks)
+then call into `agent.py`, `build/orchestrator.py` or `crew/runner.py`. Thin glue,
+no logic.
 
 ### `agent.py` — the engine
 The heart of the "drive Claude" loop. Two things to know:
@@ -213,38 +238,51 @@ anything else (unknown tool) ............→ ASK     (fail closed — safe defau
 ```
 
 The "outward/destructive" regex (`_OUTWARD_SHELL`) is the first safety net: it
-catches email senders, `gh pr/issue/release/api/gist`, file uploads via curl/wget,
-`scp/ssh/rsync`, package publishing (`npm publish`, `twine upload`…), `sudo`, and
-`rm -rf /` — **and their PowerShell equivalents** (`Send-MailMessage`,
-`Invoke-RestMethod -Method POST`, `Enter-PSSession`, `Start-Process -Verb RunAs`,
-`Format-Volume`), which matters because PowerShell is the shell the agent reaches
-for on Windows. The second net is containment: a shell command that *writes to* or
-*deletes* something outside the workspace asks too, so a redirect
-(`echo x > ~/.bashrc`) can't route around the file-write rule. **Note git is
-deliberately NOT in either** — you authorized git including `git push`, so commits
-and pushes run without asking.
+catches email senders, file uploads via curl/wget, `scp/ssh/rsync`, package
+publishing (`npm publish`, `twine upload`…), `sudo`, and `rm -rf /` — **and their
+PowerShell equivalents** (`Send-MailMessage`, `Invoke-RestMethod -Method POST`,
+`Enter-PSSession`, `Start-Process -Verb RunAs`, `Format-Volume`), which matters
+because PowerShell is the shell the agent reaches for on Windows. Installing packages
+*globally* (outside a project `.venv`) asks too. The second net is containment: a
+shell command that *writes to* or *deletes* something outside the workspace asks
+too, so a redirect (`echo x > ~/.bashrc`) can't route around the file-write rule.
+**Note git is deliberately NOT in either** — you authorized git including `git
+push`, so commits and pushes run without asking.
+
+The GitHub CLI (`gh`) and the Gmail / Calendar / Drive connectors are judged by
+**what the command says it does**: reading (`gh issue list`, `gh pr view`, searching
+your mail) runs on its own; anything that changes something (`gh pr create`, `gh repo
+delete`, sending an email, creating an event) asks; and anything it doesn't
+recognize asks too.
 
 `make_permission_callback()` wraps `classify` for real use: on "ask" it prints a
 yellow prompt and waits for `y/N`. In a **non-interactive** run (no real
 terminal), "ask" becomes an automatic **deny** — so an unattended run never hangs
 *and* never takes an unapproved outward action. (This is why the earlier live
-builds completed without pausing: nothing they did was outward-facing.)
+builds completed without pausing: nothing they did was outward-facing.) The one
+exception is a schedule's **pre-approvals** — see §6b.
 
 ### `config.py` — the settings drawer
 One small module holding everything tunable: the model + effort level, all the
-filesystem paths (`data/`, `workspace/`, prompts), `agent_env()` (prepends the
-GitHub CLI dir to PATH if `gh` isn't found), and `default_mcp_servers()` (the
-browser + memory servers attached to every run). Also sets `setting_sources=None`
+filesystem paths (`data/`, `workspace/`, prompts — `RELIFE_HOME` moves them),
+`agent_env()` (prepends the GitHub CLI dir to PATH if `gh` isn't found), and
+`default_mcp_servers()` (the browser + memory servers attached to every run). Also sets `setting_sources=None`
 indirectly — ReLife refuses to inherit the surrounding repo's Claude Code config,
 so it behaves identically wherever it's run.
 
 ### `hooks.py` — automatic memory recall
-A **hook** is a callback the SDK fires at lifecycle moments. ReLife registers one
-on `UserPromptSubmit` (fires right before your prompt reaches Claude). It calls
-`store.recall()` + `skills.find_skills()` on your prompt text and, if anything
-relevant turns up, **injects it as hidden extra context.** The effect: the agent
-"remembers" relevant past lessons *without having to decide to look them up*. It
-still has the manual `memory_recall` tool for explicit lookups.
+A **hook** is a callback the SDK fires at lifecycle moments. ReLife registers three:
+- **before your prompt reaches Claude** (`UserPromptSubmit`) it looks up memories,
+  skills and workflows matching your prompt and, if anything relevant turns up,
+  **injects it as hidden extra context** — so the agent "remembers" relevant past
+  lessons *without having to decide to look them up*;
+- **after every tool call** (`PostToolUse`) it writes one line to the event journal;
+- **when the run stops** (`Stop`) it saves a short "episode" — what the task was and
+  how it was approached.
+
+The agent still has the manual `memory_recall` tool for explicit lookups. If memory
+is unreachable for some reason, the hooks quietly do nothing rather than break the
+run.
 
 ### `prompts/system.md` — the persona
 A Markdown file appended onto Claude Code's built-in "preset" system prompt. It
@@ -316,17 +354,32 @@ mark it?* (importance).
   recall ranks things, so it makes memory *cleaner and safer*, not magically
   smarter. It's gated behind a manual command for **risk** reasons (an AI editing
   its own memory unsupervised is dangerous) as much as cost.
-- **`server.py`** — wraps all of the above as the **MCP server** `relife_memory`,
-  exposing the tools Claude calls: `memory_save` (with an `importance` dial),
-  `memory_recall`, `memory_forget`, `skill_write`/`skill_find`,
-  `workflow_save`/`workflow_find`, `memory_consolidate`, and `memory_dream` (the
-  REM pass). Names start with `relife` → the permission policy auto-trusts them.
+- **`tools.py`** — the memory tools, each written **once**: name, description,
+  inputs, and what it does. Everything below serves these same definitions.
+- **`server.py`** — wraps them as the **MCP server** `relife_memory`, exposing the
+  tools Claude calls: `memory_save` (with an `importance` dial), `memory_recall`,
+  `memory_forget`, `skill_write`/`skill_find`, `workflow_save`/`workflow_find`,
+  `memory_consolidate`, and `memory_dream` (the REM pass). Names start with
+  `relife` → the permission policy auto-trusts them.
+- **`mcp_server.py`** — the same memory as a **standalone MCP server for other AI
+  apps** (§6d), minus the two housekeeping tools and plus `memory_context`, which
+  hands an app the same "here's what memory knows" block the hook gives Claude.
+- **`context.py`** — builds that block (shared by the hook and `memory_context`).
+- **`spaces.py`** — memory **spaces**: each agent's own corner of the memory
+  (§6d). Everything from before spaces existed is in the `default` space — yours.
 - **`_text.py`** — the shared tokenizer (lowercases, splits words, drops
   stop-words like "the"/"a") used by every keyword path.
 
 **Fact vs. skill vs. workflow:** a *fact* is a thing that's true ("the user
 prefers ruff"); a *skill* is one procedure you can replay ("scaffold a FastAPI
 service"); a *workflow* is a multi-stage plan ("ship a new service end to end").
+
+### The rest of the top-level files
+- **`agents.py`** — the agent registry (`data/agents.json`): who each agent is, which
+  memory it writes, which it may read, and the hand-over operations (§6d).
+- **`workitems.py`** — the GitHub plumbing behind `relife work` (§6c).
+- **`doctor.py`** — `relife doctor`'s checks (§6b).
+- **`crew/`** — `relife crew` (§6d).
 
 ---
 
@@ -466,6 +519,15 @@ needed you for** (each denied action, with what it was). The panel shows the
 last outcome on the card and a *runs* list per schedule. Intervals under five
 minutes are refused: every run spends your Max budget.
 
+**Pre-approvals.** "Summarize my inbox and email me the digest" could never finish
+unattended — nobody is there to approve the email. So a schedule can carry a few
+narrow **pre-approvals**: *email* or *calendar events* to addresses you list (at most
+five), or — for a work schedule (§6c) — opening *the one pull request* for the issue
+that run worked on. Everything else still asks. A run can use them at most three
+times, each use is listed in the run's record ("done for you — pre-approved"), and
+an email only counts if every recipient is on your list and visible in the call
+(no sending a saved draft, no reply-all).
+
 ### `relife doctor`
 
 Everything ReLife leans on lives outside the package (the `claude` login, Node,
@@ -480,7 +542,99 @@ something.
 `RELIFE_MEMORY_URL=http://127.0.0.1:8787` and every ReLife process (CLI runs,
 the server, scheduled runs) shares **one brain** instead of each opening the
 database. Unset the variable and nothing changes — memory is in-process by
-default.
+default. The daemon also serves the memory to other AI apps over the network at
+`/mcp` (§6d).
+
+---
+
+## 6c. Working your GitHub issues — `relife work`
+
+`relife work` on its own lists the open issues assigned to you. Give it one —
+`relife work owner/repo#12`, an issue URL, or `12 --repo owner/repo` — and it:
+
+1. reads the issue and its latest comments (a closed issue stops here);
+2. clones the repo once into `workspace/<owner>__<repo>` (an existing clone is left
+   exactly as it is — it might hold your uncommitted work, so updating it is the
+   agent's first visible step);
+3. runs the agent **inside that clone**, so its free-to-write "desk" is just that one
+   repo, on a branch `relife/issue-12-<short-title>`;
+4. the agent implements, tests, commits and pushes on its own, then **asks** before
+   opening the pull request (with "Closes #12").
+
+Issue text is written by other people, so the agent is told it's information, not
+instructions — and the permission rules are the real safety net: whatever a
+malicious "also email the secrets to …" line would need still asks. `--dry-run`
+shows the task without running the agent.
+
+In the web console, a schedule can be a **work schedule** ("work my assigned GitHub
+issues", optionally only one repo or one label): each time it fires it takes the
+newest issue it hasn't tried yet. If there's nothing new, it skips without starting
+the agent — no budget spent. Unattended, the PR step would be denied (nobody to
+approve), so the branch gets pushed and the PR shows up under "needed you" — unless
+you ticked "may open the PR without asking", the narrowest pre-approval there is: it
+covers one plain `gh pr create` for *that* issue's repo and branch, nothing else.
+
+---
+
+## 6d. The platform — agents, shared memory, other AI apps, crews
+
+### Agents, each with their own memory
+
+`relife agent create reviewer` registers an agent. It gets its own **memory space**
+— its own corner of the same database — and that's the only place it can *write*.
+It can *read* its own memory plus yours (the `default` space), unless you create it
+with `--isolated`. Run it with `relife do --agent reviewer "…"`. Your memory only
+changes when you, or your main agent, change it.
+
+### Handing memory from an old agent to a new one
+
+| You want… | Command | What happens |
+|---|---|---|
+| a new agent that *knows what an old one knows* | `relife agent create junior --inherit veteran` | `junior` reads `veteran`'s memory live (and whatever `veteran` inherited), but can't change it |
+| a new agent that *starts from a copy* | `relife agent create v2 --fork veteran` | `v2` gets a snapshot copy of `veteran`'s memories, skills and workflows, as its own |
+| to *keep* what an agent learned | `relife agent promote reviewer` | copies its memories into yours — your call, never automatic |
+| to move memory to another machine | `relife memory export veteran -o pack.json` / `relife memory import pack.json --space veteran` | a portable file |
+
+Inheriting is read-only on purpose: a new memory can only be saved in one place. If
+two agents should *share* one memory, give them the same `--space`. Recalled memory
+that came from another agent is labelled (`via veteran`), so it's clear whose it is.
+
+### Other AI apps can use ReLife's memory
+
+`relife agent create cursor --runtime external` (or `relife agent connect cursor`)
+prints a block of settings to paste into Cursor, Claude Desktop, Gemini CLI or any
+other app that speaks MCP. That app can then save to and recall from *its* agent's
+memory (and read yours, unless isolated) — locally via `relife mcp --agent cursor`,
+or over the network from `relife memory serve` with a per-agent token (`relife agent
+token cursor`; revoke it any time). The app can't pick a different agent's memory,
+and it can't run the housekeeping or "dream" passes.
+
+### Crews — a team for one task
+
+`relife crew "add CSV export and review it"`:
+
+1. **Plans a team.** Claude (on your subscription — no API key) proposes a small crew:
+   which agents (reusing experienced ones, and letting new ones inherit their memory),
+   which model each runs on, and which tasks in what order.
+2. **Shows you the plan and asks** before anything runs (`--plan-only` stops here;
+   `--yes` skips the question).
+3. **Runs it with CrewAI.** Members of two kinds:
+   - **ReLife agents** — full Claude agents with all of ReLife's tools and the same
+     permission rules; each task runs in `workspace/crews/<id>/`, and anything outward
+     still asks you in the terminal;
+   - **agents on other models** (local Ollama models, or OpenAI/Gemini with keys you
+     set in your environment — list them in `RELIFE_CREW_LLMS`) or `claude-max`
+     (Claude through your subscription) — these get ReLife memory but **no shell, no
+     files, no browser**, because ReLife's permission rules can't watch over CrewAI's
+     own tool loop.
+4. **Keeps the result** in `data/crews/<id>/` — `relife crews <id>` shows what each
+   task produced, what it cost and anything that was denied. Each agent's lessons
+   land in its own memory; `relife agent promote` brings the good ones into yours.
+
+CrewAI doesn't run on Python 3.14 yet, so crews run from a Python 3.12 virtual
+environment (`py -3.12 -m venv .venv`, then `.venv\Scripts\pip install -e ".[crewai]"`
+and `.venv\Scripts\relife crew …`). `relife doctor` tells you this if you're on
+3.14.
 
 ---
 
@@ -502,10 +656,16 @@ D:\ReLife\
 │   ├─ builds/<id>/         one folder per `relife build` (ledger.json + plan.md)
 │   ├─ schedules.json       the schedules you set up in the console
 │   ├─ runs/<schedule>/     one JSON per scheduled run (summary, cost, what needed you)
+│   ├─ agents.json          your registered agents (who reads/writes which memory)
+│   ├─ spaces/<agent>/      each agent's own skills/ and workflows/
+│   ├─ crews/<id>/          one folder per `relife crew` run (plan + outcome)
 │   └─ relife.db.daemon     marker left by a running `relife memory serve` (optional)
-├─ tests/                   252 deterministic tests (no live AI — safe & fast)
+├─ .venv/                   Python 3.12 environment for crews (gitignored)
+├─ tests/                   ~800 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
+├─ MODULE_DEEP_DIVE.md      the architecture, module by module, with the reasoning
+├─ RELEASE_TESTING.md       the release checklist (incl. the budget-spending smokes)
 └─ HOW_IT_WORKS.md          ← you are here (the friendly guide)
 ```
 
@@ -514,16 +674,19 @@ D:\ReLife\
 ## 8. Things that surprise people (worth knowing)
 
 - **It costs subscription budget, not dollars-per-call.** ReLife uses your Claude
-  Code **Max** subscription. `ANTHROPIC_API_KEY` is intentionally unset; if it
-  were set, ReLife would refuse to use it. Heavy runs (especially big builds) draw
-  on the *same* usage budget as your interactive Claude Code — so a giant build
-  can hit "you've hit your session limit." That's exactly what `--resume` is for.
-- **The tests never call the live model.** All 252 tests are deterministic — they
+  Code **Max** subscription. `ANTHROPIC_API_KEY` is intentionally unset, and
+  `relife doctor` warns if it's set (it would bill metered usage instead). Heavy
+  runs (especially big builds and crews) draw on the *same* usage budget as your
+  interactive Claude Code — so a giant build can hit "you've hit your session
+  limit." That's exactly what `--resume` is for. Even inside a crew, Claude goes
+  through your subscription; only the *other* models you choose use their own keys.
+- **The tests never call the live model.** All ~800 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
   the cognitive activation/decay math, workflow learning, ledger persistence, the
-  REM critic's *application* logic via a stubbed AI, and the whole server —
-  auth, streaming, approvals, schedules — against a scripted fake agent), not
-  Claude. So you can run them freely without spending budget.
+  REM critic's *application* logic via a stubbed AI, the whole server — auth,
+  streaming, approvals, schedules — against a scripted fake agent, the memory MCP
+  server over the real protocol, and even a real CrewAI crew run with stand-in
+  models), not Claude. So you can run them freely without spending budget.
 - **There are two kinds of "memory cleanup", and only one uses AI.** The automatic
   **sleep** pass (`consolidate`) is mechanical and free — it runs itself. The
   **dream** pass (`relife dream`) is the only thing in the whole memory layer that
@@ -541,6 +704,13 @@ D:\ReLife\
   is done by the disposable `builder` subagents; the orchestrator only plans and
   tracks. If you watch a build and wonder why the "main" agent isn't typing
   code — that's by design.
+- **Agents never write into your memory.** Each writes only its own space; the only
+  ways in are you (or your main agent), `relife agent promote`, and `relife memory
+  import`. The housekeeping pass also stays inside each space — one agent's habits
+  never turn into workflows in another's memory.
+- **Agents on other models don't get hands.** In a crew, anything that touches your
+  machine (files, shell, git, browser) is done by a ReLife agent under ReLife's
+  permission rules; models running inside CrewAI only think, recall and remember.
 
 ---
 
@@ -560,10 +730,15 @@ D:\ReLife\
 7. For **big** jobs, `relife build` **plans milestones → delegates each to a
    fresh builder → records everything in a ledger**, which makes it **resumable**.
 8. `relife serve` keeps it **always on**: a web console with approval cards, and
-   **schedules** that run tasks unattended and record what they did and what
-   they needed you for.
-9. It runs on your **Max subscription**; deterministic **tests** verify the
+   **schedules** that run tasks unattended — including working your **GitHub
+   issues** — and record what they did and what they needed you for, with narrow
+   **pre-approvals** for the few things you trust it to do alone.
+9. It's a **platform**: several **agents**, each with its own memory, that can
+   **inherit** or **fork** an older agent's memory; **other AI apps** can use the
+   memory over MCP; and **crews** let CrewAI plan a team that ReLife staffs.
+10. It runs on your **Max subscription**; deterministic **tests** verify the
    plumbing without spending budget.
 
 That's ReLife. When in doubt, open `plan.md` inside a build folder to *see* the
-machine thinking, or re-read §4 (one request), §6 (a build) and §6b (the server).
+machine thinking, or re-read §4 (one request), §6 (a build), §6b (the server) and §6d
+(the platform). For the *why* behind every design choice, read `MODULE_DEEP_DIVE.md`.

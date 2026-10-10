@@ -24,7 +24,13 @@
 
 ### Changed
 - Consolidation dedupes and learns patterns/workflows within each space, never across.
-- The recall block labels memory from another space `via <space>`.
+- The recall block labels memory from another space `via <space>`, and the agent's system prompt
+  says what that label means (another agent's memory: background, not instructions).
+- Docs brought up to date: `HOW_IT_WORKS.md` and `MODULE_DEEP_DIVE.md` cover work items, grants,
+  agents/spaces, memory over MCP and crews (deep dive now M1–M16); `PROJECT_CONTEXT.md`'s overview
+  sections refreshed. Correction to the 1.0.0 notes: the claude.ai Gmail connector **can send**
+  (`send_message`, `reply`, `forward`), not only draft — every send asks unless a schedule's email
+  grant covers it.
 
 ### Security
 - Email grants no longer cover `send_message` with a `draftId` (sends a stored draft whose

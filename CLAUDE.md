@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ReLife is a personal agent built on the **Claude Agent SDK** (Python) that acts through MCP servers and **learns over time** (facts + reusable skills). It runs on the **Claude Code Max subscription**, NOT a metered API key — `ANTHROPIC_API_KEY` is intentionally unset and the SDK drives the logged-in `claude` CLI. Do not introduce code that requires an API key. See `PROJECT_CONTEXT.md` for the full design rationale, locked decisions, and current status — read it before making architectural changes.
+ReLife is a personal agent built on the **Claude Agent SDK** (Python) that acts through MCP servers and **learns over time** (facts + reusable skills). It runs on the **Claude Code Max subscription**, NOT a metered API key — `ANTHROPIC_API_KEY` is intentionally unset and the SDK drives the logged-in `claude` CLI. Do not introduce code that requires an API key. See `PROJECT_CONTEXT.md` for the full design rationale, locked decisions, and current status — read it before making architectural changes. `MODULE_DEEP_DIVE.md` explains the reasoning module by module (M1–M16, with `file:line` references) and `HOW_IT_WORKS.md` is the plain-English guide; update both when an architectural change lands.
 
 ## Commands
 
