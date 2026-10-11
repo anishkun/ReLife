@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import secrets
 import shutil
 import threading
@@ -37,7 +36,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import _atomic, config
 from .memory.spaces import DEFAULT_SCOPE, DEFAULT_SPACE, MemoryScope, validate_space
 
 RUNTIMES = ("relife", "llm", "external")
@@ -169,14 +168,15 @@ class AgentStore:
         self._load()
 
     def _load(self) -> None:
-        self._items, self.problem = self._read()
+        with _WRITE_LOCK:  # never read a file this process is half-way replacing
+            self._items, self.problem = self._read()
 
     def _read(self) -> tuple[dict[str, AgentProfile], str | None]:
         items: dict[str, AgentProfile] = {}
         if not self.path.exists():
             return items, None
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(_atomic.read_text(self.path))
         except (OSError, ValueError) as e:
             return items, f"unreadable ({type(e).__name__}: {e})"
         records = raw.get("agents", []) if isinstance(raw, dict) else None
@@ -220,7 +220,7 @@ class AgentStore:
         payload = {"version": 1, "agents": [asdict(a) for a in self._items.values()]}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        _atomic.replace(tmp, self.path)
 
     def list(self) -> list[AgentProfile]:
         return sorted(self._items.values(), key=lambda a: a.created_at)

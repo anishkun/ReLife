@@ -433,10 +433,10 @@ def test_crew_records_survive_windows_read_replace_races(tmp_path, monkeypatch):
     full suite hit it). Both retry instead of failing."""
     import os
 
-    from relife.crew import record as rec_mod
+    from relife import _atomic as rec_mod
     from relife.crew.record import CrewRunRecord, CrewRunStore
 
-    monkeypatch.setattr(rec_mod, "_RETRY_DELAY", 0)
+    monkeypatch.setattr(rec_mod, "RETRY_DELAY", 0)
     store = CrewRunStore(tmp_path)
     rec = CrewRunRecord(id=CrewRunRecord.new_id(), task="t", workspace=str(tmp_path), spec=SPEC)
     real_replace, fails = os.replace, {"n": 2}

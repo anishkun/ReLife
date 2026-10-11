@@ -720,8 +720,15 @@ name: evil` can no longer close the frontmatter and forge
   while writing the tests: **a connection per call was the real write cost** — per-thread cached
   connections with WAL (`memory/_sqlite.py`): a logged tool call ~15 ms → <1 ms; the new test file
   went 116 s → 8 s. Tests: `tests/test_scaling.py` (24; 13 fail on the old code) + 3 in
-  `test_memory_remote.py`. Still open from the review: session/crew subprocess weight, no global Max
-  budget guard, in-memory server state, sqlite-vec full mirror rebuild, cross-process registry lock.
+  `test_memory_remote.py`. CI then caught two more: (7) **sqlite-vec** cached one index for the first
+  embedding dimension seen ("Dimension mismatch" on every later search of another length — the
+  scaling test's 4-dim fake vectors exposed it) and synced from a per-process counter (rebuilt the
+  whole mirror on every save; could skip a sync across two DBs) — now per-dimension, incremental, its
+  state in `memories_vec_meta`, and scoped searches widen until the space filter is satisfied;
+  (8) **Windows sharing violations** on the agent registry under concurrent creates — every atomic
+  JSON store now goes through `relife/_atomic.py` (retrying replace/read). Still open from the
+  review: session/crew subprocess weight, no global Max budget guard, in-memory server state,
+  cross-process registry lock.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

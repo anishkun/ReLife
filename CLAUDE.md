@@ -243,6 +243,14 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
   turn's own events come straight off `(task_id, id)` (`events.for_task`) — a shared 500-event window
   let a busy agent hide everyone else's. The auto-consolidate throttle counts by `max_id()` (pruning
   lowers `count()`); an old state file's `last_event_count` is read as an id.
+- **Every atomic JSON write goes through `relife/_atomic.py`** (agents, schedules, run and crew
+  records): on Windows a file open for reading can't be replaced (and vice versa), so `replace`/
+  `read_text` retry a `PermissionError` briefly. A new store must use it too — CI's windows-latest
+  is where this shows, rarely locally.
+- **sqlite-vec is a mirror with its state in the DB** (`memories_vec_meta`: dim + a signature of the
+  indexable rows). Sync is incremental by id (AUTOINCREMENT ids are never reused); a table of another
+  dimension is rebuilt; `get_index` caches per dimension; scoped searches widen `k` until enough pass
+  the space filter. CI's `full` job is the only place with sqlite-vec installed.
 - **Registry writes re-read first.** `AgentStore.put/remove` reload the file under `_WRITE_LOCK` before
   writing (`put(new=True)` refuses a name taken meanwhile): routes run them on worker threads and a
   crew's worker creates agents, so a plain load→modify→write dropped concurrent writers' agents.

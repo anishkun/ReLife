@@ -58,6 +58,11 @@
   12 s → 10 ms per search); memory DB connections are reused per thread with WAL (a logged tool call
   ~15 ms → well under 1 ms); the memory daemon runs sweeps and space copy/import/export off its event
   loop, so one sweep no longer stalls every agent.
+- The optional sqlite-vec index syncs incrementally and keeps its sync state in the DB (it rebuilt
+  the whole mirror after every save, from a per-process counter that could skip a needed sync when
+  one process used two DBs); it is cached per embedding dimension (a second dimension broke every
+  search with "Dimension mismatch"); and a scoped search widens until enough results pass the space
+  filter, so a small agent's memories aren't crowded out by a big space's.
 - The tool-event log is pruned (`RELIFE_EVENTS_KEEP`, default 20,000) and pattern mining reads each
   space's own recent events, so a busy agent no longer hides a quiet one's patterns.
 
@@ -66,6 +71,9 @@
   memory (or an inherited space, or through `memory_context` over MCP) used to reinforce it.
 - A turn's episode now finds its own tool events however many other sessions logged since (it read
   them from the newest 500 events overall).
+- Windows: agents, schedules, run records and crew records all retry a momentary sharing violation
+  (`PermissionError` when one thread reads a file another replaces) — concurrent agent creates
+  failed on windows-latest.
 - Platform under concurrency: agent registry writes merge with the file instead of dropping another
   writer's agent (and a racing create of one name fails); a crew can't be started twice by two quick
   `run` requests or overshoot `RELIFE_AGENT_MAX_CREWS`; two crews planned in the same millisecond no

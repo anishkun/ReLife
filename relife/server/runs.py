@@ -14,14 +14,13 @@ plus a small per-schedule file store under ``data/runs/<schedule_id>/``.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .. import config
+from .. import _atomic, config
 
 # Keep the closing summary readable in a panel; the full text is in the events.
 SUMMARY_MAX_CHARS = 2000
@@ -156,7 +155,7 @@ class RunStore:
         path = self._path(record.schedule_id, record.run_id)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(asdict(record)), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic.replace(tmp, path)
         self._prune(record.schedule_id)
 
     def _prune(self, schedule_id: str) -> None:
@@ -176,7 +175,7 @@ class RunStore:
         if not path.exists():
             return None
         try:
-            return RunRecord(**json.loads(path.read_text(encoding="utf-8")))
+            return RunRecord(**json.loads(_atomic.read_text(path)))
         except (OSError, ValueError, TypeError):
             return None
 

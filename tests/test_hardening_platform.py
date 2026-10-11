@@ -11,6 +11,7 @@ to get further than it should. No CrewAI needed (the crew-runtime cases live in
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import math
 import threading
 
@@ -385,3 +386,45 @@ def test_crews_planned_in_the_same_millisecond_get_their_own_records(tmp_path):
     assert len(set(ids)) == 5
     assert all(store.get(i) is None for i in ids)  # reserved, not yet a record
     assert store.list() == []
+
+
+def test_every_durable_store_retries_a_windows_sharing_violation(tmp_path, monkeypatch):
+    """CI (windows-latest) caught concurrent agent creates failing with
+    PermissionError: a reader had the file open while another thread replaced
+    it. Agents, schedules and run records now retry like crew records do."""
+    import os
+
+    from relife import _atomic
+    from relife.server.runs import RunRecord, RunStore
+    from relife.server.schedules import Schedule, ScheduleStore
+
+    monkeypatch.setattr(_atomic, "RETRY_DELAY", 0)
+    real_replace, real_read = os.replace, pathlib.Path.read_text
+    fails = {"replace": 0, "read": 0}
+
+    def flaky_replace(a, b):
+        fails["replace"] += 1
+        if fails["replace"] % 3:  # two failures, then success
+            raise PermissionError(13, "in use")
+        return real_replace(a, b)
+
+    def flaky_read(self, *a, **kw):
+        fails["read"] += 1
+        if fails["read"] % 3:
+            raise PermissionError(13, "in use")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(_atomic.os, "replace", flaky_replace)
+    monkeypatch.setattr(_atomic.Path, "read_text", flaky_read)
+
+    agents = ag.AgentStore(tmp_path / "agents.json")
+    ag.create_agent(agents, LocalMemoryClient(), "alpha")
+    assert ag.AgentStore(tmp_path / "agents.json").require("alpha")
+
+    sched = ScheduleStore(tmp_path / "schedules.json")
+    sched.add(Schedule.new(name="n", task="t", spec={"every": "1h"}, workspace=str(tmp_path)))
+    assert len(ScheduleStore(tmp_path / "schedules.json").list()) == 1
+
+    runs = RunStore(tmp_path / "runs")
+    runs.save(RunRecord(schedule_id="s1", run_id="20260101-000000-000", started_at=1.0))
+    assert runs.get("s1", "20260101-000000-000") is not None
