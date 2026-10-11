@@ -366,3 +366,63 @@ def test_conformance_scoped_client(client):
     assert [e.space for e in a.events_for_task("sess-1")] == ["alpha"]
     assert a.recall("deploys fridays")[0].space == "alpha"
     assert client.recall("deploys fridays") == []
+
+
+# --- scaling: identical behaviour over both transports ---------------------------------
+def test_conformance_reinforcement_stays_in_the_readers_space(client):
+    from relife.memory.client import ScopedMemoryClient
+    from relife.memory.spaces import MemoryScope
+
+    theirs = client.save("the release train leaves on tuesdays")
+    mine = client.save("the release notes live in docs/releases", space="agent-r", source="agent-r")
+    agent = ScopedMemoryClient(client, MemoryScope(read=("agent-r", "default"), write="agent-r"))
+    assert {m.id for m in agent.recall("release train notes", reinforce=True)} == {theirs, mine}
+    assert client.get(theirs).use_count == 0 and client.get(mine).use_count == 1
+
+
+def test_conformance_events_for_task_beyond_the_recent_window(client):
+    client.log_event("Edit", "a.py", task_id="mine")
+    for i in range(520):  # straight into the shared DB: 520 HTTP round-trips are slow
+        ev.log_event("Read", f"r{i}", task_id="busy")
+    assert [e.tool for e in client.events_for_task("mine")] == ["Edit"]
+
+
+def test_a_sweep_runs_off_the_daemons_loop(tmp_path, monkeypatch):
+    """One consolidation used to run inline on the daemon's only loop: every
+    other caller — every agent on /mcp — waited for it."""
+    pytest.importorskip("fastapi")
+    import threading
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    from relife.memory.remote.daemon import create_app
+    from relife.memory.service import MemoryService
+
+    _bind_default_store(tmp_path, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_sweep(self):
+        started.set()
+        release.wait(10)
+        return consol.ConsolidationReport()
+
+    monkeypatch.setattr(MemoryService, "consolidate", slow_sweep)
+    monkeypatch.setattr(MemoryService, "maybe_consolidate", lambda self: consol.ConsolidationReport())
+    app = create_app(
+        tmp_path / "relife.db", skills_dir=tmp_path / "skills", workflows_dir=tmp_path / "workflows",
+        spaces_dir=tmp_path / "spaces",
+    )
+    with TestClient(app) as tc:
+        sweep = threading.Thread(target=lambda: tc.post("/consolidate"))
+        sweep.start()
+        assert started.wait(5)
+        t = _time.perf_counter()
+        assert tc.post("/save", json={"text": "saved during a sweep"}).status_code == 200
+        assert tc.get("/count").json()["count"] == 1
+        assert _time.perf_counter() - t < 2  # served while the sweep holds its thread
+        # A throttled sweep doesn't queue behind a running one: it skips.
+        assert tc.post("/consolidate/maybe").json() is None
+        release.set()
+        sweep.join(10)
+        assert not sweep.is_alive()

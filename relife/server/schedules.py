@@ -18,7 +18,6 @@ fires **once** on the next tick, never N times.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import time
@@ -28,7 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .. import config
+from .. import _atomic, config
 from ..permissions import describe_grant, normalize_grants
 
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -388,7 +387,7 @@ class ScheduleStore:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(_atomic.read_text(self.path))
         except (OSError, ValueError) as e:
             self.problem = f"unreadable ({type(e).__name__}: {e})"
             return
@@ -426,7 +425,7 @@ class ScheduleStore:
         payload = {"version": 1, "schedules": [asdict(s) for s in self._items.values()]}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        _atomic.replace(tmp, self.path)
 
     def list(self) -> list[Schedule]:
         return sorted(self._items.values(), key=lambda s: s.created_at)

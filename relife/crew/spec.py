@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..agents import validate_agent_name
+from ..agents import MAX_INHERITS, validate_agent_name
 
 RUNTIMES = ("relife", "llm")
 PROCESSES = ("sequential", "hierarchical")
@@ -154,7 +154,13 @@ def normalize_spec(
             llm = ""  # a ReLife agent runs on ReLife's own model
         lineage_ok = existing_agents | seen
         inherit = _names(d.get("inherit"), where=f"{where}: inherit")
+        if len(inherit) > MAX_INHERITS:
+            raise ValueError(f"{where}: inherits from at most {MAX_INHERITS} agents")
         fork = d.get("fork") or None
+        if fork is not None:
+            if not isinstance(fork, str):
+                raise ValueError(f"{where}: fork must be an agent name")
+            fork = fork.strip() or None
         for ref in [*inherit, *([fork] if fork else [])]:
             if ref == name:
                 raise ValueError(f"{where}: can't inherit from or fork itself")
@@ -194,7 +200,7 @@ def normalize_spec(
         if tname in done:
             raise ValueError(f"{where}: defined twice")
         agent = d.get("agent")
-        if agent not in seen:
+        if not isinstance(agent, str) or agent not in seen:
             raise ValueError(f"{where}: agent {agent!r} isn't on the crew")
         context = _names(d.get("context"), where=f"{where}: context")
         for ref in context:

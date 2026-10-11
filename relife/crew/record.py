@@ -13,35 +13,15 @@ output, and status (``planned`` → ``running`` → ``done`` | ``error`` |
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .. import config
+from .. import _atomic, config
 
 _RUN_ID = re.compile(r"^\d{8}-\d{6}-\d{3}$")
-
-# Under `relife serve` a crew's worker thread rewrites its record while HTTP
-# routes read it. On Windows a file being read can't be replaced (and one
-# being replaced can't be opened), so either side may see a PermissionError
-# for an instant: retry briefly rather than fail a request or lose a save.
-_RETRIES = 20
-_RETRY_DELAY = 0.025
-
-
-def _retrying(fn):
-    for attempt in range(_RETRIES):
-        try:
-            return fn()
-        except PermissionError:
-            if attempt == _RETRIES - 1:
-                raise
-            time.sleep(_RETRY_DELAY)
-    return None  # pragma: no cover
-
 
 @dataclass
 class TaskOutcome:
@@ -99,13 +79,31 @@ class CrewRunStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root) if root is not None else config.CREWS_DIR
 
+    def reserve_id(self, now: float | None = None) -> str:
+        """A fresh run id, claimed by creating its directory (``mkdir`` is
+        atomic). Ids are millisecond timestamps, so two crews planned in the
+        same millisecond — a schedule firing while the UI plans — would
+        otherwise share one record and one workspace; the later one moves on a
+        millisecond instead."""
+        now = time.time() if now is None else now
+        self.root.mkdir(parents=True, exist_ok=True)
+        for step in range(1000):
+            run_id = CrewRunRecord.new_id(now + step / 1000)
+            try:
+                (self.root / run_id).mkdir()
+            except FileExistsError:
+                continue
+            return run_id
+        raise RuntimeError("could not allocate a crew run id")
+
     def save(self, record: CrewRunRecord) -> Path:
         d = self.root / record.id
         d.mkdir(parents=True, exist_ok=True)
         path = d / "record.json"
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        _retrying(lambda: os.replace(tmp, path))
+        # Routes read this file while the worker rewrites it (see _atomic).
+        _atomic.replace(tmp, path)
         return path
 
     def get(self, run_id: str) -> CrewRunRecord | None:
@@ -114,7 +112,7 @@ class CrewRunStore:
         path = self.root / run_id / "record.json"
         if not path.exists():
             return None
-        return CrewRunRecord.from_dict(json.loads(_retrying(lambda: path.read_text(encoding="utf-8"))))
+        return CrewRunRecord.from_dict(json.loads(_atomic.read_text(path)))
 
     def list(self, limit: int = 20) -> list[CrewRunRecord]:
         if not self.root.is_dir():

@@ -145,6 +145,9 @@ EPISODE_MIN_EVENTS = int(os.environ.get("RELIFE_EPISODE_MIN_EVENTS", "3"))
 RECUR_THRESHOLD = 3        # a signature must repeat this many times to be a pattern
 AUTO_CONSOLIDATE = os.environ.get("RELIFE_AUTO_CONSOLIDATE", "1") != "0"
 CONSOLIDATE_EVERY = 5      # auto-run after this many new episodes/events
+# The tool-event log is raw material for pattern mining, which reads a recent
+# window per space; a consolidation pass keeps only the newest this-many events.
+EVENTS_KEEP = int(os.environ.get("RELIFE_EVENTS_KEEP", "20000"))
 
 # REM ("dream") pass — the OPT-IN, LLM-driven deep review (`relife dream`). Unlike
 # the deterministic consolidation above, REM asks the model to act as an

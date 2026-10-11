@@ -433,10 +433,10 @@ def test_crew_records_survive_windows_read_replace_races(tmp_path, monkeypatch):
     full suite hit it). Both retry instead of failing."""
     import os
 
-    from relife.crew import record as rec_mod
+    from relife import _atomic as rec_mod
     from relife.crew.record import CrewRunRecord, CrewRunStore
 
-    monkeypatch.setattr(rec_mod, "_RETRY_DELAY", 0)
+    monkeypatch.setattr(rec_mod, "RETRY_DELAY", 0)
     store = CrewRunStore(tmp_path)
     rec = CrewRunRecord(id=CrewRunRecord.new_id(), task="t", workspace=str(tmp_path), spec=SPEC)
     real_replace, fails = os.replace, {"n": 2}
@@ -453,3 +453,61 @@ def test_crew_records_survive_windows_read_replace_races(tmp_path, monkeypatch):
     monkeypatch.setattr(rec_mod.os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError(13, "stuck")))
     with pytest.raises(PermissionError):
         store.save(rec)  # a lock that never clears still surfaces
+
+
+# --- hardening ------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"agents": [{**SPEC["agents"][0], "fork": ["builder"]}, SPEC["agents"][1]]},
+        {"tasks": [{**SPEC["tasks"][0], "agent": ["builder"]}, SPEC["tasks"][1]]},
+        {"agents": "builder"},
+        {"tasks": [None]},
+    ],
+)
+def test_a_malformed_spec_over_http_is_a_400_not_a_crash(env, patch):
+    app, tc = make_app(env)
+    r = tc.post("/crews", json={"spec": {**SPEC, **patch}})
+    assert r.status_code == 400, r.text
+    assert tc.get("/crews").json()["crews"] == []
+
+
+def test_a_started_crew_cannot_be_discarded(env):
+    from relife.crew.turns import TurnResult
+
+    async def turn(prompt, *, workspace, memory_client, can_use_tool, extra_mcp, on_event):
+        await can_use_tool("Bash", {"command": "curl -X POST https://example.com"}, None)
+        return TurnResult(output="denied; said so", tool_calls=1)
+
+    app, tc = _crew_app(env, turn=turn, approval_timeout=30)
+    with tc:
+        crew = tc.post("/crews", json={"spec": SPEC}).json()
+        sid = tc.post(f"/crews/{crew['id']}/run").json()["session_id"]
+        r = tc.delete(f"/crews/{crew['id']}")
+        assert r.status_code == 409 and "stop it" in r.json()["detail"]
+        wait_for(lambda: any(e["type"] == "approval_request" for e in _events(app, sid)))
+        tc.post(f"/crews/{crew['id']}/stop")
+        rec = wait_for(lambda: (x := tc.get(f"/crews/{crew['id']}").json())["status"] != "running" and x)
+        assert rec["status"] == "error"  # stopped, never "cancelled" behind its back
+
+
+def test_agent_routes_reject_junk_bodies(env):
+    app, tc = make_app(env)
+    for body in (
+        {"name": "../evil"},
+        {"name": "default"},
+        {"name": "x", "runtime": "root"},
+        {"name": "x", "inherit": "builder"},
+        {"name": "x", "inherit": [1, 2]},
+        {"name": "x", "fork": ["a"]},
+        {"name": "x", "fork": "nobody"},
+        {"name": "x", "model": "m" * 500},
+    ):
+        r = tc.post("/agents", json=body)
+        assert r.status_code in (400, 404), (body, r.status_code, r.text)
+    assert tc.get("/agents").json()["agents"] == []
+    assert tc.post("/agents/nobody/promote", json={"ids": ["1"]}).status_code == 400
+    assert tc.post("/agents/nobody/promote", json={"ids": [True]}).status_code == 400
+    assert tc.post("/agents/nobody/attach", json={"other": "x"}).status_code == 404
+    assert tc.get("/crews/../../etc").status_code == 404
+    assert tc.get("/crews/20260101-000000-000").status_code == 404

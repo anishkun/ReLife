@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import config
+from ._sqlite import connect as _sqlite_connect
 from .spaces import DEFAULT_SPACE, validate_space
 
 _DB_PATH = config.DATA_DIR / "relife.db"
@@ -47,10 +48,9 @@ class EventLog:
         self.db_path = Path(db_path)
 
     def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        # Same file and the same cached connection as the memory store (see
+        # _sqlite.connect): a log_event per tool call no longer opens a file.
+        return _sqlite_connect(self.db_path)
 
     def init_db(self) -> None:
         with self._connect() as conn:
@@ -76,6 +76,8 @@ class EventLog:
                     "ALTER TABLE events ADD COLUMN space TEXT NOT NULL "
                     f"DEFAULT '{DEFAULT_SPACE}'"
                 )
+            # Pattern mining reads one space's recent events at a time.
+            conn.execute("CREATE INDEX IF NOT EXISTS events_space ON events(space, id)")
 
     def log_event(
         self, tool: str, brief: str = "", task_id: str = "", *, space: str = DEFAULT_SPACE
@@ -93,21 +95,72 @@ class EventLog:
             )
             return int(cur.lastrowid)
 
-    def recent_events(self, limit: int = 500) -> list[Event]:
+    def recent_events(self, limit: int = 500, *, space: str | None = None) -> list[Event]:
+        """The newest ``limit`` events (of ``space`` only, when given), oldest first.
+
+        Per space matters at scale: with one window over every space, a busy
+        agent's events pushed every quieter agent's out of what the pattern
+        miner sees, so those agents never learned a workflow."""
         self.init_db()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if space is None:
+                rows = conn.execute(
+                    "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE space = ? ORDER BY id DESC LIMIT ?",
+                    (space, limit),
+                ).fetchall()
         rows.reverse()  # chronological
         return [_row_to_event(r) for r in rows]
 
-    def events_by_task(self, limit: int = 500) -> dict[str, list[Event]]:
+    def events_by_task(
+        self, limit: int = 500, *, space: str | None = None
+    ) -> dict[str, list[Event]]:
         """Recent events grouped by task_id, chronological within each task."""
         grouped: dict[str, list[Event]] = {}
-        for e in self.recent_events(limit):
+        for e in self.recent_events(limit, space=space):
             grouped.setdefault(e.task_id, []).append(e)
         return grouped
+
+    def for_task(self, task_id: str, limit: int = 500) -> list[Event]:
+        """One task's newest ``limit`` events, oldest first — straight off the
+        ``(task_id, id)`` index, however many other sessions logged since."""
+        self.init_db()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+                (task_id, limit),
+            ).fetchall()
+        rows.reverse()
+        return [_row_to_event(r) for r in rows]
+
+    def spaces(self) -> set[str]:
+        self.init_db()
+        with self._connect() as conn:
+            return {r["space"] for r in conn.execute("SELECT DISTINCT space FROM events")}
+
+    def max_id(self) -> int:
+        """The newest event's id. Ids only grow (AUTOINCREMENT), so unlike
+        ``count()`` this keeps rising when old events are pruned."""
+        self.init_db()
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
+
+    def prune(self, keep: int) -> int:
+        """Delete all but the newest ``keep`` events; return how many went.
+        The log is raw material for pattern mining, which only ever reads a
+        recent window — without this it grew by every tool call forever."""
+        if keep <= 0:
+            return 0
+        self.init_db()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id), 0) FROM events) - ?",
+                (keep,),
+            )
+            return int(cur.rowcount)
 
     def count(self) -> int:
         self.init_db()
@@ -138,12 +191,28 @@ def log_event(
     return _log().log_event(tool, brief=brief, task_id=task_id, space=space)
 
 
-def recent_events(limit: int = 500) -> list[Event]:
-    return _log().recent_events(limit)
+def recent_events(limit: int = 500, *, space: str | None = None) -> list[Event]:
+    return _log().recent_events(limit, space=space)
 
 
-def events_by_task(limit: int = 500) -> dict[str, list[Event]]:
-    return _log().events_by_task(limit)
+def events_by_task(limit: int = 500, *, space: str | None = None) -> dict[str, list[Event]]:
+    return _log().events_by_task(limit, space=space)
+
+
+def for_task(task_id: str, limit: int = 500) -> list[Event]:
+    return _log().for_task(task_id, limit)
+
+
+def spaces() -> set[str]:
+    return _log().spaces()
+
+
+def max_id() -> int:
+    return _log().max_id()
+
+
+def prune(keep: int) -> int:
+    return _log().prune(keep)
 
 
 def count() -> int:

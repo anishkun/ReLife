@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from .. import config
 from ._text import tokenize as _tokens
+from ._procedure import cached_dir, check_procedure, header_value
 from .spaces import DEFAULT_SPACE, space_dir
 
 _WORKFLOWS_DIR = config.WORKFLOWS_DIR
@@ -88,22 +89,34 @@ def write_workflow(
     space: str = DEFAULT_SPACE,
 ) -> str:
     """Create or overwrite a workflow in ``space``. Returns its slug."""
-    if not name.strip() or not steps.strip():
-        raise ValueError("workflow needs a name and steps")
+    try:
+        check_procedure(name, steps)
+    except ValueError as e:
+        raise ValueError(f"workflow {e}") from None
+    name = header_value(name)
     slug = _slug(name)
     path = _dir(space) / f"{slug}.md"
     content = (
-        f"---\nname: {name.strip()}\n"
-        f"when_to_use: {when_to_use.strip()}\n"
-        f"trigger: {trigger.strip()}\n---\n"
+        f"---\nname: {name}\n"
+        f"when_to_use: {header_value(when_to_use)}\n"
+        f"trigger: {header_value(trigger)}\n---\n"
         f"{steps.strip()}\n"
     )
     path.write_text(content, encoding="utf-8")
     return slug
 
 
+def _index(wf: Workflow) -> tuple[set[str], set[str]]:
+    return _tokens(wf.name + " " + wf.slug), _tokens(wf.when_to_use + " " + wf.trigger + " " + wf.body)
+
+
+def _indexed(space: str):
+    # Parsed once per file version (see _procedure.cached_dir), not per search.
+    return cached_dir(_dir(space), lambda p: _parse(p, space), _index)
+
+
 def list_workflows(space: str = DEFAULT_SPACE) -> list[Workflow]:
-    return [_parse(p, space) for p in sorted(_dir(space).glob("*.md"))]
+    return [wf for wf, _, _ in _indexed(space)]
 
 
 def find_workflows(
@@ -118,12 +131,10 @@ def find_workflows(
     scored: list[tuple[int, Workflow]] = []
     seen: set[str] = set()
     for space in spaces if spaces is not None else (DEFAULT_SPACE,):
-        for wf in list_workflows(space):
+        for wf, name_tok, body_tok in _indexed(space):
             if wf.slug in seen:
                 continue
             seen.add(wf.slug)
-            name_tok = _tokens(wf.name + " " + wf.slug)
-            body_tok = _tokens(wf.when_to_use + " " + wf.trigger + " " + wf.body)
             score = 2 * len(q & name_tok) + len(q & body_tok)
             if score:
                 scored.append((score, wf))

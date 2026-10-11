@@ -313,6 +313,10 @@ class CrewService:
         self.approval_timeout = approval_timeout
         self.max_running = config.AGENT_MAX_CREWS if max_running is None else max_running
         self._hosts: dict[str, str] = {}  # crew id → session id
+        # Crews between "checked" and "hosted": adopt() awaits (it reaps idle
+        # sessions first), so without a reservation two quick requests could
+        # both pass the checks and start one crew twice, or overshoot the cap.
+        self._pending: set[str] = set()
 
     @property
     def client(self) -> Any:
@@ -352,14 +356,19 @@ class CrewService:
 
     # --- run ----------------------------------------------------------------
     def running(self) -> int:
-        return sum(
+        live = sum(
             1 for s in self.manager.all() if getattr(s, "kind", "") == "crew" and getattr(s, "busy", False)
         )
+        return live + len(self._pending)
 
     def host(self, crew_id: str) -> CrewHost | None:
         sid = self._hosts.get(crew_id)
         s = self.manager.get(sid) if sid else None
         return s if isinstance(s, CrewHost) else None
+
+    def starting(self, crew_id: str) -> bool:
+        """Checked and being hosted, not yet registered (see ``_pending``)."""
+        return crew_id in self._pending
 
     def session_id(self, crew_id: str) -> str | None:
         h = self.host(crew_id)
@@ -379,7 +388,7 @@ class CrewService:
         # The live host first: the record only says "running" once the worker
         # thread has saved it, so a quick second request would still read
         # "planned" and start the same crew twice.
-        if record.id in self._hosts:
+        if record.id in self._hosts or record.id in self._pending:
             raise ValueError(f"crew {record.id} has already been started")
         if record.status != "planned":
             raise ValueError(f"crew {record.id} is {record.status}; only a planned crew can run")
@@ -403,10 +412,15 @@ class CrewService:
 
     async def launch(self, host: CrewHost) -> CrewHost:
         """Start a built host under the session manager (ceiling, reaper, shutdown)."""
-        if host.record.id in self._hosts:
-            raise ValueError(f"crew {host.record.id} has already been started")
-        await self.manager.adopt(host)  # raises SessionLimitReached
-        self._hosts[host.record.id] = host.id
+        crew_id = host.record.id
+        if crew_id in self._hosts or crew_id in self._pending:
+            raise ValueError(f"crew {crew_id} has already been started")
+        self._pending.add(crew_id)  # synchronously, before the first await
+        try:
+            await self.manager.adopt(host)  # raises SessionLimitReached
+        finally:
+            self._pending.discard(crew_id)
+        self._hosts[crew_id] = host.id
         return host
 
     async def start(self, crew_id: str) -> CrewHost:
