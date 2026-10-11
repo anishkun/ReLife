@@ -647,9 +647,17 @@ and it can't run the housekeeping or "dream" passes.
      for good);
    - **agents on other models** (local Ollama models, or OpenAI/Gemini with keys you
      set in your environment — list them in `RELIFE_CREW_LLMS`) or `claude-max`
-     (Claude through your subscription) — these get ReLife memory but **no shell, no
-     files, no browser**, because ReLife's permission rules can't watch over CrewAI's
-     own tool loop.
+     (Claude through your subscription) — these get ReLife memory, and by default
+     nothing else. If the plan gives one `"tools": ["files"]` (read, list, write and
+     edit files) or `"shell"` (run commands), each tool checks ReLife's permission
+     rules *itself* before it acts, since the rules can't watch CrewAI's own tool
+     loop. You get the same terminal question (or browser card) a ReLife agent's
+     outward action gets, and it's denied when nobody is there. One rule is stricter
+     for them: reading a file **outside** the crew's folder asks first, because
+     whatever such an agent reads goes to its model's provider. (That rule covers the
+     file tools. A shell command can still read anywhere, so give out `shell` only
+     when the agent really has to run things.) They never get the browser or your
+     email/calendar.
 4. **Keeps the result** in `data/crews/<id>/` — `relife crews <id>` shows what each
    task produced, what it cost and anything that was denied. (If the terminal or server
    running a crew dies, its record says *interrupted* rather than "running" forever.) Each agent's lessons

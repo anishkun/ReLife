@@ -140,9 +140,15 @@ plan shown + confirm → `build.ensure_profiles` (reuse existing agents, create 
 (`turns.run_relife_turn`) in `<workspace>/crews/<id>/` with ReLife's permission callback, scoped hooks and scoped
 memory server; `runtime: llm` → a CrewAI `Agent` on the model string (or `claude-max` → **`llm.ClaudeMaxLLM(BaseLLM)`**,
 Claude via the CLI, no function calling ⇒ CrewAI's ReAct text, stop words applied by truncation) with ReLife memory as
-in-process CrewAI tools (`memory_tools.py`, same specs) and the recall block prepended to its tasks — **no
-machine-touching tools** (classify() can't gate CrewAI's loop). `spec.py`/`planner.py`/`record.py` are pure (no
-CrewAI import); the turn runner and the LLM's model call are injected, so `tests/test_crew.py` runs a real
+in-process CrewAI tools (`memory_tools.py`, same specs) and the recall block prepended to its tasks. Machine
+tools are **opt-in per agent** (`AgentSpec.tools`: `files`, `shell`) and **carry the gate themselves**, since
+classify() can't see CrewAI's loop: `machine.MachineTools` describes each call as the ReLife tool the policy
+knows (`Read`/`Glob`/`Write`/`Edit`/`PowerShell`/`Bash`) and awaits the same `can_use_tool` a ReLife member gets
+(`build.terminal_approvals` on the CLI; `CrewHost._member_approvals` → `LoopBroker` card under the server, deny
+once stopped), with policy **`permissions.classify_confined`** — classify() plus reads outside the workspace
+ask (what such a member reads goes to another provider). Both permission callbacks take `policy=` (only ever
+stricter). Calls journal themselves under the ReLife tool name; no browser or connectors for other models.
+`spec.py`/`planner.py`/`record.py`/`machine.py` are pure (no CrewAI import); the turn runner and the LLM's model call are injected, so `tests/test_crew.py` runs a real
 `Crew.kickoff()` with zero model calls. `runner.py` is `prepare_crew` (plan/validate + record `planned`) and
 `execute_crew` (run a recorded plan), composed by `run_crew` for the CLI.
 

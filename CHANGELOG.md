@@ -26,6 +26,14 @@
   with every member's work streaming into the console and its outward actions arriving as approval
   cards (denied on timeout when nobody is watching). A crew can be stopped, run again, or put on a
   schedule (crew schedules take no pre-approvals). `RELIFE_AGENT_MAX_CREWS` (default 1).
+- **Gated machine tools for crew members on other models.** A plan can give an `llm` member
+  `"tools": ["files"]` (read/list/write/edit) and/or `"shell"` (run a command in the workspace). The
+  tools ask ReLife's permission policy before every call: the terminal prompt under `relife crew`, a
+  browser card under `relife serve`, a deny when nobody is there, and a deny for every call once the
+  crew is stopped. They use a stricter policy, `classify_confined`, under which file reads outside the
+  workspace ask, because what such a member reads goes to its model's provider. Calls are journaled
+  into the member's memory space. Off unless the plan names them; no browser or connectors for other
+  models.
 
 - **A shared Max budget.** Every model call ReLife starts (CLI, server sessions, crews, planners,
   scheduled runs) is recorded in one ledger (`data/spend.db`); `relife doctor` and `GET /budget`

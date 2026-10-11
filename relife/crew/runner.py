@@ -53,7 +53,12 @@ def describe_plan(spec: CrewSpec) -> list[str]:
     """The plan as the user reviews it before anything runs."""
     lines = [f"goal: {spec.goal}", f"process: {spec.process}", "agents:"]
     for a in spec.agents:
-        engine = "ReLife agent (Claude + tools)" if a.runtime == "relife" else f"CrewAI agent on {a.llm} (no tools)"
+        if a.runtime == "relife":
+            engine = "ReLife agent (Claude + tools)"
+        elif a.tools:
+            engine = f"CrewAI agent on {a.llm} (gated {' + '.join(a.tools)} tools)"
+        else:
+            engine = f"CrewAI agent on {a.llm} (no tools)"
         lineage = []
         if a.inherit:
             lineage.append("inherits " + ", ".join(a.inherit))
@@ -134,8 +139,13 @@ def execute_crew(
     on_step: Callable[[str, Any], None] | None = None,
     on_task: Callable[[str, str, TurnResult | None], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    approvals: Any = None,
 ) -> CrewRunRecord:
     """Run a recorded plan: agents and their memory, kickoff, per-task outcomes.
+
+    ``approvals`` builds the gate for CrewAI members' machine tools
+    (``build.terminal_approvals`` when omitted; the server routes them to the
+    browser).
 
     ``on_event(agent, event)`` sees each ReLife member's streamed events,
     ``on_step(agent, step)`` each CrewAI-member step, and ``on_task(task, agent,
@@ -185,6 +195,7 @@ def execute_crew(
             on_outcome=on_outcome,
             on_step=on_step,
             should_stop=should_stop,
+            approvals=approvals,
         )
         echo(f"running crew {record.id} in {crew_ws}")
         out = crew.kickoff()

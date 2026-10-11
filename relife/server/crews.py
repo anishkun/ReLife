@@ -24,7 +24,8 @@ loop, where every SSE stream and approval future lives:
   ``make_approval_callback`` — the pure ``classify()`` decides — over a
   :class:`LoopBroker` that hops each ask onto the server loop's
   :class:`~.session.ApprovalBroker` and awaits the browser's answer (or the
-  timeout's deny) from the worker loop.
+  timeout's deny) from the worker loop. A CrewAI member's gated machine tools
+  ask through the same bridge, judged by ``classify_confined``.
 
 Stopping is cooperative: pending approvals are denied at once and no further
 task starts, whichever kind of member it belongs to (a ReLife member's turn
@@ -42,6 +43,8 @@ import importlib.util
 import threading
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from claude_agent_sdk import PermissionResultDeny
 
 from .. import config
 from ..agents import AgentStore
@@ -237,6 +240,7 @@ class CrewHost(EventStream):
                 on_step=self._on_step,
                 on_task=self._on_task,
                 should_stop=self._stop.is_set,
+                approvals=self._member_approvals,
             )
         except BaseException as e:  # noqa: BLE001 — surfaced on the loop
             if not fut.cancelled():  # the host was closed while we worked
@@ -254,6 +258,24 @@ class CrewHost(EventStream):
     def _on_task(self, task: str, agent: str, result: Any) -> None:
         cost = f" · ${result.cost_usd:.3f}" if result is not None and result.cost_usd else ""
         self._emit({"type": "note", "text": f"task {task} finished by {agent}{cost}"})
+
+    def _member_approvals(self, agent_name: str, workspace: Path, policy: Any) -> Any:
+        """The gate for a CrewAI member's machine tools: same browser card (and
+        unattended deny) as a ReLife member's turn, judged by ``policy``."""
+        assert self._loop is not None
+        gate = make_approval_callback(
+            workspace,
+            LoopBroker(self._broker, self._loop, {"agent": agent_name}),
+            timeout=self._timeout,
+            policy=policy,
+        )
+
+        async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+            if self._stop.is_set():  # stopped: not even an auto-allowed step runs
+                return PermissionResultDeny(message="the crew was stopped")
+            return await gate(tool_name, tool_input, context)
+
+        return can_use_tool
 
     async def _member_turn(self, agent: Any, prompt: str, extra_mcp: dict[str, Any]) -> Any:
         """A ReLife member's task (runs on the worker thread's loop): the same
