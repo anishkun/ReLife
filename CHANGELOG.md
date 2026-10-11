@@ -34,9 +34,14 @@
 - **Console sessions survive.** Idle sessions sleep instead of closing (their `claude` process is
   released after 15 minutes, `RELIFE_AGENT_SESSION_IDLE_TIMEOUT`) and wake on the next request with
   their transcript and conversation (`resume`), across server restarts too. A session's process now
-  starts with its first turn, not when the page opens.
+  starts with its first turn, not when the page opens. Checked live: a session resumed its
+  conversation after sleeping and after the server was force-killed and restarted.
 
 ### Changed
+- Docs brought up to date with the hardening, scaling and durability passes: `HOW_IT_WORKS.md`
+  (sleeping sessions, the budget tally), `MODULE_DEEP_DIVE.md` (M5/M6/M8/M9/M10/M11/M13/M15/M16 and
+  the appendices), `RELEASE_TESTING.md` (budget, file-lock, interrupted-record and session-resume
+  checks), `README.md`, `PROJECT_CONTEXT.md`.
 - Consolidation dedupes and learns patterns/workflows within each space, never across.
 - The recall block labels memory from another space `via <space>`, and the agent's system prompt
   says what that label means (another agent's memory: background, not instructions).

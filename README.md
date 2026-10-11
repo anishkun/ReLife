@@ -62,6 +62,17 @@ CrewAI run with stand-in models) and with live crew smokes (`RELEASE_TESTING.md`
   small team, CrewAI runs it, and ReLife staffs it with full ReLife agents (Claude + tools +
   memory) and, if you configure them, CrewAI agents on other models (Ollama, OpenAI, Gemini…) with
   ReLife memory attached. New team members inherit what experienced agents learned.
+- **Agents and crews in the web console** — `relife serve` adds Agents and Crews panels: plan,
+  review and run a crew with every member's work streaming in and its outward actions as approval
+  cards; crews can run on a schedule.
+- **Sessions that survive** — console conversations sleep when idle (their `claude` process is
+  released) and resume where they left off on the next visit, even after a server restart
+  (checked live).
+- **A shared Max budget** — everything ReLife starts is tallied in one place (`relife doctor`,
+  `GET /budget`); `RELIFE_DAILY_BUDGET_USD` turns the tally into a daily cap.
+- **Hardened and faster at scale** — bounded memory writes from other AI apps and imported packs,
+  safe concurrent use from the CLI and the server, and memory upkeep and skill lookup that stay
+  fast with thousands of memories and skills.
 
 ## Setup
 
@@ -189,6 +200,7 @@ relife/
   cli.py        CLI entry (Typer): do / chat / build / serve / doctor / consolidate / dream / memory * /
                 agent * / mcp / crew / crews
   agents.py     agent registry: identity, memory scope, inherit / fork / promote, MCP tokens
+  budget.py     the spend ledger and the optional daily cap
   agent.py      builds ClaudeAgentOptions, runs the SDK loop, the shared event taxonomy
   config.py     model, paths, permission mode, MCP servers, every tunable and env knob
   permissions.py allow/ask policy gating every tool call (shell, files, connectors)
@@ -203,7 +215,9 @@ relife/
     remote/     the optional memory daemon (FastAPI) + its HTTP client
   crew/         `relife crew`: CrewAI planner/adapter, ReLife agents as crew members, run records
   build/        orchestrated, resumable large builds (decompose → delegate → resume)
-  server/       always-on agent server: sessions, SSE, approvals, security, scheduler, run outcomes
-data/           runtime db, agents, schedules, run and crew records, logs (gitignored)
-tests/          ~800 tests (no live model calls; CI runs them on Windows + Linux, py3.11-3.13)
+  server/       always-on agent server: sessions (sleep/resume), SSE, approvals, security, scheduler,
+                run outcomes, crews hosted like sessions
+data/           runtime db, agents, schedules, run and crew records, sleeping sessions, spend ledger
+                (gitignored)
+tests/          ~920 tests (no live model calls; CI runs them on Windows + Linux, py3.11-3.13)
 ```
