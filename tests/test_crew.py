@@ -314,3 +314,36 @@ def test_a_registry_change_after_planning_ends_the_run_as_an_error(env, tmp_path
     )
     assert rec.status == "error" and "parent" in rec.error
     assert records.get(rec.id).status == "error"  # not left "planned"
+
+
+def test_a_crew_stops_at_the_next_task_once_the_daily_cap_is_reached(env, tmp_path, monkeypatch):
+    from relife import budget, config
+
+    store, client, _ = env
+    monkeypatch.setattr(config, "DAILY_BUDGET_USD", 0.4)
+
+    class SpendingRunner(FakeRunner):
+        async def __call__(self, agent, prompt, extra_mcp):
+            budget.record(0.5, "crew")  # what a real turn's result would record
+            return await super().__call__(agent, prompt, extra_mcp)
+
+    reviewer = StubModel()
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=SPEC, yes=True, echo=lambda s: None,
+        runner=SpendingRunner(), llm_factory=lambda model: ClaudeMaxLLM(ask_model=reviewer),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "error" and "daily budget reached" in rec.error
+    assert not reviewer.calls  # the second task never started
+
+
+def test_a_running_crew_records_its_process(env, tmp_path):
+    import os
+
+    store, client, _ = env
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=SPEC, yes=True, echo=lambda s: None,
+        runner=FakeRunner(), llm_factory=lambda model: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.pid == os.getpid() and rec.status == "done"

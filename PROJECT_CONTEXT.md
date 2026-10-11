@@ -729,6 +729,22 @@ name: evil` can no longer close the frontmatter and forge
   JSON store now goes through `relife/_atomic.py` (retrying replace/read). Still open from the
   review: session/crew subprocess weight, no global Max budget guard, in-memory server state,
   cross-process registry lock.
+- **Open items from the review (2026-10-11).** (1) **Cross-process registry lock** (`_filelock.py`:
+  `msvcrt.locking`/`fcntl.flock` on `agents.json.lock`) — three processes x 15 creates lost agents
+  every run without it. (2) **Shared Max budget** (`budget.py`): one SQLite ledger for every model call
+  ReLife starts, `CostMeter` for cumulative totals, `RELIFE_DAILY_BUDGET_USD` gate (off by default, the
+  user's choice) at the CLI, the server routes, the scheduler and crew task boundaries; `relife doctor`
+  + `GET /budget`. Found on the way: the CLI's `total_cost_usd` is cumulative per process (read from
+  the bundled CLI: `total_cost_usd: XT()`, the same session total it reports elsewhere), so server
+  sessions published running totals as turn costs — fixed. (3) **Sessions sleep and wake**: lazy
+  client, `sdk_session_id` captured, snapshots in `data/sessions/`, reaper sleeps (default idle 15
+  min), `manager.restore` on every session route, resume with a fresh-conversation fallback; this is
+  also the answer to the subprocess-weight item (a session holds a `claude` process only while it
+  works). (4) **Stale records**: crew records carry their owner pid (`_proc.pid_alive`, Windows-safe);
+  schedule history `submitted` → `interrupted` at startup. (5) Non-Claude crew agents reading default
+  memory: kept as is (user's decision). Tests: `test_budget.py` (10), `test_session_persistence.py`
+  (12), plus registry/crew cases. Still open: crew members are still one `claude` process per task
+  (fresh context by design); TLS/multi-user remain out of scope.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

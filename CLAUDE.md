@@ -66,6 +66,10 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 #   env, read by CrewAI/LiteLLM; ReLife never stores them); `claude-max` (Claude via the CLI) is always available
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 # RELIFE_AGENT_MAX_CREWS (default 1) caps crews running at once under `relife serve`
+# RELIFE_DAILY_BUDGET_USD — daily cap on Max usage across everything ReLife starts (off unless set; spend is
+#   always tracked in data/spend.db — relife doctor, GET /budget). Reached ⇒ new work refused, crews stop at a task boundary
+# server sessions sleep after RELIFE_AGENT_SESSION_IDLE_TIMEOUT (default 900s): subprocess released, record kept in
+#   data/sessions/ (RELIFE_AGENT_SESSION_KEEP=50, RELIFE_AGENT_SESSION_RETENTION_DAYS=14); restored on the next request
 # RELIFE_EVENTS_KEEP (default 20000) — tool events kept after a consolidation pass (older ones pruned)
 ```
 
@@ -243,6 +247,29 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
   turn's own events come straight off `(task_id, id)` (`events.for_task`) — a shared 500-event window
   let a busy agent hide everyone else's. The auto-consolidate throttle counts by `max_id()` (pruning
   lowers `count()`); an old state file's `last_event_count` is read as an id.
+- **`total_cost_usd` is cumulative per client.** The bundled CLI fills it from its process-wide session
+  total, so a long-lived client (`relife chat`, a server session) reports a running total after each turn.
+  `budget.CostMeter` turns totals into per-turn spend; server sessions publish that per-turn cost (they used
+  to publish the running total, so a scheduled run in a reused session reported everything before it too).
+  Fresh-client paths (`ask_model_oneshot`, crew member turns) call `budget.record` directly. Every model
+  path must record somewhere, or the daily cap undercounts.
+- **The daily cap is checked at the door, never mid-call.** `budget.check()` gates the CLI commands,
+  `POST /sessions/{id}/messages`, crew planning/runs (429) and a schedule firing (`skipped: daily budget
+  reached`); a running crew stops at its next task boundary (`build_crew`'s `task_callback`). Off unless
+  `RELIFE_DAILY_BUDGET_USD` > 0; the ledger never fails a run (errors are swallowed).
+- **Server sessions sleep; they are not closed.** `AgentSession.start()` starts only the worker; the
+  client connects on the first turn (`_ensure_client`, resuming `sdk_session_id`, and falling back to a
+  fresh conversation with a note if the CLI no longer has it). The reaper's `close` persists a snapshot
+  (`SessionStore`, ids `[0-9a-f]{32}` only) and `manager.restore(id)` wakes it — every session route goes
+  through it, so the UI's reattach works after a restart. A restored workspace is re-checked with
+  `resolve_workspace` (a record is no more trusted than a request body). `DELETE` = `close(forget=True)`.
+  Injected test factories get no store unless `sessions_dir` is passed.
+- **"Is that process alive?" never uses `os.kill(pid, 0)` on Windows** — there it is `TerminateProcess`.
+  `relife/_proc.pid_alive` uses `OpenProcess`/`GetExitCodeProcess`. A crew record carries its owner `pid`;
+  `CrewRunStore.get` turns a `running` record whose process is gone into `interrupted`. The server closes
+  schedule history entries left `submitted` at startup (it owns them).
+- **The agent registry also takes an OS file lock** (`relife/_filelock.py`, `agents.json.lock`) around each
+  write, on top of the in-process lock: the CLI and the server are separate processes.
 - **Every atomic JSON write goes through `relife/_atomic.py`** (agents, schedules, run and crew
   records): on Windows a file open for reading can't be replaced (and vice versa), so `replace`/
   `read_text` retry a `PermissionError` briefly. A new store must use it too — CI's windows-latest
@@ -254,7 +281,7 @@ The system prompt uses the **`claude_code` preset** with `prompts/system.md` app
 - **Registry writes re-read first.** `AgentStore.put/remove` reload the file under `_WRITE_LOCK` before
   writing (`put(new=True)` refuses a name taken meanwhile): routes run them on worker threads and a
   crew's worker creates agents, so a plain load→modify→write dropped concurrent writers' agents.
-  Cross-process (CLI + server) this narrows the window; it is not a file lock.
+  Across processes the OS file lock (`_filelock`) serializes them.
 - **CrewAI requires Python < 3.14** (1.15.x). The `[crewai]` extra is marker-gated; crew code that imports CrewAI
   (`llm`, `agent`, `native`, `memory_tools`, `build`) is only imported after `_crewai_or_exit()`.
 

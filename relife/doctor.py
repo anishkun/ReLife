@@ -72,9 +72,20 @@ class Probes:
     # --- agents / crews (defaults keep older probe bundles valid) ---
     agents: list[dict] = field(default_factory=list)  # public agent records
     agents_problem: str | None = None  # the registry couldn't fully read agents.json
+    # --- the shared Max budget (budget.status(); None = unknown) ---
+    spend: dict | None = None
 
 
 # --- the real machine --------------------------------------------------------
+def _spend_status() -> dict | None:
+    try:
+        from . import budget
+
+        return budget.status()
+    except Exception:  # noqa: BLE001 — a doctor never crashes on a probe
+        return None
+
+
 def default_probes() -> Probes:
     import importlib.util
     import os
@@ -172,6 +183,7 @@ def default_probes() -> Probes:
         sidecar_exists=config.MEMORY_SIDECAR_PATH.exists(),
         agents=agent_records,
         agents_problem=agents_problem,
+        spend=_spend_status(),
     )
 
 
@@ -347,6 +359,25 @@ def _check_agents(p: Probes) -> Check:
         "agents", "ok",
         f"{len(p.agents)} registered ({mix})" + (f" · {tokens} with an HTTP MCP token" if tokens else ""),
     )
+
+
+def _check_budget(p: Probes) -> Check:
+    """Today's usage-equivalent spend across everything ReLife started."""
+    s = p.spend
+    if s is None:
+        return Check("budget", "skip", "spend ledger unreadable")
+    used = f"${s['spent_usd']:.2f} today"
+    top = ", ".join(f"{k} ${v:.2f}" for k, v in list(s.get("by_kind", {}).items())[:3])
+    if not s.get("cap_usd"):
+        return Check(
+            "budget", "ok", f"{used}" + (f" ({top})" if top else "") + " · no daily cap",
+        )
+    if s.get("exceeded"):
+        return Check(
+            "budget", "warn", f"{used} of ${s['cap_usd']:.2f} — new work is refused until tomorrow",
+            "raise RELIFE_DAILY_BUDGET_USD to continue today",
+        )
+    return Check("budget", "ok", f"{used} of ${s['cap_usd']:.2f} (${s['remaining_usd']:.2f} left)")
 
 
 def _check_model(p: Probes) -> Check:
@@ -543,6 +574,7 @@ def run_checks(p: Probes) -> list[Check]:
     checks.append(login)
     checks.append(_check_api_key(p))
     checks.append(_check_model(p))
+    checks.append(_check_budget(p))
     checks.append(_check_node(p))
     checks.append(_check_gh(p))
     checks.append(_check_fts5(p))

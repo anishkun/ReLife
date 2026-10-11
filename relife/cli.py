@@ -62,6 +62,18 @@ def _agent_memory(agent: Optional[str]):
     return ScopedMemoryClient(default_client(), scope)
 
 
+def _budget_gate(what: str) -> None:
+    """Refuse to start model work once RELIFE_DAILY_BUDGET_USD is reached
+    (off unless set; see relife/budget.py)."""
+    from . import budget
+
+    try:
+        budget.check(what)
+    except budget.BudgetExceeded as e:
+        typer.secho(str(e), fg=typer.colors.YELLOW)
+        raise typer.Exit(1) from e
+
+
 @app.command("do")
 def do(
     task: str = typer.Argument(..., help="What you want done, in plain language."),
@@ -71,6 +83,7 @@ def do(
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help=_AGENT_OPTION_HELP),
 ) -> None:
     """Run a single task to completion."""
+    _budget_gate("this task")
     ws = _resolve_workspace(workspace)
     typer.secho(f"workspace: {ws}", fg=typer.colors.BRIGHT_BLACK)
     memory = _agent_memory(agent)
@@ -92,6 +105,7 @@ def chat(
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help=_AGENT_OPTION_HELP),
 ) -> None:
     """Start an interactive multi-turn session."""
+    _budget_gate("a chat")
     ws = _resolve_workspace(workspace)
     typer.secho(f"workspace: {ws}", fg=typer.colors.BRIGHT_BLACK)
     memory = _agent_memory(agent)
@@ -157,6 +171,7 @@ def work(
     if dry_run:
         typer.echo("\n" + prompt)
         return
+    _budget_gate("work on this issue")
     # The checkout *is* the workspace: auto-allowed writes stay inside this repo.
     can_use_tool = make_permission_callback(checkout)
     mcp_servers = config.default_mcp_servers()
@@ -202,6 +217,7 @@ def build(
         typer.secho("Provide a spec to build, or --resume a prior build.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
+    _budget_gate("this build")
     can_use_tool = make_permission_callback(ws)
     hooks = memory_hooks()
     anyio.run(
@@ -276,6 +292,7 @@ def dream_cmd(
     """Run an opt-in REM ('dream') pass: the model reviews recent memories as an
     adversarial critic and reversibly prunes/reweights them. Unlike `consolidate`
     this uses the model (spends Max budget) — run it when budget is comfortable."""
+    _budget_gate("a dream pass")
     config.ensure_dirs()
 
     typer.secho("Dreaming (REM pass) — reviewing recent memories…", fg=typer.colors.BRIGHT_BLACK)
@@ -990,6 +1007,8 @@ def crew_cmd(
     if not task and spec is None:
         typer.secho('give a task, or --spec FILE', fg=typer.colors.RED)
         raise typer.Exit(2)
+    if not (spec is not None and plan_only):  # a given spec, only shown, spends nothing
+        _budget_gate("a crew")
     ws = _resolve_workspace(workspace)
     try:
         raw = load_spec_file(spec) if spec is not None else None

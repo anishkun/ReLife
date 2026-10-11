@@ -14,6 +14,7 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeSDKError, ResultMessage
 
+from .. import budget as spend
 from .. import config
 from ..agent import _render, build_options, console, preset_system_prompt
 from .agents import ORCHESTRATOR_PROMPT_FILE, build_agents
@@ -109,10 +110,13 @@ async def run_build(
         ledger.set_session_id(None)  # drop the stale handle so we don't retry it
         client = await _connect(None)
 
+    meter = spend.CostMeter("build", ledger.build_id)
     try:
         await client.query(prompt)
         async for msg in client.receive_response():
             _render(msg)
+            if isinstance(msg, ResultMessage):
+                meter.observe(getattr(msg, "total_cost_usd", None))
             if isinstance(msg, ResultMessage) and getattr(msg, "session_id", None):
                 # Persist the session handle so the next --resume can continue it.
                 ledger.set_session_id(msg.session_id)

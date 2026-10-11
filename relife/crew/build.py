@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from crewai import Crew, Process, Task
 
+from .. import budget
 from ..agents import AgentStore, create_agent
 from ..memory.client import ScopedMemoryClient
 from ..memory.spaces import MemoryScope
@@ -90,7 +91,8 @@ def build_crew(
     should_stop: Callable[[], bool] | None = None,
 ) -> Crew:
     """``should_stop`` is checked after every task (any member kind): once it
-    says so, the next task never starts and ``kickoff()`` raises."""
+    says so — or the daily budget is reached — the next task never starts and
+    ``kickoff()`` raises."""
     llm_factory = llm_factory or default_llm
     members: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
@@ -147,6 +149,9 @@ def build_crew(
     def stop_check(_output: Any) -> None:
         if should_stop is not None and should_stop():
             raise RuntimeError("crew stopped by the user")
+        # The daily cap (off unless RELIFE_DAILY_BUDGET_USD is set): the task
+        # that just finished is kept, no further one starts.
+        budget.check("the crew's next task")
 
     # A closure again (it carries this run's stop flag): same unserializable-
     # callback warning as the step callback, same reason it is noise here.
@@ -160,5 +165,5 @@ def build_crew(
             memory=False,
             planning=False,
             verbose=False,
-            task_callback=stop_check if should_stop is not None else None,
+            task_callback=stop_check,
         )

@@ -44,6 +44,8 @@ SKILLS_DIR = DATA_DIR / "skills"          # one Markdown file per learned skill
 WORKFLOWS_DIR = DATA_DIR / "workflows"    # one Markdown file per learned workflow
 AGENTS_PATH = DATA_DIR / "agents.json"    # agent registry (identity + memory scope per agent)
 CREWS_DIR = DATA_DIR / "crews"            # one subdir per `relife crew` run (plan + outcome)
+SPEND_PATH = DATA_DIR / "spend.db"         # the spend ledger: every model call ReLife starts (budget.py)
+SESSIONS_DIR = DATA_DIR / "sessions"      # sleeping server sessions (server/session.SessionStore)
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system.md"
 WEB_DIR = PACKAGE_DIR / "web"              # self-contained web UI served by `relife serve`
@@ -206,7 +208,10 @@ AGENT_AUTH_WINDOW = float(os.environ.get("RELIFE_AGENT_AUTH_WINDOW", "60"))
 # Resource ceilings. Each session owns a `ClaudeSDKClient` (a subprocess), so an
 # unbounded POST /sessions is a resource-exhaustion lever even on loopback.
 AGENT_MAX_SESSIONS = int(os.environ.get("RELIFE_AGENT_MAX_SESSIONS", "8"))
-AGENT_SESSION_IDLE_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SESSION_IDLE_TIMEOUT", "3600"))
+# Idle sessions go to sleep (subprocess released, record kept: restored on the next request).
+AGENT_SESSION_IDLE_TIMEOUT = float(os.environ.get("RELIFE_AGENT_SESSION_IDLE_TIMEOUT", "900"))
+AGENT_SESSION_KEEP = int(os.environ.get("RELIFE_AGENT_SESSION_KEEP", "50"))  # sleeping sessions kept
+AGENT_SESSION_RETENTION_DAYS = float(os.environ.get("RELIFE_AGENT_SESSION_RETENTION_DAYS", "14"))
 AGENT_REAP_INTERVAL = float(os.environ.get("RELIFE_AGENT_REAP_INTERVAL", "60"))
 AGENT_MAX_MESSAGE_CHARS = int(os.environ.get("RELIFE_AGENT_MAX_MESSAGE_CHARS", "16000"))
 AGENT_MAX_QUEUED_TURNS = int(os.environ.get("RELIFE_AGENT_MAX_QUEUED_TURNS", "8"))
@@ -222,6 +227,9 @@ AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
 # Crews running at once inside `relife serve` (each member turn is a CLI
 # subprocess and spends Max budget; a crew is also one session slot).
 AGENT_MAX_CREWS = int(os.environ.get("RELIFE_AGENT_MAX_CREWS", "1"))
+# Daily Max-usage cap across everything ReLife starts (CLI, server, crews, schedules), in the
+# CLI's usage-equivalent dollars. 0 = off: spend is still tracked (relife doctor, GET /budget).
+DAILY_BUDGET_USD = float(os.environ.get("RELIFE_DAILY_BUDGET_USD", "0") or 0)
 # Floor on the interval form ("every 30m"): every run spends Max budget, so a
 # one-minute schedule is a mistake to refuse, not a wish to honour.
 AGENT_SCHEDULE_MIN_INTERVAL = float(os.environ.get("RELIFE_AGENT_SCHEDULE_MIN_INTERVAL", "300"))

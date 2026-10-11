@@ -428,3 +428,57 @@ def test_every_durable_store_retries_a_windows_sharing_violation(tmp_path, monke
     runs = RunStore(tmp_path / "runs")
     runs.save(RunRecord(schedule_id="s1", run_id="20260101-000000-000", started_at=1.0))
     assert runs.get("s1", "20260101-000000-000") is not None
+
+
+# --- the registry across processes ------------------------------------------------------------
+_CHILD = r"""
+import sys
+from relife import agents as ag
+from relife.memory.client import LocalMemoryClient
+from relife.memory import store, events, spaces, skills, workflows
+import pathlib
+tmp = pathlib.Path(sys.argv[1])
+store._DB_PATH = events._DB_PATH = tmp / f"relife-{sys.argv[2]}.db"
+spaces._SPACES_DIR = tmp / "spaces"; skills._SKILLS_DIR = tmp / "sk"; workflows._WORKFLOWS_DIR = tmp / "wf"
+for i in range(15):
+    ag.create_agent(ag.AgentStore(tmp / "agents.json"), LocalMemoryClient(), f"p{sys.argv[2]}-{i}")
+"""
+
+
+def test_two_processes_writing_the_registry_lose_nothing(tmp_path):
+    """The CLI and the server are separate processes: the in-process lock
+    can't serialize them, the file lock does."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "child.py"
+    script.write_text(_CHILD, encoding="utf-8")
+    procs = [
+        subprocess.Popen([sys.executable, str(script), str(tmp_path), str(n)]) for n in range(3)
+    ]
+    assert [p.wait(120) for p in procs] == [0, 0, 0]
+    assert len(ag.AgentStore(tmp_path / "agents.json").list()) == 45
+
+
+def test_the_file_lock_excludes_and_times_out(tmp_path):
+    from relife._filelock import LockTimeout, file_lock
+
+    target = tmp_path / "x.json"
+    with file_lock(target):
+        # A second holder in another thread can't get in (the OS lock is per
+        # handle, so this models another process).
+        got = []
+
+        def other():
+            try:
+                with file_lock(target, timeout=0.2):
+                    got.append("in")
+            except LockTimeout:
+                got.append("timeout")
+
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        assert got == ["timeout"]
+    with file_lock(target, timeout=0.2):
+        pass  # released

@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .. import config
+from .. import budget, config
 from .. import workitems
 from .crews import CrewLimitReached, CrewService, CrewUnavailable
 from .runs import RunRecord, RunStore
@@ -247,6 +247,9 @@ class Scheduler:
         return status, item
 
     async def _start(self, schedule: Schedule, run_id: str, now: float) -> str:
+        if budget.exceeded():
+            # Recorded and advanced like any skip: no retry storm, visible in history.
+            return "skipped: daily budget reached"
         session: Any = self.manager.get(schedule.session_id) if schedule.session_id else None
         if session is not None and getattr(session, "busy", False):
             return "skipped: previous run still in progress"

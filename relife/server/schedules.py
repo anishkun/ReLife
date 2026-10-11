@@ -302,6 +302,20 @@ class Schedule:
         del self.runs[:-limit]
         self.next_run_at = next_run(self.spec, now)
 
+    def close_interrupted(self) -> int:
+        """Mark history entries still ``submitted`` as interrupted (the server
+        stopped before their recorder finished; nothing will ever upgrade
+        them). Returns how many."""
+        n = 0
+        for entry in self.runs:
+            if entry.get("status") == "submitted":
+                entry["status"] = "interrupted"
+                entry["summary"] = entry.get("summary") or "the server stopped before this run finished"
+                n += 1
+        if n and self.runs and self.runs[-1].get("status") == "interrupted":
+            self.last_status = "interrupted"
+        return n
+
     def update_run(self, run_id: str, **fields: Any) -> bool:
         """Patch the history entry for ``run_id`` (and ``last_status`` if it's
         the latest). False if the entry has already aged out of the history."""
