@@ -164,6 +164,7 @@ def execute_crew(
             on_task(name, agent.agent_name, result)
 
     record.status = "running"
+    record.pid = os.getpid()
     records.save(record)
     try:
         # Inside the try: the registry may have changed since the plan was

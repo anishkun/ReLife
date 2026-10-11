@@ -43,3 +43,16 @@ def _testclient_host(monkeypatch):
     from relife import config
 
     monkeypatch.setattr(config, "AGENT_ALLOWED_HOSTS", frozenset({"testserver"}))
+
+
+@pytest.fixture(autouse=True)
+def _spend_ledger_isolated(tmp_path, monkeypatch):
+    """Every model call is recorded in the spend ledger (``relife/budget.py``):
+    tests write a throwaway one, never the real ``data/spend.db``, and run with
+    no daily cap unless a test sets one."""
+    from relife import config
+
+    monkeypatch.setattr(config, "SPEND_PATH", tmp_path / "spend.db")
+    monkeypatch.setattr(config, "DAILY_BUDGET_USD", 0.0)
+    # Likewise sleeping server sessions (server/session.SessionStore).
+    monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")

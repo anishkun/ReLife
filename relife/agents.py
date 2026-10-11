@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from . import _atomic, config
+from ._filelock import file_lock
 from .memory.spaces import DEFAULT_SCOPE, DEFAULT_SPACE, MemoryScope, validate_space
 
 RUNTIMES = ("relife", "llm", "external")
@@ -48,7 +49,8 @@ TOKEN_PREFIX = "rla_"
 # Every change is read-modify-write of one file, and under `relife serve` the
 # routes (on worker threads) and a crew's worker can change the registry at the
 # same time: writes are serialized, and each re-reads the file first so one
-# writer never drops another's agent.
+# writer never drops another's agent. Across processes (the CLI while the
+# server runs) the same section also holds an OS file lock (``_filelock``).
 _WRITE_LOCK = threading.RLock()
 
 
@@ -240,7 +242,7 @@ class AgentStore:
         # Round-trip through from_dict so a profile built in code obeys the
         # same rules as one read from disk.
         profile = AgentProfile.from_dict(asdict(profile))
-        with _WRITE_LOCK:
+        with _WRITE_LOCK, file_lock(self.path):
             self._refresh()
             if new and profile.name in self._items:
                 raise ValueError(f"an agent named {profile.name!r} already exists")
@@ -249,7 +251,7 @@ class AgentStore:
         return profile
 
     def remove(self, name: str) -> bool:
-        with _WRITE_LOCK:
+        with _WRITE_LOCK, file_lock(self.path):
             self._refresh()
             if self._items.pop(name, None) is None:
                 return False

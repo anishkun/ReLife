@@ -90,6 +90,15 @@ The web console binds `127.0.0.1` and, without a token, only answers requests ad
 non-loopback bind — the server refuses otherwise). There is no TLS: put a reverse proxy in
 front before exposing it beyond your machine.
 
+Console sessions sleep when idle (15 minutes by default, `RELIFE_AGENT_SESSION_IDLE_TIMEOUT`):
+their `claude` process is released, and reopening the page, sending a message or restarting
+the server picks the conversation up where it was.
+
+Everything ReLife starts reports what it used of your Max plan (usage-equivalent dollars);
+`relife doctor` shows today's total and `GET /budget` breaks it down. Set
+`RELIFE_DAILY_BUDGET_USD` to cap it: once reached, new work (a task, a turn, a crew, a
+scheduled run) is refused until tomorrow, and a running crew stops after its current task.
+
 Use the interpreter ReLife is installed into for everything below (if plain `python` lacks
 `claude_agent_sdk`, try `py -3`).
 

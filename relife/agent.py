@@ -32,7 +32,7 @@ from claude_agent_sdk import (
 )
 from rich.console import Console
 
-from . import config
+from . import budget, config
 
 # Windows consoles default to a legacy code page (cp1252) that can't encode the
 # glyphs we (and the model) emit. Force UTF-8 and use ANSI rendering so output
@@ -137,6 +137,8 @@ async def ask_model_oneshot(
                         chunks.append(block.text)
             elif isinstance(msg, ResultMessage):
                 cost = getattr(msg, "total_cost_usd", None)
+    # A fresh client per call, so its total is this call's cost.
+    budget.record(cost, "model-call")
     return "".join(chunks), cost
 
 
@@ -353,10 +355,13 @@ async def run_task(
         mcp_servers=mcp_servers,
         hooks=hooks,
     )
+    meter = budget.CostMeter("cli")
     async with ClaudeSDKClient(options=options) as client:
         await client.query(prompt)
         async for msg in client.receive_response():
             _render(msg)
+            if isinstance(msg, ResultMessage):
+                meter.observe(getattr(msg, "total_cost_usd", None))
     _maybe_consolidate()
 
 
@@ -377,6 +382,7 @@ async def run_chat(
         hooks=hooks,
     )
     console.print("[bold]ReLife chat[/] — type 'exit' to quit.\n")
+    meter = budget.CostMeter("cli")
     async with ClaudeSDKClient(options=options) as client:
         while True:
             try:
@@ -391,6 +397,15 @@ async def run_chat(
                 return
             if not user:
                 continue
+            if budget.exceeded():
+                try:
+                    budget.check("another turn")
+                except budget.BudgetExceeded as e:
+                    console.print(f"[yellow]{e}[/]")
+                continue
             await client.query(user)
             async for msg in client.receive_response():
                 _render(msg)
+                if isinstance(msg, ResultMessage):
+                    # One client for the whole chat: its total is cumulative.
+                    meter.observe(getattr(msg, "total_cost_usd", None))

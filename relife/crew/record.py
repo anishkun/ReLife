@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import _atomic, config
+from .._proc import pid_alive
 
 _RUN_ID = re.compile(r"^\d{8}-\d{6}-\d{3}$")
 
@@ -49,6 +50,9 @@ class CrewRunRecord:
     tasks: list[TaskOutcome] = field(default_factory=list)
     final_output: str = ""
     error: str | None = None
+    # The process running it (set when it starts): a record still "running"
+    # whose process is gone was cut off by a crash or shutdown.
+    pid: int | None = None
 
     @staticmethod
     def new_id(now: float | None = None) -> str:
@@ -112,7 +116,21 @@ class CrewRunStore:
         path = self.root / run_id / "record.json"
         if not path.exists():
             return None
-        return CrewRunRecord.from_dict(json.loads(_atomic.read_text(path)))
+        return self._reconcile(CrewRunRecord.from_dict(json.loads(_atomic.read_text(path))))
+
+    def _reconcile(self, record: CrewRunRecord) -> CrewRunRecord:
+        """A record left "running" by a process that is gone (a crash, a closed
+        terminal, a restarted server) can never finish: say so, once, durably.
+        Without an owner pid (written before it was recorded) it's left as is."""
+        if record.status == "running" and record.pid is not None and not pid_alive(record.pid):
+            record.status = "interrupted"
+            record.error = record.error or "the process running this crew ended before it finished"
+            record.finished_at = record.finished_at or time.time()
+            try:
+                self.save(record)
+            except OSError:
+                pass
+        return record
 
     def list(self, limit: int = 20) -> list[CrewRunRecord]:
         if not self.root.is_dir():

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .. import config
+from .. import budget, config
 from ..server.runs import summarize_events
 
 OUTPUT_MAX_CHARS = 20000  # a task's output feeds the next task; keep it bounded
@@ -92,6 +92,9 @@ async def run_relife_turn(
             await client.query(prompt)
             async for msg in client.receive_response():
                 for ev in to_event(msg):
+                    if ev["type"] == "result":
+                        # A fresh client per task: its total is this task's cost.
+                        budget.record(ev.get("cost_usd"), "crew", str(workspace.name))
                     events.append(ev)
                     if on_event is not None:
                         on_event(ev)

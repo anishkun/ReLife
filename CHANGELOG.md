@@ -27,6 +27,15 @@
   cards (denied on timeout when nobody is watching). A crew can be stopped, run again, or put on a
   schedule (crew schedules take no pre-approvals). `RELIFE_AGENT_MAX_CREWS` (default 1).
 
+- **A shared Max budget.** Every model call ReLife starts (CLI, server sessions, crews, planners,
+  scheduled runs) is recorded in one ledger (`data/spend.db`); `relife doctor` and `GET /budget`
+  show today's usage. `RELIFE_DAILY_BUDGET_USD` caps it: new work is refused once reached and a
+  running crew stops after its current task. Off unless set.
+- **Console sessions survive.** Idle sessions sleep instead of closing (their `claude` process is
+  released after 15 minutes, `RELIFE_AGENT_SESSION_IDLE_TIMEOUT`) and wake on the next request with
+  their transcript and conversation (`resume`), across server restarts too. A session's process now
+  starts with its first turn, not when the page opens.
+
 ### Changed
 - Consolidation dedupes and learns patterns/workflows within each space, never across.
 - The recall block labels memory from another space `via <space>`, and the agent's system prompt
@@ -67,6 +76,13 @@
   space's own recent events, so a busy agent no longer hides a quiet one's patterns.
 
 ### Fixed
+- A server session reported its running total as each turn's cost (the CLI's `total_cost_usd` is
+  cumulative per process), so scheduled runs in a reused session overstated their cost.
+- A crew interrupted by a crash or a closed terminal stayed `running` forever; it now reads as
+  `interrupted` once its process is gone. Scheduled runs a stopped server left `submitted` are closed
+  as `interrupted` at the next start.
+- The agent registry takes a file lock, so `relife agent …` while `relife serve` writes it can't
+  lose an agent.
 - Reading memory no longer strengthens memory in another space: an agent recalling your default
   memory (or an inherited space, or through `memory_context` over MCP) used to reinforce it.
 - A turn's episode now finds its own tool events however many other sessions logged since (it read

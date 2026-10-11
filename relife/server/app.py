@@ -64,6 +64,7 @@ Endpoints:
   POST   /crews/{id}/run                      → run a planned crew → {session_id}
   POST   /crews/{id}/stop                     → stop a running crew
   DELETE /crews/{id}                          → discard a planned crew
+  GET    /budget                              → today's Max spend + the daily cap
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .. import agents as agents_mod
+from .. import budget
 from .. import config
 from ..crew.record import CrewRunStore
 from ..crew.spec import CrewSpec
@@ -112,6 +114,7 @@ from .session import (
     SessionLimitReached,
     SessionManager,
     SessionReadOnly,
+    SessionStore,
     TooManySubscribers,
     TurnQueueFull,
 )
@@ -145,6 +148,7 @@ def create_app(
     crew_turn: Any = None,
     crew_llm_factory: Any = None,
     crew_approval_timeout: float | None = None,
+    sessions_dir: Path | None = None,
 ) -> FastAPI:
     """Build the agent server app.
 
@@ -160,9 +164,17 @@ def create_app(
     answer to (default ``RELIFE_AGENT_ALLOWED_HOSTS``) — see ``host_allowed``.
     ``agents_path``/``crews_dir``/``memory_client`` and the ``crew_*`` hooks
     point the platform routes at tmp state and stub models in tests.
+    ``sessions_dir`` is where sleeping sessions are kept; by default real
+    sessions use ``data/sessions`` and an injected factory none (tests opt in).
     """
-    manager = SessionManager(session_factory=session_factory)
     root = Path(workspace_root) if workspace_root is not None else config.AGENT_WORKSPACE_ROOT
+    if sessions_dir is None and session_factory is None:
+        sessions_dir = config.SESSIONS_DIR
+    manager = SessionManager(
+        session_factory=session_factory,
+        store=SessionStore(sessions_dir) if sessions_dir is not None else None,
+        workspace_ok=lambda raw: resolve_workspace(raw, root),
+    )
     ui_html = _load_ui()
     auth_limiter = AttemptLimiter(config.AGENT_AUTH_MAX_ATTEMPTS, config.AGENT_AUTH_WINDOW)
     store = ScheduleStore(schedules_path)
@@ -183,6 +195,11 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # A previous server that stopped mid-run (crash, restart) left those
+        # runs "submitted" forever; this process owns the schedules, so it
+        # closes them before the scheduler starts.
+        if sum(s.close_interrupted() for s in store.list()):
+            store.save()
         tasks = []
         if reap:
             tasks.append(asyncio.create_task(manager.run_reaper()))
@@ -245,8 +262,12 @@ def create_app(
     auth = [Depends(require_token)]
     mutate = [Depends(require_same_origin), Depends(require_token)]
 
-    def _session_or_404(session_id: str):
-        session = manager.get(session_id)
+    async def _session_or_404(session_id: str):
+        # A sleeping session (idle-reaped, or from before a restart) wakes here.
+        try:
+            session = await manager.restore(session_id)
+        except SessionLimitReached as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         if session is None:
             raise HTTPException(status_code=404, detail="unknown session")
         manager.touch(session)
@@ -318,7 +339,7 @@ def create_app(
     async def get_session(session_id: str) -> dict[str, Any]:
         """Does this session still exist? Lets a reloading UI reattach to its
         own agent instead of spawning a second one and orphaning the first."""
-        session = _session_or_404(session_id)
+        session = await _session_or_404(session_id)
         return {
             "session_id": session.id,
             "workspace": str(getattr(session, "workspace", "")),
@@ -328,13 +349,14 @@ def create_app(
 
     @app.delete("/sessions/{session_id}", dependencies=mutate)
     async def close_session(session_id: str) -> dict[str, Any]:
-        if not await manager.close(session_id):
+        # The UI's "new session": discard it for good, not just put it to sleep.
+        if not await manager.close(session_id, forget=True):
             raise HTTPException(status_code=404, detail="unknown session")
         return {"closed": True}
 
     @app.post("/sessions/{session_id}/messages", dependencies=mutate)
     async def post_message(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        session = _session_or_404(session_id)
+        session = await _session_or_404(session_id)
         text = (body.get("text") or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="empty message")
@@ -343,6 +365,7 @@ def create_app(
                 status_code=413,
                 detail=f"message exceeds {config.AGENT_MAX_MESSAGE_CHARS} characters",
             )
+        _budget_or_429("this turn")
         try:
             await session.submit(text)
         except TurnQueueFull as e:
@@ -355,7 +378,7 @@ def create_app(
     async def resolve_approval(
         session_id: str, approval_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        session = _session_or_404(session_id)
+        session = await _session_or_404(session_id)
         decision = (body.get("decision") or "").lower()
         if decision not in {"allow", "deny"}:
             raise HTTPException(status_code=400, detail="decision must be allow|deny")
@@ -364,7 +387,7 @@ def create_app(
 
     @app.get("/sessions/{session_id}/events", dependencies=auth)
     async def events(session_id: str, request: Request) -> StreamingResponse:
-        session = _session_or_404(session_id)
+        session = await _session_or_404(session_id)
         last_raw = request.headers.get("last-event-id") or request.query_params.get("last_id")
         last_id = int(last_raw) if last_raw and last_raw.isdigit() else None
         try:
@@ -615,6 +638,18 @@ def create_app(
         return {"copied": copied}
 
     # --- crews ------------------------------------------------------------------
+    # --- the shared Max budget -----------------------------------------------------
+    def _budget_or_429(what: str) -> None:
+        try:
+            budget.check(what)
+        except budget.BudgetExceeded as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
+
+    @app.get("/budget", dependencies=auth)
+    async def budget_route() -> dict[str, Any]:
+        """Today's spend across everything ReLife started, and the cap (if set)."""
+        return await off_loop(budget.status)
+
     def _crew_view(rec: Any, *, full: bool = False) -> dict[str, Any]:
         from ..crew.runner import describe_plan
 
@@ -658,6 +693,7 @@ def create_app(
         task = body.get("task")
         spec = body.get("spec")
         if spec is None:
+            _budget_or_429("planning a crew")
             task = str(task or "").strip()
             if not task:
                 raise HTTPException(status_code=400, detail="give a task or a spec")
@@ -676,6 +712,7 @@ def create_app(
     @app.post("/crews/{crew_id}/run", dependencies=mutate)
     async def run_crew_route(crew_id: str) -> dict[str, Any]:
         _crew_or_404(crew_id)
+        _budget_or_429("a crew")
         try:
             host = await crews.start(crew_id)
         except CrewUnavailable as e:

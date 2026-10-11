@@ -10,20 +10,31 @@ Concurrency model mirrors the memory daemon: everything runs on the single serve
 event loop. The permission callback awaits a future that a *different* request
 handler (``POST …/approvals/…``) resolves — both run on the same loop, so the
 suspended worker and the approving request interleave cleanly.
+
+**Sessions sleep instead of dying.** A session's ``claude`` subprocess is the
+expensive part, so it is started only when a turn arrives, and the idle reaper
+*puts a session to sleep*: the subprocess goes, but a small record stays in
+``data/sessions/<id>.json`` (workspace, the SDK's conversation id, the last
+events). The next request for that id (the browser reattaching, a new message,
+the server restarting) restores it: the transcript replays, and the next turn
+resumes the same conversation (``resume=``). A server restart used to lose
+every session, and an idle tab held a subprocess for an hour.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from claude_agent_sdk import ClaudeSDKClient
+from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
-from .. import config
+from .. import _atomic, budget, config
 from ..agent import _tool_brief, build_options, maybe_consolidate_off_loop, to_event
 from ..hooks import memory_hooks
 from ..permissions import grant_allows, make_approval_callback
@@ -34,6 +45,9 @@ _RING_MAX = 500
 # browser tab, a paused debugger) must not grow the server's memory without
 # bound, so the oldest event is dropped to make room instead.
 _SUB_QUEUE_MAX = 1000
+
+# How many events a sleeping session keeps for its transcript replay.
+_PERSIST_EVENTS = 300
 
 Publish = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -140,6 +154,13 @@ class EventStream:
         self._seq = 0
         self.last_active = time.monotonic()
 
+    def preload(self, history: list[tuple[int, dict[str, Any]]]) -> None:
+        """Seed the replay ring with a restored session's events, keeping their
+        numbers so a browser's ``Last-Event-ID`` still means the same event."""
+        for seq, ev in history:
+            self._ring.append((seq, ev))
+            self._seq = max(self._seq, seq)
+
     def subscribe(
         self, last_id: int | None = None
     ) -> tuple[asyncio.Queue[tuple[int, dict[str, Any]]], list[tuple[int, dict[str, Any]]]]:
@@ -191,9 +212,26 @@ class EventStream:
 class AgentSession(EventStream):
     """One long-lived agent conversation bound to a workspace."""
 
-    def __init__(self, workspace: Path, *, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        session_id: str | None = None,
+        resume: str | None = None,
+        history: list[tuple[int, dict[str, Any]]] | None = None,
+        created_at: float | None = None,
+    ) -> None:
         super().__init__(session_id)
         self.workspace = workspace
+        # The SDK's own conversation id (from each result): what a restored
+        # session resumes. Distinct from ``self.id``, the server's handle.
+        self.sdk_session_id = resume
+        self.created_at = time.time() if created_at is None else created_at
+        # Called after each turn and on close with this session (the manager
+        # persists it); None = not persisted (tests, a crew host).
+        self.on_save: Callable[[AgentSession], None] | None = None
+        if history:
+            self.preload(history)
         # Each queued turn carries the grants that apply to it (a scheduled turn's
         # pre-authorizations; ``[]`` for anything typed).
         self._inbound: asyncio.Queue[tuple[str, list[dict[str, Any]]]] = asyncio.Queue(
@@ -205,10 +243,19 @@ class AgentSession(EventStream):
         self._turn_active = False
         self._turn_grants: list[dict[str, Any]] = []
         self._grant_uses = 0
+        # The client lives across turns, so its result cost is a running
+        # total: the meter turns it into each turn's own cost (budget.py).
+        self._meter = budget.CostMeter("server", self.id)
 
     # --- lifecycle ----------------------------------------------------------
     async def start(self) -> None:
-        options = build_options(
+        # No subprocess yet: the client connects when the first turn arrives,
+        # so a session opened and never used (or restored and only looked at)
+        # costs nothing.
+        self._worker = asyncio.create_task(self._run())
+
+    def _options(self, resume: str | None):
+        return build_options(
             cwd=self.workspace,
             can_use_tool=make_approval_callback(
                 self.workspace,
@@ -218,10 +265,47 @@ class AgentSession(EventStream):
             ),
             mcp_servers=config.default_mcp_servers(),
             hooks=memory_hooks(),
+            resume=resume,
         )
-        self._client = ClaudeSDKClient(options=options)
-        await self._client.connect()
-        self._worker = asyncio.create_task(self._run())
+
+    async def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        resume = self.sdk_session_id
+        client = ClaudeSDKClient(options=self._options(resume))
+        try:
+            await client.connect()
+        except Exception:
+            if resume is None:
+                raise
+            # The CLI no longer has that conversation (cleared, or another
+            # machine): carry on in a fresh one rather than fail the turn.
+            await self._publish(
+                {"type": "note", "text": "the earlier conversation could not be resumed; starting fresh"}
+            )
+            self.sdk_session_id = None
+            client = ClaudeSDKClient(options=self._options(None))
+            await client.connect()
+        self._client = client
+
+    def snapshot(self) -> dict[str, Any]:
+        """What a sleeping session keeps (see module doc)."""
+        events = list(self._ring)[-_PERSIST_EVENTS:]
+        return {
+            "id": self.id,
+            "workspace": str(self.workspace),
+            "sdk_session_id": self.sdk_session_id,
+            "created_at": self.created_at,
+            "updated_at": time.time(),
+            "events": [[seq, ev] for seq, ev in events],
+        }
+
+    def _save(self) -> None:
+        if self.on_save is not None:
+            try:
+                self.on_save(self)
+            except Exception:  # noqa: BLE001 - persistence never breaks a turn
+                pass
 
     async def aclose(self) -> None:
         if self._worker is not None:
@@ -235,6 +319,8 @@ class AgentSession(EventStream):
                 await self._client.disconnect()
             except Exception:
                 pass
+            self._client = None
+        self._save()
 
     # --- inbound / outbound -------------------------------------------------
     async def submit(self, text: str, *, grants: list[dict[str, Any]] | None = None) -> None:
@@ -280,16 +366,24 @@ class AgentSession(EventStream):
 
     # --- worker -------------------------------------------------------------
     async def _run(self) -> None:
-        assert self._client is not None
         while True:
             turn, self._turn_grants = await self._inbound.get()
             self._grant_uses = 0
             self._turn_active = True
             await self._publish({"type": "user", "text": turn})
             try:
+                await self._ensure_client()
+                assert self._client is not None
                 await self._client.query(turn)
                 async for msg in self._client.receive_response():
+                    if isinstance(msg, ResultMessage) and getattr(msg, "session_id", None):
+                        self.sdk_session_id = msg.session_id
                     for ev in to_event(msg):
+                        if ev["type"] == "result":
+                            # Publish what this turn cost, not the session's
+                            # running total (which every turn's record and the
+                            # scheduler's run cost used to show).
+                            ev = {**ev, "cost_usd": self._meter.observe(ev.get("cost_usd"))}
                         await self._publish(ev)
             except asyncio.CancelledError:
                 raise
@@ -300,6 +394,7 @@ class AgentSession(EventStream):
                 self._turn_active = False
                 self._turn_grants = []
                 self.touch()
+                self._save()
             # Brain upkeep after each completed turn (deterministic, fail-safe).
             # Off the loop: this process hosts every session's stream and every
             # pending approval on one loop, and a pass can take seconds on a
@@ -309,12 +404,94 @@ class AgentSession(EventStream):
                 await self._publish({"type": "note", "text": note})
 
 
-# Factory used by SessionManager; overridable in tests.
-SessionFactory = Callable[[Path], AgentSession]
+# Factory used by SessionManager; overridable in tests. A restore calls it with
+# the keywords AgentSession takes (session_id, resume, history, created_at).
+SessionFactory = Callable[..., AgentSession]
 
 
-def _default_session_factory(workspace: Path) -> AgentSession:
-    return AgentSession(workspace)
+def _default_session_factory(workspace: Path, **kw: Any) -> AgentSession:
+    return AgentSession(workspace, **kw)
+
+
+_SESSION_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+class SessionStore:
+    """Sleeping sessions, one JSON file each (``data/sessions/<id>.json``).
+
+    Holds a transcript, so it lives under ``data/`` (never in a workspace) and
+    only ids shaped like the server's own (32 hex) ever name a file. Bounded:
+    the newest ``AGENT_SESSION_KEEP`` are kept, and none older than
+    ``AGENT_SESSION_RETENTION_DAYS``.
+    """
+
+    def __init__(self, root: Path, *, keep: int | None = None, retention_days: float | None = None) -> None:
+        self.root = Path(root)
+        self.keep = config.AGENT_SESSION_KEEP if keep is None else keep
+        self.retention = 86400 * (
+            config.AGENT_SESSION_RETENTION_DAYS if retention_days is None else retention_days
+        )
+
+    def _path(self, session_id: str) -> Path | None:
+        if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
+            return None
+        return self.root / f"{session_id}.json"
+
+    def save(self, snap: dict[str, Any]) -> None:
+        path = self._path(snap.get("id", ""))
+        if path is None:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+        _atomic.replace(tmp, path)
+        self.prune()
+
+    def load(self, session_id: str) -> dict[str, Any] | None:
+        path = self._path(session_id)
+        if path is None or not path.exists():
+            return None
+        try:
+            rec = json.loads(_atomic.read_text(path))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(rec, dict) or rec.get("id") != session_id:
+            return None
+        if time.time() - float(rec.get("updated_at") or 0) > self.retention:
+            self.delete(session_id)
+            return None
+        return rec
+
+    def delete(self, session_id: str) -> bool:
+        path = self._path(session_id)
+        if path is None or not path.exists():
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+    def ids(self) -> list[str]:
+        if not self.root.is_dir():
+            return []
+        return [p.stem for p in self.root.glob("*.json") if _SESSION_ID.match(p.stem)]
+
+    def prune(self) -> None:
+        if not self.root.is_dir():
+            return
+        files = sorted(
+            (p for p in self.root.glob("*.json") if _SESSION_ID.match(p.stem)),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        cutoff = time.time() - self.retention
+        for i, p in enumerate(files):
+            try:
+                if (self.keep and i >= self.keep) or p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
 
 
 class SessionManager:
@@ -333,9 +510,18 @@ class SessionManager:
         *,
         max_sessions: int | None = None,
         idle_timeout: float | None = None,
+        store: SessionStore | None = None,
+        workspace_ok: Callable[[str], Path] | None = None,
     ) -> None:
         self._factory = session_factory or _default_session_factory
         self._sessions: dict[str, AgentSession] = {}
+        # Sleeping sessions (None: sessions just end when closed, as in tests).
+        self.store = store
+        # Re-checks a restored session's workspace (the server passes its
+        # root-confinement rule): a record on disk is not trusted further than
+        # a request body would be.
+        self._workspace_ok = workspace_ok
+        self._restoring = asyncio.Lock()
         self.max_sessions = config.AGENT_MAX_SESSIONS if max_sessions is None else max_sessions
         self.idle_timeout = (
             config.AGENT_SESSION_IDLE_TIMEOUT if idle_timeout is None else idle_timeout
@@ -365,7 +551,46 @@ class SessionManager:
         await session.start()
         self.touch(session)
         self._sessions[session.id] = session
+        if self.store is not None and hasattr(session, "snapshot") and hasattr(session, "on_save"):
+            store = self.store
+            session.on_save = lambda s: store.save(s.snapshot())
         return session
+
+    async def restore(self, session_id: str) -> AgentSession | None:
+        """The live session, or a sleeping one woken from its record (see the
+        module doc); None if there is neither. Raises SessionLimitReached when
+        waking it would exceed the ceiling."""
+        live = self._sessions.get(session_id)
+        if live is not None or self.store is None:
+            return live
+        async with self._restoring:  # two requests for one id wake it once
+            live = self._sessions.get(session_id)
+            if live is not None:
+                return live
+            rec = self.store.load(session_id)
+            if rec is None:
+                return None
+            try:
+                ws = (
+                    self._workspace_ok(rec.get("workspace", ""))
+                    if self._workspace_ok is not None
+                    else Path(rec["workspace"])
+                )
+            except (ValueError, KeyError, TypeError):
+                return None  # its workspace is no longer allowed: it stays asleep
+            history = [
+                (int(item[0]), item[1])
+                for item in rec.get("events") or []
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[1], dict)
+            ]
+            session = self._factory(
+                ws,
+                session_id=session_id,
+                resume=rec.get("sdk_session_id") or None,
+                history=history,
+                created_at=rec.get("created_at"),
+            )
+            return await self.adopt(session)
 
     def all(self) -> list[Any]:
         return list(self._sessions.values())
@@ -380,12 +605,14 @@ class SessionManager:
         if session is not None and hasattr(session, "touch"):
             session.touch()
 
-    async def close(self, session_id: str) -> bool:
+    async def close(self, session_id: str, *, forget: bool = False) -> bool:
+        """End a live session: it goes to sleep (its record stays, so it can be
+        restored), or with ``forget`` is discarded for good ("new session")."""
         session = self._sessions.pop(session_id, None)
-        if session is None:
-            return False
-        await session.aclose()
-        return True
+        if session is not None:
+            await session.aclose()
+        dropped = forget and self.store is not None and self.store.delete(session_id)
+        return session is not None or bool(dropped)
 
     def _idle_ids(self, now: float) -> list[str]:
         """Sessions past the idle timeout with no live event stream attached.
@@ -409,7 +636,8 @@ class SessionManager:
         return stale
 
     async def reap_idle(self) -> list[str]:
-        """Close sessions idle beyond the timeout. Returns the ids closed."""
+        """Put sessions idle beyond the timeout to sleep (their subprocess
+        goes; a persisted session can be restored). Returns the ids closed."""
         now = time.monotonic()
         closed = []
         for sid in self._idle_ids(now):

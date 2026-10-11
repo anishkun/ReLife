@@ -19,7 +19,7 @@
 > is the synthesis — read it last, and re-read it whenever you make an architectural
 > change. Line references are to the code as of the platform pass (branch
 > `feat/platform-crewai`, commit `a53ef91`); the test suite is **~800 deterministic
-> tests** — 878 on Python 3.14, 899 in the 3.12 `.venv` where CrewAI is installed
+> tests** — 902 on Python 3.14, 925 in the 3.12 `.venv` where CrewAI is installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
