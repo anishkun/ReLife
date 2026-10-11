@@ -30,7 +30,10 @@ measurably better at recurring tasks.
   mining), a shared Max budget with an optional daily cap, console sessions that sleep and
   resume across restarts, a cross-process lock on the agent registry, and records that
   read `interrupted` once their process is gone.
-- **Next:** ReLife-gated machine tools for non-Claude agents; hosting (Managed Agents) later.
+- **Gated machine tools for non-Claude crew members (built 2026-10-11, unreleased):** an
+  `llm` member the plan gives `"tools": ["files", "shell"]` acts through tools that ask
+  ReLife's permission gate themselves (`crew/machine.py`), reads held to the workspace.
+- **Next:** hosting (Managed Agents).
 
 ## 2. Locked decisions (with rationale)
 
@@ -66,7 +69,7 @@ memory: MemoryClient seam → Local (default) | Http daemon (RELIFE_MEMORY_URL);
         spaces per agent (ScopedMemoryClient); also served to ANY MCP client:
         `relife mcp --agent NAME` (stdio) and /mcp on the daemon (agent token)
 crews:  `relife crew` → CrewAI Crew of ReLifeAgent (a ReLife turn per task) +
-        CrewAI agents on other models (ReLife memory, no machine tools)
+        CrewAI agents on other models (ReLife memory; opt-in gated file/shell tools)
 GitHub: via `gh` CLI (build → commit → gh repo create → push; `relife work` → PR)
 ```
 
@@ -778,6 +781,31 @@ name: evil` can no longer close the frontmatter and forge
   tool events**, so only the resumed conversation could answer; the ledger held exactly three
   per-turn costs ($0.298 / $0.314 / $0.331). Still open: crew members are still one `claude`
   process per task (fresh context by design); TLS/multi-user remain out of scope.
+- **Gated machine tools for non-Claude crew members — ✅ DONE (2026-10-11).** The last "no hands"
+  gap: CrewAI's tool loop never passes through the SDK's `can_use_tool`, so `llm` members had memory
+  only. Now the *tool* carries the gate. `crew/machine.py` (CrewAI-free): `MachineTools` —
+  `read_file`/`list_files`/`write_file`/`edit_file` (`files`) and `run_shell` (`shell`; PowerShell on
+  Windows, bash elsewhere, cwd = workspace, timeout, bounded output) — describes each call as the
+  ReLife tool the policy knows (`Read`/`Glob`/`Write`/`Edit`/`PowerShell`/`Bash`, same fields) and
+  awaits the very `can_use_tool` a ReLife member gets: the terminal prompt (`build.terminal_approvals`)
+  or, under the server, `make_approval_callback` over the `LoopBroker` (a card stamped with the agent;
+  unattended ⇒ deny; after stop ⇒ deny, even an auto-allowed step, since CrewAI can't cancel the task
+  in flight). The policy is **`permissions.classify_confined`** — `classify()` plus one tightening: a
+  read outside the workspace asks, because what this member reads goes to its model's provider (file
+  tools only — the shell is still the denylist, so `cat` outside the workspace isn't caught). Both
+  callbacks gained `policy=` (default `classify`; only ever stricter). Opt-in per agent
+  (`AgentSpec.tools`, validated against `machine.TOOLSETS`, dropped for `relife` agents; old records
+  load), shown in the plan ("gated files tools"), offered by the planner prompt for file/command work an
+  `llm` member must do itself. A denial comes back to the model as `DENIED: … did not happen, don't
+  retry`; a broken gate denies. Every call — allowed or denied — is journaled into the member's space
+  under the ReLife tool name (the step callback skips these, no double count), so consolidation reads a
+  shell step by its command. Glob patterns can't walk out of their directory (`..`, absolute, drive).
+  Tests: `tests/test_crew_machine.py` (19, CrewAI-free: policy, real non-interactive gate, files in/out,
+  six outward/escaping shell commands never run, timeout/bounds, a real shell call, spec/plan), two in
+  `test_crew.py` (a real `Crew.kickoff()` whose ReAct-scripted member writes inside, is denied outside
+  and denied a `curl -X POST`, with the journal checked), two in `test_server_platform.py` (the ask
+  reaches the browser as a card for the agent and the approved read happens; a stopped crew's gate
+  denies). 922 on 3.14, 948 on the 3.12 venv.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

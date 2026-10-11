@@ -5,7 +5,7 @@ configured (a CrewAI/LiteLLM string: ``ollama/llama3.1``, ``gpt-4.1``,
 ``gemini/…`` — keys, if any, come from the environment and are CrewAI's to read)
 or on Claude through the subscription (``claude-max`` → :class:`ClaudeMaxLLM`).
 
-What they get from ReLife is memory, nothing that touches the machine:
+What they get from ReLife:
 
 - the external memory tools, bound to the agent's scoped client
   (``memory_tools.py``) — saves land in its own space;
@@ -13,11 +13,12 @@ What they get from ReLife is memory, nothing that touches the machine:
   kickoff (``memory/context.build_context``), so it starts from what is known
   even if it never calls a tool;
 - every step it takes journaled into its space's event log, so consolidation
-  learns its recurring patterns the same way it learns a ReLife agent's.
-
-No shell, file or network tools: ReLife's permission policy (``classify()``)
-gates ReLife's own agent loop, not CrewAI's, so anything that acts on the world
-is a ReLife agent's job. (Gated tools for other models are a later step.)
+  learns its recurring patterns the same way it learns a ReLife agent's;
+- **only if the plan names them** (``"tools": ["files", "shell"]``), the gated
+  machine tools (``machine.py``). ReLife's permission policy gates the Claude
+  SDK's loop, never CrewAI's, so these tools carry the gate themselves: each
+  call is checked by the same ``can_use_tool`` a ReLife member gets before it
+  acts. No browser and no connectors for other models.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from typing import Any, Callable
 from crewai import Agent
 
 from .. import config
+from .machine import TOOL_NAMES
 from .memory_tools import memory_tools
 from .spec import AgentSpec
 
@@ -53,8 +55,8 @@ def journal_step(client: Any, task_id: str) -> Callable[[Any], None]:
 
     def on_step(step: Any) -> None:
         tool = getattr(step, "tool", None)
-        if not tool:
-            return
+        if not tool or str(tool) in TOOL_NAMES:
+            return  # machine tools journal themselves, under the ReLife tool name
         try:
             client.log_event(str(tool), brief=str(getattr(step, "tool_input", ""))[:120], task_id=task_id)
         except Exception:  # noqa: BLE001 — journaling never breaks a run
@@ -70,7 +72,10 @@ def llm_agent(
     llm: Any,
     task_id: str,
     on_step: Callable[[Any], None] | None = None,
+    tools: list[Any] | None = None,
 ) -> Agent:
+    """``tools`` are extra CrewAI tools beyond memory — the gated machine tools
+    (``machine_tools.py``) when the plan gives the agent any."""
     journal = journal_step(memory_client, task_id)
 
     def step(s: Any) -> None:
@@ -89,7 +94,7 @@ def llm_agent(
             goal=spec.goal,
             backstory=spec.backstory or spec.role,
             llm=llm,
-            tools=memory_tools(memory_client),
+            tools=[*memory_tools(memory_client), *(tools or [])],
             allow_delegation=False,
             verbose=False,
             step_callback=step,

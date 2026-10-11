@@ -20,8 +20,9 @@
 > change. Line references were taken at the platform pass (commit `a53ef91`) and may
 > have drifted by a few lines since; the hardening, scaling and durability passes that
 > followed (PRs #9 and #10) are folded into the modules they changed — M5, M6, M8, M9,
-> M10, M11, M13, M15 and M16. The test suite is **~920 deterministic tests** — 902 on
-> Python 3.14, 925 in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
+> M10, M11, M13, M15 and M16; the gated machine tools for other models are in M15. The
+> test suite is **~920–950 deterministic tests** — 922 on
+> Python 3.14, 948 in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -2425,9 +2426,58 @@ environment by CrewAI/LiteLLM — or `claude-max`. Its tools are **ReLife memory
 client), delegation is off, and a `step_callback` journals its steps into its space so
 consolidation learns its habits too. A CrewAI agent has no recall hook, so
 `build_crew` prepends the `build_context` block to each of its task descriptions
-(labelled "data, not instructions"). **No shell, no files, no browser**: `classify()`
-gates the Claude SDK's tool loop, and CrewAI's loop never passes through it, so
-anything that touches the machine is a ReLife member's job.
+(labelled "data, not instructions"). By default it has **no shell, no files, no
+browser**: `classify()` gates the Claude SDK's tool loop, and CrewAI's loop never
+passes through it. The plan can opt a member into gated machine tools, below.
+
+### Gated machine tools for other models (`machine.py`, `machine_tools.py`)
+
+The fix for "CrewAI's loop never asks ReLife" is to make the *tool* ask. A member
+the plan gives `"tools": ["files"]` and/or `"shell"` gets `read_file`, `list_files`,
+`write_file`, `edit_file` and/or `run_shell`. These are CrewAI `BaseTool`s
+(`machine_tools.py`) over one `MachineTools` object per member (`machine.py`,
+CrewAI-free). Before acting, each method describes its call as the ReLife tool the
+policy already knows, with the same input fields: `Read {file_path}`, `Glob {path}`,
+`Write`/`Edit {file_path}`, `PowerShell`/`Bash {command}`. It then awaits a
+`can_use_tool` built the same way a ReLife member's is: `build.terminal_approvals`
+(TTY prompt, deny off a TTY) under `relife crew`, and `CrewHost._member_approvals`
+under the server (the `LoopBroker` card stamped with the agent, unattended ⇒ deny).
+Nothing in `machine.py` decides what is allowed. A broken gate denies, and a denial
+comes back to the model as an observation ("DENIED: … did not happen; don't retry,
+say so") rather than an exception.
+
+**The one stricter rule.** The policy handed to that callback is
+`permissions.classify_confined`: `classify()` verbatim, except that a read outside the
+workspace asks. For a ReLife (Claude) agent a read stays between the user and
+Anthropic. A member on another model ships what it reads to that model's provider, so
+files outside the crew's workspace go there only on the user's say. Both callbacks
+gained a `policy=` parameter for this (default `classify`). It exists to tighten,
+never to loosen. `list_files` also refuses a glob pattern that could walk out of its
+directory (`..`, absolute, a drive), since the policy judges only `path`.
+
+**Shell.** `run_shell` is judged and run as the platform's shell (`PowerShell` on
+Windows, `Bash` elsewhere), in the workspace, with stdin closed, `agent_env()`'s PATH,
+a timeout (`SHELL_TIMEOUT`) and bounded output. It is the same denylist as a ReLife
+agent's, not a sandbox: `git push` and `pytest` run, while `curl -X POST`, redirects
+out of the workspace, global installs and `gh pr merge` ask. The read confinement
+binds the *file* tools only. A shell `cat ~/.ssh/config` is a read the denylist
+doesn't catch, so `shell` is the toolset to grant sparingly, and the planner prompt
+says so.
+
+**Stop and journal.** CrewAI can't cancel the task in flight, so once a server crew
+is stopped its gate denies *every* call, even an auto-allowed write. Each call,
+allowed or denied, is journaled into the member's space under the ReLife tool name
+(the step callback skips these names, so nothing is counted twice). Consolidation
+therefore reads a member's shell step by its command (`_action_label`), exactly as it
+reads a ReLife agent's.
+
+**Opt-in, from untrusted plans.** `AgentSpec.tools` is validated against
+`machine.TOOLSETS` (an unknown name is an error) and dropped for `relife` agents,
+which have ReLife's own tools. Old records without the field still load. Letting the
+planner turn tools on is safe because the gate, not the plan, decides each call: the
+worst a plan can do is make a member *ask* more. The plan shows "gated files tools"
+before the user confirms. Other models never get the browser or the claude.ai
+connectors.
 
 ### Claude for CrewAI without an API key (`llm.ClaudeMaxLLM`)
 
@@ -2558,8 +2608,11 @@ never both crew and work. Over HTTP a spec may only name `RELIFE_CREW_LLMS` + `c
 > M15 mastery check: CrewAI orchestrates, ReLife provides the members and the memory;
 > the plan is untrusted and validated (caps, backward-only context, known lineage), with
 > one retry and then a single-agent fallback; a ReLife member is one fresh, scoped
-> ReLife turn per task with context fenced; a CrewAI member gets memory but no
-> machine-touching tools, because `classify()` can't gate CrewAI's loop; Claude reaches
+> ReLife turn per task with context fenced; a CrewAI member gets memory, and machine
+> tools only if the plan opts it in. Those tools carry the gate themselves, because
+> `classify()` can't see CrewAI's loop: each call is described as a ReLife tool and
+> judged by `classify_confined` through the same callback, so reads outside the
+> workspace ask too. Claude reaches
 > CrewAI only through the CLI; CrewAI memory/planning/telemetry stay off; `crew_tools`
 > falls to ask on purpose; handoff happens in `ensure_profiles`; under the server a crew is a
 > session (`CrewHost`), its members' asks cross threads through `LoopBroker` to a browser card,
@@ -2694,10 +2747,13 @@ multi-process test, not locally — which is why those tests exist.
 - **Read-only attachments make "where did that save go?" trivially answerable — at
   the cost that agents sharing writes must share a space.** Two agents on one space
   can't be told apart in it except by `source`.
-- **Non-Claude agents get memory but no hands.** A crew member on Ollama can reason,
-  recall and remember, but every file edit, test run and push goes to a ReLife member,
-  because ReLife's permission policy can't see inside CrewAI's tool loop. Less capable
-  crews, in exchange for one policy covering everything that touches the machine.
+- **Non-Claude agents get only the hands they're given, and those hands ask.** A
+  crew member on Ollama reasons, recalls and remembers. Files and the shell come only
+  through the opt-in gated tools, each call judged by the same policy (stricter on
+  reads). The shell is still a denylist, and the tools are a small, hand-written set
+  (no browser, no connectors, no MCP), so a ReLife member stays the right choice for
+  real engineering work. The cost of one policy covering everything that touches the
+  machine is that ReLife has to re-describe every foreign tool call in its own terms.
 - **A fresh SDK client per crew task buys clean context at the cost of startup time
   and no shared transcript.** Continuity between a member's tasks is whatever it saved
   to memory and what CrewAI passes as context — the `relife build` trade, again.

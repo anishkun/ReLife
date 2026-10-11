@@ -640,6 +640,27 @@ def classify(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Dec
     return "ask", "unrecognized tool — approval required by default"
 
 
+_READ_TOOLS = {"Read", "Glob", "Grep", "LS", "NotebookRead"}
+
+
+def classify_confined(tool_name: str, tool_input: dict[str, Any], workspace: Path) -> Decision:
+    """``classify()`` with reads held to the workspace too — the policy for the
+    machine tools a non-Claude crew member gets (``crew/machine.py``).
+
+    Everything ``classify()`` asks still asks; the one tightening is that a
+    read outside the workspace asks instead of passing as read-only. For
+    Claude a read stays between the user and Anthropic; a member on another
+    model sends what it reads to that model's provider, so files outside the
+    crew's workspace go there only when the user says so.
+    """
+    decision, reason = classify(tool_name, tool_input, workspace)
+    if decision == "allow" and tool_name in _READ_TOOLS:
+        path = tool_input.get("file_path") or tool_input.get("path") or ""
+        if not path or not _under(str(path), workspace):
+            return "ask", f"read outside the workspace (sent to another model's provider): {path or '?'}"
+    return decision, reason
+
+
 # --- pre-authorized grants (scheduled runs) ---------------------------------
 # An unattended scheduled run has nobody at the approval card, so an ask-case
 # times out to deny — which makes "summarize my inbox and email me the digest"
@@ -897,18 +918,20 @@ def make_permission_callback(
     workspace: Path,
     *,
     interactive: bool | None = None,
+    policy: Callable[[str, dict[str, Any], Path], Decision] = classify,
 ) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
     """Build a ``can_use_tool`` callback bound to a workspace.
 
     ``interactive`` defaults to whether stdin is a TTY. When non-interactive,
     ask-cases are denied (so unattended runs never block, but also never take an
-    unapproved outward action).
+    unapproved outward action). ``policy`` is ``classify`` unless a caller
+    needs a stricter one (``classify_confined``) — never a looser one.
     """
     if interactive is None:
         interactive = sys.stdin.isatty()
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):
-        decision, reason = classify(tool_name, tool_input, workspace)
+        decision, reason = policy(tool_name, tool_input, workspace)
         if decision == "allow":
             return PermissionResultAllow()
 
@@ -948,6 +971,7 @@ def make_approval_callback(
     *,
     timeout: float,
     preauthorize: Callable[[str, dict[str, Any]], Awaitable[str | None]] | None = None,
+    policy: Callable[[str, dict[str, Any], Path], Decision] = classify,
 ) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
     """Build a ``can_use_tool`` that routes ask-cases to a UI approval broker.
 
@@ -963,11 +987,11 @@ def make_approval_callback(
     ``preauthorize`` (optional) is consulted for ask-cases *before* the broker:
     if it returns a grant description the call is allowed without a card. The
     session supplies it, applying the current turn's grants (``grant_allows``)
-    plus a per-run use cap.
+    plus a per-run use cap. ``policy`` as in ``make_permission_callback``.
     """
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):
-        decision, reason = classify(tool_name, tool_input, workspace)
+        decision, reason = policy(tool_name, tool_input, workspace)
         if decision == "allow":
             return PermissionResultAllow()
 

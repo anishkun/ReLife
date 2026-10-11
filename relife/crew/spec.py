@@ -21,6 +21,7 @@ from typing import Any
 
 from .. import config
 from ..agents import MAX_INHERITS, validate_agent_name
+from .machine import TOOLSETS
 
 RUNTIMES = ("relife", "llm")
 PROCESSES = ("sequential", "hierarchical")
@@ -37,6 +38,7 @@ class AgentSpec:
     llm: str = ""            # runtime llm: a CrewAI/LiteLLM model string, or "claude-max"
     inherit: list[str] = field(default_factory=list)  # agents whose memory it reads
     fork: str | None = None  # agent whose memory it starts from (a copy)
+    tools: list[str] = field(default_factory=list)  # runtime llm: gated toolsets (machine.TOOLSETS)
 
 
 @dataclass
@@ -152,6 +154,12 @@ def normalize_spec(
                 )
         else:
             llm = ""  # a ReLife agent runs on ReLife's own model
+        tools = _names(d.get("tools"), where=f"{where}: tools")
+        unknown = [t for t in tools if t not in TOOLSETS]
+        if unknown:
+            raise ValueError(f"{where}: unknown toolset {unknown[0]!r} (choose from {', '.join(TOOLSETS)})")
+        if runtime != "llm":
+            tools = []  # a ReLife agent has ReLife's own tools
         lineage_ok = existing_agents | seen
         inherit = _names(d.get("inherit"), where=f"{where}: inherit")
         if len(inherit) > MAX_INHERITS:
@@ -178,6 +186,7 @@ def normalize_spec(
                 llm=llm,
                 inherit=inherit,
                 fork=fork,
+                tools=tools,
             )
         )
         seen.add(name)

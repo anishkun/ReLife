@@ -9,7 +9,10 @@
    (that is ``relife agent attach``, the user's act).
 2. **Members.** ``runtime: relife`` → :class:`ReLifeAgent` (a full ReLife turn
    per task); ``runtime: llm`` → a CrewAI agent on the chosen model with ReLife
-   memory attached. Each gets a ``ScopedMemoryClient`` for its own scope.
+   memory attached, plus the gated machine tools the plan names for it (each
+   call checked by the ``can_use_tool`` that ``approvals`` builds — the
+   terminal prompt by default, a browser card under the server). Each gets a
+   ``ScopedMemoryClient`` for its own scope.
 3. **Tasks** in plan order, each reading only the earlier tasks it names.
 4. **The crew**, with CrewAI's own memory, planning and knowledge OFF: they
    default to OpenAI embeddings/models (they'd demand a key), and ReLife's
@@ -30,9 +33,20 @@ from ..memory.client import ScopedMemoryClient
 from ..memory.spaces import MemoryScope
 from ..memory.context import build_context
 from .agent import OnOutcome, ReLifeAgent, TurnRunner
+from .machine import CanUseTool, MachineTools
 from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
 from .spec import CrewSpec
 from .turns import OnEvent
+
+# (agent name, workspace, policy) -> the can_use_tool its machine tools ask.
+Approvals = Callable[[str, Path, Any], CanUseTool]
+
+
+def terminal_approvals(agent_name: str, workspace: Path, policy: Any) -> CanUseTool:
+    """``relife crew``'s gate: prompt on a TTY, deny when nobody is there."""
+    from ..permissions import make_permission_callback
+
+    return make_permission_callback(workspace, policy=policy)
 
 
 def ensure_profiles(spec: CrewSpec, store: AgentStore, client: Any) -> list[str]:
@@ -89,11 +103,16 @@ def build_crew(
     on_outcome: OnOutcome | None = None,
     on_step: Callable[[str, Any], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    approvals: Approvals | None = None,
 ) -> Crew:
     """``should_stop`` is checked after every task (any member kind): once it
     says so — or the daily budget is reached — the next task never starts and
-    ``kickoff()`` raises."""
+    ``kickoff()`` raises. ``approvals`` builds the gate for an ``llm`` member's
+    machine tools (default: :func:`terminal_approvals`)."""
+    from ..permissions import classify_confined
+
     llm_factory = llm_factory or default_llm
+    approvals = approvals or terminal_approvals
     members: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
     for a in spec.agents:
@@ -112,12 +131,25 @@ def build_crew(
                 on_outcome=on_outcome,
             )
         else:
+            task_id = f"crew-{run_id}-{a.name}"
+            gated: list[Any] = []
+            if a.tools:
+                from .machine_tools import machine_tools
+
+                mem = scoped[a.name]
+                tools = MachineTools(
+                    workspace,
+                    approvals(a.name, workspace, classify_confined),
+                    journal=lambda tool, brief, m=mem, t=task_id: m.log_event(tool, brief=brief, task_id=t),
+                )
+                gated = machine_tools(tools, a.tools)
             members[a.name] = llm_agent(
                 a,
                 memory_client=scoped[a.name],
                 llm=llm_factory(a.llm),
-                task_id=f"crew-{run_id}-{a.name}",
+                task_id=task_id,
                 on_step=(lambda s, n=a.name: on_step(n, s)) if on_step else None,
+                tools=gated,
             )
 
     tasks: dict[str, Task] = {}
