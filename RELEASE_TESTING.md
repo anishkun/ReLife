@@ -93,7 +93,7 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
       crews panel, run it, and watch the members' events stream with their names; ask the builder for one
       outward action (e.g. a POST with curl) and approve its card; `stop` on a second run denies a waiting
       card; the crew's run record and per-task outcomes match the CLI's (~$0.75)
-- [ ] **gated machine tools** (3.12 venv, scratch `RELIFE_HOME`): a `--spec` crew with one `claude-max`
+- [x] **gated machine tools** (3.12 venv, scratch `RELIFE_HOME`): a `--spec` crew with one `claude-max`
       member holding `"tools": ["files", "shell"]` — its write inside the crew workspace lands without a
       prompt, a read of a file outside the workspace prompts (decline it → the member reports it), and
       `relife memory search --space <member> Write` shows its calls journaled (~$0.10)

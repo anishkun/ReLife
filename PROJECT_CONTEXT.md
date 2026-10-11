@@ -805,7 +805,15 @@ name: evil` can no longer close the frontmatter and forge
   `test_crew.py` (a real `Crew.kickoff()` whose ReAct-scripted member writes inside, is denied outside
   and denied a `curl -X POST`, with the journal checked), two in `test_server_platform.py` (the ask
   reaches the browser as a card for the agent and the approved read happens; a stopped crew's gate
-  denies). 922 on 3.14, 948 on the 3.12 venv.
+  denies). 922 on 3.14, 948 on the 3.12 venv. Merged as PR #12. **Live smoke (2026-10-11, scratch
+  `RELIFE_HOME`, real CLI, ~$0.59) — ✅ PASSED:** a `claude-max` member with `files`+`shell` wrote
+  `hello.md` in the crew workspace unprompted, its read of a file outside the workspace prompted and was
+  denied (no input) and it reported that honestly, `run_shell python --version` ran (PowerShell); all
+  three calls sat in its space's journal as `Write`/`Read`/`PowerShell`. **Found:** the crew record said
+  $0.00 while the budget ledger had all four calls — a CrewAI member's cost was never added to the
+  record (pre-existing, since crews shipped). Fixed: `build_crew(llm_outcomes=)` charges each `llm`
+  task the change in its member's LLM running total (CrewAI's per-task `callback`) and keeps its output
+  if a later task fails; two regression tests.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

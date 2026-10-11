@@ -89,6 +89,10 @@
   space's own recent events, so a busy agent no longer hides a quiet one's patterns.
 
 ### Fixed
+- **A crew's record now counts its CrewAI members' cost.** Only ReLife members' turns were added up,
+  so a `claude-max` member's spending (correctly in the daily budget ledger) showed as $0.00 in
+  `relife crews` and the run summary. Each `llm` task is now charged the change in its member's
+  running total, and its output is kept if a later task fails.
 - A server session reported its running total as each turn's cost (the CLI's `total_cost_usd` is
   cumulative per process), so scheduled runs in a reused session overstated their cost.
 - A crew interrupted by a crash or a closed terminal stayed `running` forever; it now reads as
