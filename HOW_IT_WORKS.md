@@ -312,9 +312,12 @@ mark it?* (importance).
   (`data/relife.db`). `recall(query)` is **two-stage** so it stays fast even with
   huge memory: first a cheap **index** (SQLite FTS5) narrows millions of rows to a
   handful of candidates, then the full four-signal score ranks just those.
-  Recalling a memory **reinforces** it (recall is a use). Re-saving the same text
-  strengthens it instead of duplicating. Faded memories are **archived, not
-  deleted** — reversible, like a memory you *could* still dredge up.
+  Recalling a memory **reinforces** it (recall is a use) — but only the reader's
+  *own* memory: an agent reading yours doesn't make your memories stronger. Re-saving
+  the same text strengthens it instead of duplicating. Faded memories are **archived,
+  not deleted** — reversible, like a memory you *could* still dredge up. Because other
+  AI apps can write memory too, every save has limits (a memory is at most 8,000
+  characters — "save the lesson, not the transcript").
 - **`embeddings.py`** — gives recall its *sense of meaning*. A small model runs
   **locally on your machine** (no API key, works offline) to turn text into
   vectors so "set up CI" can match "configure the test pipeline" even with no
@@ -326,14 +329,16 @@ mark it?* (importance).
   ("scaffold → test → make repo → push"), under `data/workflows/`. The difference
   from a skill is that the value is in the **sequence**.
 - **`events.py`** — a quiet journal of every tool the agent uses. On its own it's
-  boring; it's the **raw material** the next file mines for patterns.
+  boring; it's the **raw material** the next file mines for patterns. It's trimmed to
+  the newest 20,000 entries, so it never grows forever.
 - **`consolidate.py`** — ReLife's **"sleep" pass.** Periodically (after runs, or
   via `relife consolidate`) it does brain-like housekeeping: **fades/archives**
   unused memories, **merges** duplicates, and — the magic part — scans the event
   journal for **action sequences it keeps repeating** and **writes them up as new
   workflows automatically.** So ReLife literally learns "whenever I do X I tend to
   do Y then Z" and saves that plan for next time. (Deliberately kept AI-free so
-  it's cheap and safe to run on its own.)
+  it's cheap and safe to run on its own — and built to stay quick as memory grows:
+  each pass only checks what's new since the last one.)
 - **`rem.py`** — ReLife's **"dream" pass** (`relife dream`), the brain-analogy
   taken one step further. Sleep (above) is cheap, automatic, and mechanical. REM
   is the **opt-in, AI-powered deep review** you run *on purpose* when you know you
@@ -499,10 +504,23 @@ card** appears with the concrete details (recipient, subject, command). Click
 allow or deny. If you don't click within five minutes the action is **denied**,
 exactly like an unattended terminal run.
 
-Behind the page: each browser session is one long-lived agent conversation (one
-`claude` subprocess, kept open across turns), the page reattaches to it on
-reload instead of starting a new one, and the server is **local-only** by design
+Behind the page: each browser session is one long-lived agent conversation, and the
+page reattaches to it on reload instead of starting a new one. The conversation's
+`claude` process only runs while it's working: after 15 quiet minutes the session
+**goes to sleep** (the process is released, the conversation is kept on disk), and the
+next thing you do — reload, type, or even restart the server — wakes it with its
+transcript and its memory of the conversation. The server is **local-only** by design
 (binding beyond `127.0.0.1` requires a token and is refused without one).
+
+### What it's costing you
+
+Everything ReLife starts — a task, a chat turn, a crew member, a scheduled run —
+reports how much of your Max plan it used, and it all goes into one tally. `relife
+doctor` shows today's total, and the server's `GET /budget` breaks it down. If you
+want a hard stop, set `RELIFE_DAILY_BUDGET_USD`: once today's total reaches it, new
+work is turned away (with a message saying so) until tomorrow, and a running crew
+finishes its current task and stops. Nothing is cut off mid-answer. Without the
+setting, it only keeps count.
 
 ### Schedules — tasks that run themselves
 
@@ -517,7 +535,10 @@ Every run's **outcome is recorded** (`data/runs/…`): the agent's closing summa
 how many tools it used, the cost, and — the important part — **anything it
 needed you for** (each denied action, with what it was). The panel shows the
 last outcome on the card and a *runs* list per schedule. Intervals under five
-minutes are refused: every run spends your Max budget.
+minutes are refused: every run spends your Max budget. (Over your daily cap, if you
+set one, a run is skipped and the history says why; and if the server stops in the
+middle of a run, the next start marks that run *interrupted* instead of leaving it
+"in progress" forever.)
 
 **Pre-approvals.** "Summarize my inbox and email me the digest" could never finish
 unattended — nobody is there to approve the email. So a schedule can carry a few
@@ -621,14 +642,17 @@ and it can't run the housekeeping or "dream" passes.
 3. **Runs it with CrewAI.** Members of two kinds:
    - **ReLife agents** — full Claude agents with all of ReLife's tools and the same
      permission rules; each task runs in `workspace/crews/<id>/`, and anything outward
-     still asks you in the terminal;
+     still asks you in the terminal (if the plan reuses an agent you already have, it
+     can read extra memory *for that run only* — only you change what an agent reads
+     for good);
    - **agents on other models** (local Ollama models, or OpenAI/Gemini with keys you
      set in your environment — list them in `RELIFE_CREW_LLMS`) or `claude-max`
      (Claude through your subscription) — these get ReLife memory but **no shell, no
      files, no browser**, because ReLife's permission rules can't watch over CrewAI's
      own tool loop.
 4. **Keeps the result** in `data/crews/<id>/` — `relife crews <id>` shows what each
-   task produced, what it cost and anything that was denied. Each agent's lessons
+   task produced, what it cost and anything that was denied. (If the terminal or server
+   running a crew dies, its record says *interrupted* rather than "running" forever.) Each agent's lessons
    land in its own memory; `relife agent promote` brings the good ones into yours.
 
 CrewAI doesn't run on Python 3.14 yet, so crews run from a Python 3.12 virtual
@@ -672,9 +696,11 @@ D:\ReLife\
 │   ├─ agents.json          your registered agents (who reads/writes which memory)
 │   ├─ spaces/<agent>/      each agent's own skills/ and workflows/
 │   ├─ crews/<id>/          one folder per `relife crew` run (plan + outcome)
+│   ├─ sessions/            console conversations that are asleep (wake on next use)
+│   ├─ spend.db             the tally of what everything ReLife started has used today
 │   └─ relife.db.daemon     marker left by a running `relife memory serve` (optional)
 ├─ .venv/                   Python 3.12 environment for crews (gitignored)
-├─ tests/                   ~800 deterministic tests (no live AI — safe & fast)
+├─ tests/                   ~920 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
 ├─ MODULE_DEEP_DIVE.md      the architecture, module by module, with the reasoning
@@ -693,7 +719,9 @@ D:\ReLife\
   interactive Claude Code — so a giant build can hit "you've hit your session
   limit." That's exactly what `--resume` is for. Even inside a crew, Claude goes
   through your subscription; only the *other* models you choose use their own keys.
-- **The tests never call the live model.** All ~800 tests are deterministic — they
+  `relife doctor` shows how much ReLife has used today, and `RELIFE_DAILY_BUDGET_USD`
+  turns that into a cap.
+- **The tests never call the live model.** All ~920 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
   the cognitive activation/decay math, workflow learning, ledger persistence, the
   REM critic's *application* logic via a stubbed AI, the whole server — auth,
@@ -721,6 +749,9 @@ D:\ReLife\
   ways in are you (or your main agent), `relife agent promote`, and `relife memory
   import`. The housekeeping pass also stays inside each space — one agent's habits
   never turn into workflows in another's memory.
+- **Closing the tab doesn't end the conversation.** A console session sleeps when idle
+  and wakes where it left off — even after the server restarts. "New session" is the
+  button that really ends one.
 - **Agents on other models don't get hands.** In a crew, anything that touches your
   machine (files, shell, git, browser) is done by a ReLife agent under ReLife's
   permission rules; models running inside CrewAI only think, recall and remember.
@@ -745,7 +776,9 @@ D:\ReLife\
 8. `relife serve` keeps it **always on**: a web console with approval cards, and
    **schedules** that run tasks unattended — including working your **GitHub
    issues** — and record what they did and what they needed you for, with narrow
-   **pre-approvals** for the few things you trust it to do alone.
+   **pre-approvals** for the few things you trust it to do alone. Conversations
+   **sleep and wake** instead of ending, and one **budget tally** (with an optional
+   daily cap) covers everything it starts.
 9. It's a **platform**: several **agents**, each with its own memory, that can
    **inherit** or **fork** an older agent's memory; **other AI apps** can use the
    memory over MCP; and **crews** let CrewAI plan a team that ReLife staffs.

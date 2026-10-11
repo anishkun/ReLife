@@ -17,9 +17,11 @@
 > pre-approved actions). M13–M15 are the *platform* layer (many agents with their own
 > memory, memory for any LLM over MCP, CrewAI crews staffed with ReLife agents). M16
 > is the synthesis — read it last, and re-read it whenever you make an architectural
-> change. Line references are to the code as of the platform pass (branch
-> `feat/platform-crewai`, commit `a53ef91`); the test suite is **~800 deterministic
-> tests** — 902 on Python 3.14, 925 in the 3.12 `.venv` where CrewAI is installed
+> change. Line references were taken at the platform pass (commit `a53ef91`) and may
+> have drifted by a few lines since; the hardening, scaling and durability passes that
+> followed (PRs #9 and #10) are folded into the modules they changed — M5, M6, M8, M9,
+> M10, M11, M13, M15 and M16. The test suite is **~920 deterministic tests** — 902 on
+> Python 3.14, 925 in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -820,6 +822,41 @@ The flag matters. The *hook* recalls with `reinforce=True` (a use by the agent).
 (`cli.py:389`) — so a human *looking* at what the agent would be shown does not
 distort what the agent will be shown. **Observation must not be a use.**
 
+The same rule, one level up: **a reader may only strengthen its own memory.**
+`recall(reinforce=True, reinforce_space=S)` reinforces only hits that live in `S`, and
+`ScopedMemoryClient` always passes its write space. Before, an agent reading the user's
+`default` space — or an external agent calling `memory_context` over MCP — strengthened
+every memory it was shown: read-only access that changed what the owner's recall ranks
+and what decay spares, and something an external agent could do on purpose by asking
+repeatedly. Reinforcement is a write; inherited memory is read-only; so it follows.
+
+### Writes are bounded (memory writers are untrusted)
+
+Memory is written by models — ReLife's own, CrewAI members, external MCP agents — and by
+imported packs from other installs, and everything saved is later injected into prompts.
+So `save()` refuses non-string text and text over `MAX_TEXT_CHARS` (8000; "save the
+lesson, not the transcript"), tags over `MAX_TAGS_CHARS` (500), and passes importance
+through `clean_importance`: a missing, non-numeric or **non-finite** value means the kind
+default. That last clause was a real hole — `max(0, min(1, nan))` is **1.0**, so a `NaN`
+importance (from a model's JSON, or a crafted pack) made a memory *maximally* important;
+`set_importance(NaN)` (the REM critic's reweight) is now a no-op for the same reason.
+`validate_pack` checks the same bounds for every entry (and at most 50,000 items) *before*
+anything is written, so a bad pack imports nothing rather than half.
+
+### One connection per thread, in WAL (`memory/_sqlite.py`)
+
+The store and the event log used to open a fresh SQLite connection per call and drop it.
+Measured, that *was* the cost of a write: in WAL mode the last connection to close
+checkpoints and deletes the WAL file, and under the old rollback journal every open was a
+full sync — ~15 ms per logged tool call, ~50 ms per save on Windows, and a recall that
+reinforced five hits paid it five times on every prompt. `_sqlite.connect(path)` now keeps
+**one connection per thread per file** (sqlite3 connections belong to their thread; the
+server's worker threads each keep their own), in WAL with `synchronous=NORMAL` and a
+`busy_timeout`; callers still use `with conn:` for commit/rollback and nothing closes
+them. A logged tool call dropped below a millisecond. The connection is a small subclass so
+per-connection state can ride on it (which extensions are loaded — sqlite-vec must be
+loaded once per connection now that connections live long).
+
 ### Soft-optional everything: FTS5, embeddings, ANN
 
 Three capabilities are **soft-optional** — present them if available, degrade
@@ -860,6 +897,22 @@ correct." The `embedding` BLOB column stays the source of truth either way — t
 table is a synced accelerator used only to *prune* the candidate set, never to *rank*
 (ranking re-computes exact cosine from the column), which makes it robust to
 distance-metric quirks.
+
+**Keeping the mirror in step** (fixed after CI's `full` job — the only place with
+sqlite-vec installed — failed). Three things were wrong, all invisible locally:
+- `get_index` cached *one* index for the first embedding dimension it saw, so a second
+  dimension (a model change; a test's small fake vectors) made every later search fail
+  with "Dimension mismatch". It is cached **per dimension** now.
+- The "is the mirror current?" check was a row count held **in the process**: it rebuilt
+  the whole `vec0` table whenever the count moved (every save), and with two DBs in one
+  process (the daemon's, a test's) it could skip a sync it needed. The sync state now
+  lives **in the database** (`memories_vec_meta`: the dimension, and a signature of the
+  indexable rows — count, max id, id sum; ids are AUTOINCREMENT, never reused), and a
+  sync touches only rows added or removed since. A table of another dimension is
+  rebuilt; vectors of another length are left to brute force.
+- A scoped search over-fetched a fixed 4× and filtered by space afterwards, so a big
+  space could crowd a small agent's memories out of its *own* recall. It now widens `k`
+  until enough rows pass the filter or the table is exhausted.
 
 ### The service / client seams (`service.py`, `client.py`)
 
@@ -905,6 +958,17 @@ they're diffable and the consolidation pass can write them mechanically):
   under `data/spaces/<space>/{skills,workflows}` (`spaces.space_dir`). A find over
   several spaces lets an earlier space shadow a same-named procedure in a later one,
   so an agent's own version of a skill wins over the one it inherited.
+- **Bounded, and one line per header value** (`memory/_procedure.py`). The parser ends
+  the frontmatter at the first `---`, so a model-written name like
+  `x\n---\nname: evil\n---\n…` could close the header early, forge fields, or swallow
+  the real steps. `header_value` collapses whitespace (newlines included) and shrinks
+  `---` to `--`; names are ≤ 120 chars, steps ≤ 20,000.
+- **Cached** (`_procedure.cached_dir`). Every prompt searches the skills and workflows of
+  every space the agent reads, and opening each file was the whole cost (~10 ms per file
+  on Windows: 200 skills took 2.4 s *per prompt*). Parsed files — with their token sets —
+  are cached per directory and keyed by `(mtime, size)`, so a search stats each file
+  (`os.scandir`) and re-reads only what changed; another process's edit changes the
+  stamp, so the daemon and a CLI still see each other's writes. 1,000 skills: 12 s → 10 ms.
 
 ### The MCP surface (`server.py`)
 
@@ -1094,8 +1158,9 @@ and the whole design rests on why they're separate.
 #### `consolidate.run_consolidation()` (the sleep) — `consolidate.py:362`
 
 Runs automatically when enough events accrued (`should_auto_run`:
-`events.count() − last ≥ CONSOLIDATE_EVERY`, gated by `AUTO_CONSOLIDATE`,
-`consolidate.py:74`), invoked via `agent.maybe_consolidate()` after each run. Four
+`events.max_id() − last ≥ CONSOLIDATE_EVERY`, gated by `AUTO_CONSOLIDATE` — by event
+*id*, because the log is now pruned and pruning lowers the count; an old state file's
+`last_event_count` reads as an id, since nothing was ever deleted then), invoked via `agent.maybe_consolidate()` after each run. Four
 deterministic steps:
 
 1. **Decay & forget (`_decay_and_archive`, `consolidate.py:83`).** Tier 1: archive
@@ -1105,7 +1170,9 @@ deterministic steps:
 2. **Dedupe (`_dedupe`, `consolidate.py:113`).** Merge near-duplicates: keyword Jaccard
    ≥ 0.9, **or** (embeddings on) semantic cosine ≥ `DEDUP_SIM` (0.90), which catches
    paraphrases sharing few tokens. The survivor is *reinforced*; the duplicate
-   *deleted* — merging concentrates strength rather than losing it.
+   *deleted* — merging concentrates strength rather than losing it. It used to compare
+   every pair in a space and re-embed every memory on every pass (19 s at 3,000
+   memories); it is now indexed and incremental — see *Dedupe at scale* below.
 3. **Detect patterns (`_detect_patterns`, `consolidate.py:299`).** Two detectors:
    recurring **episodes** → `pattern` memory; recurring **action n-grams** from the
    event log → `pattern` memory **+ a synthesized workflow**.
@@ -1129,6 +1196,31 @@ deterministic steps:
 So a recurring real procedure becomes an *automatically* synthesized workflow, which
 `_recall_hook` then surfaces next time a matching task appears. **The journal from 6a
 feeds workflow synthesis in 6b, which feeds injection in 6a. The loop closes.**
+
+**Dedupe at scale.** Three changes, none of which alters what gets merged (a property
+test checks the result against the old all-pairs loop on random corpora):
+- **Prefix filtering** (`_prefix`). Tokens are ordered rarest-first across the space;
+  two sets with Jaccard ≥ t must share a token among each one's first
+  `|x| − ⌈t·|x|⌉ + 1` tokens. Survivors are indexed by those prefix tokens, so a new
+  memory is compared only with survivors it could possibly match — exact, not a heuristic.
+- **Stored vectors** (`_SemIndex`). Meanings are compared with one matrix–vector product
+  per memory over the embeddings `save` already stored (numpy, which fastembed brings);
+  only rows without a vector are embedded.
+- **Incremental marks.** The state file keeps, per `mode:space`, the newest memory
+  already deduped as `[id, created_at]`; the next pass compares only newer memories
+  (against everything). A mark counts only while that id still names that memory — a
+  rebuilt DB restarts ids, and a stale mark would silently skip new ones — and a mark
+  made without embeddings never vouches for a pass with them.
+3,000 memories: 19 s → 0.2 s on a full pass.
+
+**The event log is bounded and mined per space.** `run_consolidation` prunes the log to
+the newest `EVENTS_KEEP` (20,000) events — it grew by every tool call forever. Pattern
+mining reads **each space's own** recent window (`events_by_task(space=)`, index
+`events_space(space, id)`); with one 500-event window over every space, a busy agent
+pushed every quieter agent's events out of what the miner saw, so they never learned a
+workflow. And the Stop hook's episode reads its own turn's events straight off the
+`(task_id, id)` index (`events.for_task`) — it used to look for them in the newest 500
+events overall, which several busy server sessions could fill.
 
 **Consolidation never crosses a space.** Decay is per row, so it needed nothing. But
 `_dedupe` groups by space before merging, episodes are clustered per space
@@ -1364,13 +1456,18 @@ upkeep — hits one database and one set of dirs. The test-isolation mechanism
 against a tmp DB without dirs must not clobber the real skills dir for the rest of
 the process.
 
-### Concurrency: serialize on the loop, on purpose
+### Concurrency: quick calls on the loop, bulk work on a thread
 
-Every handler is `async def` calling the **sync** service directly (`daemon.py:12`).
-That means all DB + embedding access is serialized on the single event loop — no
-threadpool writers, no SQLite lock contention. For a single-user daemon that's the
-right trade: correctness for free, and per-request offloading is a later refinement
-if it's ever needed. The exception is `/dream`: REM can run for minutes, so on the
+Quick handlers are `async def` calling the **sync** service directly, serialized on the
+single event loop — for a single-user daemon, correctness for free. The first edition
+did that for *everything*, and the scaling review measured what it cost: one
+consolidation sweep (seconds on a large store) froze every other caller, every agent on
+`/mcp` included. So **bulk** routes — `/consolidate`, `/consolidate/maybe` and space
+copy/archive/export/import — now run through `bulk()`: on a worker thread
+(`anyio.to_thread`), one at a time under a lock, and `consolidate/maybe` *skips* rather
+than queues when a sweep is already running (the throttle fires it again later). SQLite
+in WAL with a connection per thread makes the overlap safe. The bearer-token check is
+constant-time (`secrets.compare_digest`). The other exception is `/dream`: REM can run for minutes, so on the
 *client* side it's the one `async` protocol method and is dispatched via
 `anyio.to_thread` with `timeout=None` (`http_client.py:182`) so it doesn't block the
 caller's loop; the `ask_model` callable **can't cross the wire**, so the daemon uses
@@ -1434,11 +1531,13 @@ factory, a `serve()` with lazy uvicorn, token auth, env knobs in `config.py`. Bu
 is a far more dangerous process than the daemon — **it runs shell commands and edits
 files** — and almost every design decision below follows from that.
 
-### `AgentSession` — one conversation, one subprocess, one loop (`session.py:112`)
+### `AgentSession` — one conversation, one subprocess (while it works), one loop
 
-A session owns exactly one `ClaudeSDKClient`, **kept open across turns** — the same
-thing `run_chat` proves works. `start()` (`session.py:135`) is M2's three-piece
-assembly with one substitution: `make_approval_callback` instead of the TTY callback.
+A session owns one `ClaudeSDKClient`, **kept open across turns** — the same thing
+`run_chat` proves works — built by M2's three-piece assembly with one substitution:
+`make_approval_callback` instead of the TTY callback. Since the durability pass the
+client is **lazy**: `start()` only starts the worker, and `_ensure_client` connects on
+the first turn (see *Sessions sleep instead of dying* below).
 A worker task (`_run`, `session.py:254`) drains an inbound queue → `client.query` →
 `receive_response()` → `to_event` → publish. Each event gets a monotonically
 increasing sequence id and lands in a **ring buffer** (`_RING_MAX` = 500) *and* in
@@ -1454,6 +1553,42 @@ Three details that carry weight:
 - **The user's turn is echoed** as a `user` event *when the worker dequeues it*
   (`session.py:260`) — not when HTTP accepted it. M10's run recorder keys on exactly
   that echo.
+- **A turn's cost is its own.** The CLI fills a result's `total_cost_usd` from its
+  process-wide session total (read from the bundled CLI: the same value it reports as
+  the session's total cost), so a long-lived client reports a *running* total after each
+  turn. The worker passes it through a `budget.CostMeter`, which records the difference
+  in the spend ledger (M11) and publishes it as the turn's cost; it used to publish the
+  running total, so a scheduled run in a reused session reported everything before it.
+
+### Sessions sleep instead of dying
+
+A session's `claude` subprocess is the expensive part, and the first edition held one per
+session from page load until the idle reaper closed it an hour later — losing the
+transcript and the conversation. Now:
+
+- **Lazy start.** No subprocess until a turn arrives; a page opened and left costs nothing.
+- **A record per session** (`SessionStore`, `data/sessions/<id>.json`): workspace, the
+  SDK's conversation id (captured from each `ResultMessage.session_id`), and the last 300
+  events with their sequence numbers — saved after every turn and on close. Only ids of
+  the server's own shape (32 hex) ever name a file; the store keeps the newest
+  `AGENT_SESSION_KEEP` within `AGENT_SESSION_RETENTION_DAYS`.
+- **The reaper puts a session to sleep** (default after 15 idle minutes): `close` releases
+  the subprocess and the record stays. "New session" (`DELETE`) is `close(forget=True)`.
+- **Every session route wakes it** (`manager.restore`): the record becomes a new
+  `AgentSession` with the same id, its events preloaded into the ring with their
+  *original* numbers (so a browser's `Last-Event-ID` still means the same event), and
+  `resume=<conversation id>` for its first turn. If the CLI no longer has that
+  conversation, the session says so in a note and starts fresh rather than failing the
+  turn. Restores of one id are serialized, so two requests wake it once.
+- **A record is no more trusted than a request body**: its workspace goes back through
+  `resolve_workspace` against the root; a record pointing elsewhere stays asleep.
+
+Checked live (2026-10-11, real CLI, scratch home, ~$0.94): turn 1 set a code word; the
+session slept after 20 idle seconds and its process was gone; turn 2 woke it and the
+agent recalled the word; the server was then **force-killed** and restarted, and the
+reattached session replayed both turns and quoted the first message verbatim — with zero
+memories and zero tool events in that home, so only the resumed conversation could
+answer. The ledger held exactly three per-turn costs.
 
 ### `ApprovalBroker` — a permission prompt as a future (`session.py:53`)
 
@@ -1492,14 +1627,16 @@ client catches back up. Nothing here is unbounded.
 
 The obvious UI — `POST /sessions` on page load — was wrong in a way that only shows
 up in use: every reload spawned a **second `ClaudeSDKClient` subprocess**, orphaned
-the first until the idle reaper (an hour), lost the transcript, and after
+the first until the idle reaper, lost the transcript, and after
 `AGENT_MAX_SESSIONS` reloads returned 429 with no way out. So the page remembers its
 session id in `localStorage` (`web/index.html:325`), **probes** `GET /sessions/{id}`
 (`app.py:270`) on load, and if alive reattaches by streaming `?last_id=0` — replay the
 whole ring (`web/index.html:455`). A fresh page has no `Last-Event-ID` (that's
 per-`EventSource`), which is why the query form exists; the route prefers the header
 so an *automatic* reconnect still resumes rather than replays. A "new session" button
-`DELETE`s the current one so a slot can be freed from the browser.
+`DELETE`s the current one so a slot can be freed from the browser. Since sessions
+sleep, the probe also wakes a session the reaper put to sleep or a restart dropped, so
+reattaching survives both.
 
 ### `security.py` — the policy as pure functions (`security.py`)
 
@@ -1552,9 +1689,9 @@ local user speaking directly, not a request body.
 ### Everything is bounded, because the process never exits
 
 Each session is a **subprocess**. A long-lived process with unbounded anything is a
-resource-exhaustion lever even on loopback. So: `AGENT_MAX_SESSIONS` (429), an idle
-reaper under the app lifespan (`app.py:139`) that skips sessions with a live SSE
-subscriber, `AGENT_MAX_QUEUED_TURNS` (429 — `submit` uses `put_nowait` rather than
+resource-exhaustion lever even on loopback. So: `AGENT_MAX_SESSIONS` (429, counting
+sessions in memory — sleeping ones are files), an idle reaper under the app lifespan
+that skips sessions with a live SSE subscriber and puts the rest to sleep, `AGENT_MAX_QUEUED_TURNS` (429 — `submit` uses `put_nowait` rather than
 blocking a request handler per pending turn, `session.py:165`), `AGENT_MAX_MESSAGE_CHARS`
 (413), `AGENT_MAX_SUBSCRIBERS` (429), and drop-oldest on lagging queues. Shutdown
 `aclose()`s every session so **no subprocess is orphaned**.
@@ -1644,6 +1781,11 @@ schedule (`enabled and next_run_at <= now`). A firing is `_submit` (`:214`):
    it compactly as `⏱ scheduled · name`.
 3. `session.submit(prompt)` — and from here it is *exactly* a typed turn: same hooks,
    same journaling, same learning, same `classify()`, same approval broker.
+
+Two door checks come first: over the daily budget (M11), the firing is recorded
+`skipped: daily budget reached` and the schedule advances (no retry storm); and at
+server start, history entries a stopped server left `submitted` are closed as
+`interrupted` (`Schedule.close_interrupted`) — nothing else would ever upgrade them.
 
 That last point is the design. There is no "scheduled-run mode" in the agent. Because
 the approval path is M9's future-with-timeout, **nobody watching ⇒ the ask-case times
@@ -1800,6 +1942,29 @@ Two checks worth knowing exist:
   reports whether the `[crewai]` extra imports. The agents check counts registered
   agents by runtime (and how many hold an MCP token), and warns when
   `data/agents.json` had unreadable records (the original file is kept aside).
+
+- **`budget`**: today's usage-equivalent spend, by kind, and the cap if one is set —
+  `warn` once it is reached, with the setting that lifts it.
+
+### The shared Max budget (`budget.py`)
+
+Everything ReLife starts spends the same Max plan as interactive Claude Code, and with
+schedules, crews and several console sessions running there was no single answer to
+"how much did ReLife use today?" — let alone a way to stop. `budget.py` is that answer:
+
+- **One ledger** (`data/spend.db`, SQLite — the CLI, the server and the daemon all write
+  it). Every model path records into it: CLI `do`/`chat`/`build` and server sessions
+  through a `CostMeter` (their clients are long-lived, so their totals are cumulative —
+  M9), crew member turns and every `ask_model_oneshot` (planner, `ClaudeMaxLLM`, the REM
+  critic) directly, since each is a fresh client whose total *is* its cost. `relife
+  doctor` and `GET /budget` show today's total and the split by kind.
+- **An optional daily cap** (`RELIFE_DAILY_BUDGET_USD`, off unless set — the owner's
+  choice: track always, enforce only on request). `budget.check()` is called **at the
+  door, never mid-call**: CLI commands exit 1 with a message; the server answers 429 to a
+  turn, a crew plan or a crew run; a schedule's firing is recorded as skipped; a running
+  crew stops at its next task boundary (its `task_callback`), keeping what finished.
+- **Never fails the work.** A ledger error is logged and swallowed — spend unknown beats
+  work lost — and junk costs (`None`, negative, `NaN`) record nothing.
 
 ### Memory inspection & correction (`relife memory *`, MVP pass 3)
 
@@ -2000,6 +2165,17 @@ lazy load, atomic tmp + `os.replace` writes, every record validated through
 kept aside — never "repaired" into something wider. `scope_for(name)` (`:246`) raises
 `LookupError` for an unknown name: **an unknown agent never falls back to the default
 scope.**
+
+**Concurrent writers.** The registry is one file written by the CLI (`relife agent …`),
+the server's routes (on worker threads) and a crew's worker — sometimes at once, and from
+different processes. A plain load → modify → write dropped whichever agent the other
+writer added. Now `put`/`remove` hold an in-process lock **and** an OS file lock
+(`relife/_filelock.py`: `msvcrt.locking` / `fcntl.flock` on `agents.json.lock`, released
+when the handle closes — a crash can't leave it stuck), re-read the file inside the lock,
+apply only their own change, and write. `put(new=True)` refuses a name taken meanwhile, so
+two racing creates can't both "win". A file that reads as broken mid-session is kept
+aside before the next write, never overwritten. Reads and the atomic replace go through
+`relife/_atomic.py`, which retries Windows' momentary sharing violations (M16).
 
 ### Handoff: inherit, fork, promote, packs
 
@@ -2293,9 +2469,11 @@ ReLife hasn't vetted don't become autonomous by arriving with a crew.
 ### Where memory flows
 
 `ensure_profiles` (`build.py:32`) is the handoff point: a planned agent that doesn't
-exist is created with the plan's `inherit`/`fork` (M13); one that exists is reused and
-any planned inherits are attached. Every member gets `ScopedMemoryClient(client,
-profile.scope())`, so a crew of three writes into three spaces, reads what each
+exist is created with the plan's `inherit`/`fork` (M13); one that exists is reused —
+and a planned `inherit` on it widens its reads **for that run only** (`build.run_scope`).
+It used to `attach` permanently, which let model output (the plan) change a registered
+agent's scope for good, even an isolated one's; attaching is the user's act. Every member
+gets `ScopedMemoryClient(client, run_scope(...))`, so a crew of three writes into three spaces, reads what each
 inherited plus the user's default, and never writes `default`. Afterwards `relife
 memory search --space NAME` shows what each learned, and `relife agent promote NAME`
 is the user's call.
@@ -2356,6 +2534,19 @@ starts another — CrewAI has no cancel. (The first version only had the ReLife 
 browser run caught a CrewAI reviewer still running after stop.) One more Windows trap: the worker
 `os.replace`s `record.json` while routes read it, and Windows lets neither happen during the
 other — `CrewRunStore` retries a `PermissionError` briefly on both sides.
+
+**Hardening under concurrency.** `adopt()` awaits (it reaps idle sessions first), so two
+quick `run` requests could both pass the checks — starting one crew twice or overshooting
+`AGENT_MAX_CREWS`; a crew is now reserved in `CrewService._pending` *synchronously*, before
+the first await, and released if adopt fails. Crew run ids are millisecond stamps, so two
+plans in the same millisecond (a schedule firing while the UI plans) shared one record and
+one workspace; `CrewRunStore.reserve_id` claims an id by `mkdir`, which is atomic.
+`DELETE /crews/{id}` on a started crew is a 409 (it used to mark a live crew `cancelled`),
+and `ensure_profiles` runs inside `execute_crew`'s recorded `try`, so a fork parent deleted
+after planning ends the run as an error instead of leaving it `planned` forever. A record
+carries its owner `pid`; once that process is gone, a `running` record reads as
+`interrupted` (`relife/_proc.pid_alive` — never `os.kill(pid, 0)` on Windows, where it
+*terminates* the process). The daily budget stops a crew at its next task boundary (M11).
 
 Crew schedules (`Schedule.crew`) hold a spec validated at creation against the registry and the
 configured models; a firing re-validates it (an inherited agent may be gone), records it, builds
@@ -2459,6 +2650,16 @@ This module is the synthesis: the recurring design *principles*, the deliberate
    The fence is a hint; the permission policy is the backstop, and is written as if
    the fence will sometimes fail.
 
+**A later principle: anything another thread or process may touch is atomic, retried
+and, if read-modify-write, locked.** The always-on server made every durable file
+shared — agents, schedules, run and crew records, the spend ledger, session records —
+and Windows made it sharp: a file open for reading can't be replaced, and vice versa.
+So every JSON store writes tmp + replace through `_atomic` (which retries a momentary
+`PermissionError`), the registry's read-modify-write takes a file lock, ids that name
+files are claimed atomically (`mkdir`) or shape-checked, and "is the writer still alive?"
+is asked of the OS (`_proc`). Most of these were found by CI's windows-latest jobs or a
+multi-process test, not locally — which is why those tests exist.
+
 ### The sharpest trade-offs (state these crisply)
 
 - **LLM-free consolidation buys affordability at the cost of intelligence.** The
@@ -2518,10 +2719,11 @@ This module is the synthesis: the recurring design *principles*, the deliberate
    The defense in depth is the workspace itself being a throwaway directory.
 4. **The agent server has no TLS and no multi-user model.** Loopback + optional token
    is the supported shape; anything further needs a reverse proxy and is explicitly
-   unsupported today.
+   unsupported today. (Server *state* no longer dies with the process — sessions sleep to
+   disk and resume, M9 — but it is still one user's server.)
 5. **Live verification is expensive and rationed.** Because live runs consume Max
-   budget, the team relies on the ~800 deterministic tests and avoids hammering live
-   runs. Some end-to-end behaviors are validated less often than unit-level logic. The
+   budget, the team relies on the ~920 deterministic tests and avoids hammering live
+   runs (the daily cap, M11, now makes "don't hammer" enforceable). Some end-to-end behaviors are validated less often than unit-level logic. The
    live crew smokes ran once (a plan, then a two-agent crew: $0.26 + $0.47) and caught two
    things no stub could: a warning on every run and crew episodes that all looked alike.
 6. **Windows-specific sharp edges.** Console encoding must be forced to UTF-8
@@ -2536,7 +2738,12 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 8. **Memory written by other models enters the store.** It's confined to their own
    spaces, labelled `via <space>` when shown to anyone else, and never reaches `default`
    without `promote`. But an agent that inherits from an external agent does read what
-   that agent wrote — inheritance is explicit, and it is a trust decision.
+   that agent wrote — inheritance is explicit, and it is a trust decision. CrewAI
+   members on non-Claude models also read the user's `default` space unless isolated —
+   so that memory reaches their provider; kept as the default by the owner's decision.
+9. **A crew member is still one `claude` process per task.** Fresh context per task is
+   deliberate (memory carries continuity), so each task pays a cold start; console
+   sessions, by contrast, now hold a process only while they work (M9).
 
 ### "Why not X" — alternatives consciously rejected
 
@@ -2700,28 +2907,34 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 |---|---|
 | `cli.py` | Typer CLI: `do`/`chat` (`--agent`)/`work`/`build`/`serve`/`doctor`/`consolidate`/`dream` + `memory {search,list,show,forget,stats,serve,ping,spaces,export,import}` + `agent {list,create,show,attach,detach,promote,token,connect,delete}` + `mcp` + `crew`/`crews`; wires permissions + MCP + hooks. |
 | `__main__.py` | `python -m relife` (what MCP client configs launch). |
-| `agents.py` | `AgentProfile` (identity → `MemoryScope`), `AgentStore` (`data/agents.json`), `create_agent` (inherit/fork), `attach`/`detach`/`promote`/`delete_agent`, hashed `rla_` tokens, `mcp_config`. |
+| `agents.py` | `AgentProfile` (identity → `MemoryScope`), `AgentStore` (`data/agents.json`; writes re-read under a thread lock + file lock, `put(new=)`), `create_agent` (inherit/fork), `attach`/`detach`/`promote`/`delete_agent`, hashed `rla_` tokens, `mcp_config`. |
+| `budget.py` | The spend ledger (`data/spend.db`): `record`, `CostMeter` (cumulative → per turn), `spent`/`by_kind`/`status`, the optional daily cap (`check`, `exceeded`, `BudgetExceeded`). |
+| `_atomic.py` | `replace`/`read_text` retrying Windows sharing violations — every atomic JSON store uses it. |
+| `_filelock.py` | `file_lock(path)`: cross-process exclusive lock on a `.lock` sidecar (`msvcrt` / `fcntl`). |
+| `_proc.py` | `pid_alive` (Windows: `OpenProcess`/`GetExitCodeProcess`, never `os.kill`). |
 | `workitems.py` | `relife work` plumbing: `parse_ref`, `list_assigned`, `fetch`, `ensure_checkout`, `branch_name`, `task_prompt` (issue text fenced). |
 | `agent.py` | `build_options`, `run_task`/`run_chat`, `to_event` (shared taxonomy), `_render`, `ask_model_oneshot`, `maybe_consolidate` (+ `_off_loop`), `_tool_brief`, Windows UTF-8 fix. |
 | `permissions.py` | `classify()` pure policy; nested-shell re-classification; `_OUTWARD_SHELL` denylist (both shells); `_global_install`; `_gh_outward` (verb-based `gh`); `_write_targets`/`_delete_targets`/`_escapes` shell containment (+ `_msys_to_windows`); `_under()`; connector verb policy; grants (`normalize_grants`, `grant_allows`, `_pr_create_matches`); `make_permission_callback` (TTY) + `make_approval_callback` (UI, `preauthorize`). |
 | `hooks.py` | `_make_hooks(get_client)` → recall (inject+reinforce via `build_context`), event (journal), episode (capture); module trio over `default_client()`; `memory_hooks(client)` for a scoped agent; every call `off_loop`. |
-| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/agents), `default_probes()`, `to_json`. |
+| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/budget/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/agents), `default_probes()`, `to_json`. |
 | `config.py` | All paths (`RELIFE_HOME`), model id, every cognitive/recall/REM/daemon/server/scheduler/grant/crew tunable, `default_mcp_servers(memory_client)`, `agent_env`. |
 | `web/index.html` | Self-contained console: auth prompt, transcript via `EventSource`, approval cards, reattach via `localStorage` + `?last_id=0`, schedules panel with watch/run/runs, work toggle and pre-approvals. |
 | `memory/cognitive.py` | Pure ACT-R math: `activation`, `sigmoid`, `fused_score`, `should_archive`, `should_hard_delete`. |
-| `memory/store.py` | `MemoryStore`: schema v3 (spaces)/migrations, two-stage space-filtered `recall`, reinforce-on-`save` (per space), candidate + common-term gate, `archive`/`get`, `copy_space`/`archive_space`/`space_counts`; module shims over `_DB_PATH`. |
-| `memory/vector_index.py` | `VectorIndex` protocol, `BruteForceIndex`, `SqliteVecIndex`, `get_index` self-test. |
+| `memory/store.py` | `MemoryStore`: schema v3 (spaces)/migrations, two-stage space-filtered `recall` (`reinforce_space`), reinforce-on-`save` (per space), bounded writes + `clean_importance`, candidate + common-term gate, `archive`/`get`, `stored_embeddings`, `copy_space`/`archive_space`/`space_counts`; module shims over `_DB_PATH`. |
+| `memory/_sqlite.py` | `connect(path)`: one cached connection per thread per file, WAL + `synchronous=NORMAL` + `busy_timeout`; `close_all`. |
+| `memory/_procedure.py` | Skill/workflow bounds (`check_procedure`), one-line header values (`header_value`), the parsed-file cache (`cached_dir`). |
+| `memory/vector_index.py` | `VectorIndex` protocol, `BruteForceIndex`, `SqliteVecIndex` (incremental sync, state in `memories_vec_meta`, widening scoped search), `get_index` (self-test, cached per dimension). |
 | `memory/embeddings.py` | Soft-optional local ONNX embeddings; `available`/`embed`/`cosine`. |
 | `memory/service.py` | `MemoryService` facade: memory + `archive(id)`/`get(id)` + skills + workflows + events + spaces (`spaces`/`copy_space`/`archive_space`/`export_space`/`import_pack`) + `maybe_consolidate` (throttle decided here) + `dream`. |
 | `memory/client.py` | `MemoryClient` protocol, `LocalMemoryClient`, `ScopedMemoryClient` (the scope enforcement point), `default_client()` (env-selected transport), `off_loop`, daemon-sidecar warning. |
 | `memory/spaces.py` | `DEFAULT_SPACE`, `validate_space`, `space_dir`, `MemoryScope(read, write, source)`. |
 | `memory/remote/wire.py` | Dependency-free dict ⇄ dataclass for every type that crosses the HTTP seam. |
-| `memory/remote/daemon.py` | FastAPI daemon: `_bind_db`/`_bind_dirs` (module-global binding, spaces dir included), routes mirroring the protocol (incl. `/spaces/*`), `/mcp` + its lifespan, sidecar file, `serve()`. |
+| `memory/remote/daemon.py` | FastAPI daemon: `_bind_db`/`_bind_dirs` (module-global binding, spaces dir included), routes mirroring the protocol (incl. `/spaces/*`), bulk routes off the loop (`bulk()`), constant-time token check, `/mcp` + its lifespan, sidecar file, `serve()`. |
 | `memory/remote/http_client.py` | `HttpMemoryClient`: pooled httpx, rebuilds real objects, 400→`ValueError`, `dream` off-thread with no timeout. |
 | `memory/skills.py` | Single procedures as Markdown, per space; weighted keyword `find_skills` (earlier space shadows). |
 | `memory/workflows.py` | Multi-step procedures as Markdown (+`trigger`), per space; weighted keyword `find_workflows`. |
 | `memory/events.py` | `EventLog`: tool journal (with `space`), `events_by_task(space=)`, `for_task`, `max_id`, `prune`. |
-| `memory/consolidate.py` | Deterministic "sleep", per space: decay/archive/delete, dedupe, n-gram mining, workflow synthesis, `should_auto_run`. |
+| `memory/consolidate.py` | Deterministic "sleep", per space: decay/archive/delete, indexed incremental dedupe (`_prefix`, `_SemIndex`, `dedupe_marks`), per-space n-gram mining, workflow synthesis, event pruning, `should_auto_run` (by event id). |
 | `memory/rem.py` | Opt-in LLM "dream": replay buffer, critic prompt, deterministic reversible `_apply`, journal. |
 | `memory/tools.py` | `ToolSpec` + the memory tools defined once; `INTERNAL_TOOLS` (Claude's nine) and `EXTERNAL_TOOLS` (no consolidate/dream, + `memory_context`). |
 | `memory/context.py` | `build_context(client, query)`: the deduped, budgeted recall block with `via <space>` provenance. |
@@ -2732,11 +2945,11 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 | `build/server.py` | MCP `relife_build`: `build_plan_set`/`build_milestone_update`/`build_status`, ledger-bound. |
 | `build/agents.py` | `builder` `AgentDefinition` + tool list + orchestrator prompt path. |
 | `build/orchestrator.py` | `run_build`: fresh vs resume, ledger wiring, session persistence + expired-session fallback. |
-| `server/app.py` | `create_app()` (auth/cookie/CSRF wiring, sessions, SSE, approvals, schedules, runs routes, lifespan), `serve()` with `guard_bind`. |
-| `server/session.py` | `ApprovalBroker` (future + timeout), `AgentSession` (one `ClaudeSDKClient`, ring buffer, subscribers, `busy`, per-turn grants + use cap), `SessionManager` (ceiling, idle reaper). |
+| `server/app.py` | `create_app()` (auth/cookie/CSRF wiring, sessions (restored on demand), SSE, approvals, schedules, runs, agents, crews, `/budget` routes; lifespan closes interrupted runs), `serve()` with `guard_bind`. |
+| `server/session.py` | `ApprovalBroker` (future + timeout), `EventStream` (ring, subscribers, `preload`), `AgentSession` (lazy `ClaudeSDKClient` with resume, `CostMeter`, `snapshot`, `busy`, per-turn grants + use cap), `SessionStore` (`data/sessions/`), `SessionManager` (ceiling, reaper that sleeps, `restore`, `close(forget=)`). |
 | `server/security.py` | Pure: `token_matches`, `presented_token`, `same_origin`, `is_loopback`, `guard_bind`, `resolve_workspace`, `AttemptLimiter`. |
 | `server/schedules.py` | `Schedule` record (grants, `work`, `worked`), `parse_every`/`parse_at`/`parse_days`/`normalize_spec`/`next_run` (explicit `now`), `normalize_work`, `check_grants_fit`, `ScheduleStore` (atomic JSON, corrupt file preserved). |
-| `server/crews.py` | `CrewHost` (a crew run as a session: `EventStream`, worker thread, `member_event`, cooperative stop), `LoopBroker` (cross-loop approvals), `CrewService` (plan / build_host / launch / start, `AGENT_MAX_CREWS`), `crewai_available`. |
+| `server/crews.py` | `CrewHost` (a crew run as a session: `EventStream`, worker thread, `member_event`, cooperative stop), `LoopBroker` (cross-loop approvals), `CrewService` (plan / build_host / launch / start, `_pending` reservations, `AGENT_MAX_CREWS`), `crewai_available`. |
 | `server/scheduler.py` | `Scheduler`: tick loop, `fire`/`_submit` (per-schedule session, skip-when-busy, advance-from-now), `_prepare_work` + `pick_issue` (work schedules), `bind_grants`, `_record` recorder, `scheduled_prompt`. |
 | `server/runs.py` | `summarize_events` (closing summary + denied + acted lists), `RunRecord`, `RunStore` (bounded per-schedule files). |
 | `crew/spec.py` | `AgentSpec`/`TaskSpec`/`CrewSpec`; `normalize_spec` (the plan's validator); `load_spec_file`; `single_agent_spec`. |
@@ -2746,9 +2959,9 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 | `crew/llm.py` | `ClaudeMaxLLM(BaseLLM)`: Claude via `ask_model_oneshot`, ReAct text, stop words by truncation. |
 | `crew/native.py` | `default_llm`, `llm_agent` (CrewAI `Agent` with ReLife memory tools, no delegation), `journal_step`. |
 | `crew/memory_tools.py` | `RelifeMemoryTool(BaseTool)` over a `ToolSpec`; `memory_tools(client)`. |
-| `crew/build.py` | `ensure_profiles` (the handoff point), `build_crew` (scoped members, recall block for CrewAI tasks, CrewAI memory/planning off). |
-| `crew/runner.py` | `run_crew` (plan → record → confirm → kickoff → outcomes → consolidate), `roster`, `describe_plan`, telemetry off. |
-| `crew/record.py` | `TaskOutcome`, `CrewRunRecord`, `CrewRunStore` (`data/crews/<id>/record.json`, id-shape checked). |
+| `crew/build.py` | `ensure_profiles` (the handoff point), `run_scope` (a reused agent's run-only reads), `build_crew` (scoped members, recall block for CrewAI tasks, stop + budget check per task, CrewAI memory/planning off). |
+| `crew/runner.py` | `prepare_crew` (plan/validate → record `planned`) + `execute_crew` (profiles → kickoff → outcomes → consolidate, owner `pid`), composed by `run_crew`; `roster`, `describe_plan`, telemetry off. |
+| `crew/record.py` | `TaskOutcome`, `CrewRunRecord` (+ `pid`), `CrewRunStore` (`data/crews/<id>/record.json`, id-shape checked, `reserve_id` by `mkdir`, `running` → `interrupted` once the owner is gone). |
 
 ---
 
@@ -2760,7 +2973,11 @@ This module is the synthesis: the recurring design *principles*, the deliberate
 **Paths:** `RELIFE_HOME` decides where `data/` and `workspace/` live (default: beside the
 code in a source checkout, `~/.relife` for an installed wheel — never `site-packages`).
 Under `data/`: `relife.db`, `skills/`, `workflows/`, `spaces/<space>/`, `agents.json`
-(`AGENTS_PATH`), `crews/` (`CREWS_DIR`), `builds/`, `schedules.json`, `runs/`.
+(`AGENTS_PATH`, + `agents.json.lock`), `crews/` (`CREWS_DIR`), `builds/`, `schedules.json`,
+`runs/`, `spend.db` (`SPEND_PATH`), `sessions/` (`SESSIONS_DIR`).
+
+**Budget:** `DAILY_BUDGET_USD` (`RELIFE_DAILY_BUDGET_USD`, default 0 = no cap; spend is
+tracked either way).
 
 **Activation / forgetting:**
 - `DECAY = 0.35` — recency forgetting rate.
@@ -2786,7 +3003,12 @@ paraphrase reinforcement).
 **Injection (hooks):** `RECALL_INJECT_BUDGET = 2400` chars, `RECALL_DEDUP_JACCARD = 0.8`.
 
 **Episodes / consolidation:** `EPISODE_MIN_EVENTS = 3`, `RECUR_THRESHOLD = 3`,
-`AUTO_CONSOLIDATE = on`, `CONSOLIDATE_EVERY = 5`.
+`AUTO_CONSOLIDATE = on`, `CONSOLIDATE_EVERY = 5` (new events, by id),
+`EVENTS_KEEP = 20000` (`RELIFE_EVENTS_KEEP`; tool events kept after a pass).
+
+**Write bounds (in code, not config):** memory text ≤ 8000 chars, tags ≤ 500
+(`store.MAX_TEXT_CHARS`/`MAX_TAGS_CHARS`); skill/workflow names ≤ 120, header values
+≤ 500, steps ≤ 20,000 (`_procedure`); packs ≤ 50,000 items.
 
 **REM:** `REM_BATCH_MAX = 40`, `REM_REFERENCE_MAX = 30`, `REM_MIN_CONFIDENCE = 0.7`,
 `REM_MAX_PRUNE_FRACTION = 0.25`. (No AUTO flag — never auto-runs by design.)
@@ -2803,7 +3025,9 @@ paraphrase reinforcement).
 deny), `AGENT_COOKIE` / `AGENT_COOKIE_MAX_AGE = 30d`, `AGENT_AUTH_MAX_ATTEMPTS = 10`
 per `AGENT_AUTH_WINDOW = 60s`; `AGENT_ALLOWED_HOSTS` (`RELIFE_AGENT_ALLOWED_HOSTS`) —
 extra Host names a tokenless server answers to (DNS-rebinding guard).
-- Ceilings: `AGENT_MAX_SESSIONS = 8`, `AGENT_SESSION_IDLE_TIMEOUT = 3600s`,
+- Ceilings: `AGENT_MAX_SESSIONS = 8` (in memory), `AGENT_SESSION_IDLE_TIMEOUT = 900s`
+  (then the session sleeps), `AGENT_SESSION_KEEP = 50` and
+  `AGENT_SESSION_RETENTION_DAYS = 14` (sleeping sessions kept),
   `AGENT_REAP_INTERVAL = 60s`, `AGENT_MAX_MESSAGE_CHARS = 16000`,
   `AGENT_MAX_QUEUED_TURNS = 8`, `AGENT_MAX_SUBSCRIBERS = 8`.
 - `AGENT_WORKSPACE_ROOT = ./workspace` — containment root for server-created sessions.
@@ -2829,4 +3053,5 @@ Most are overridable via `RELIFE_*` environment variables (see `config.py`).
 policy shape argument), then M5→M6 (the relevance gate and why reinforcement is
 safe), then M8→M10 (why the daemon binds globals, why auth needs a cookie, why a
 scheduled run is a turn), then M13→M15 (why scope comes from identity, why tools are
-defined once, why a CrewAI agent gets no shell).*
+defined once, why a CrewAI agent gets no shell), and finally M9's *Sessions sleep* and
+M11's budget (why a cost is cumulative, why the cap is checked only at the door).*

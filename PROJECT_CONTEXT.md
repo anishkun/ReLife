@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-10-10.
+> Last updated: 2026-10-11.
 
 ## 1. Vision
 
@@ -24,6 +24,12 @@ measurably better at recurring tasks.
 - **Platform in the server (built 2026-10-10, unreleased):** `/agents` `/spaces` `/crews`
   routes, crews run under `relife serve` with members' approvals in the browser, crew
   schedules, Agents + Crews panels in the web console.
+- **Hardening, scaling and durability (built 2026-10-10/11, merged as PRs #9 and #10,
+  unreleased):** bounded memory writes and untrusted-input fixes, memory that stays fast
+  at size (indexed dedupe, cached procedures, per-thread WAL connections, per-space event
+  mining), a shared Max budget with an optional daily cap, console sessions that sleep and
+  resume across restarts, a cross-process lock on the agent registry, and records that
+  read `interrupted` once their process is gone.
 - **Next:** ReLife-gated machine tools for non-Claude agents; hosting (Managed Agents) later.
 
 ## 2. Locked decisions (with rationale)
@@ -82,9 +88,10 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** ~810 passing — 800 on Python 3.14 (the CrewAI modules skip), 811 in the 3.12 `.venv`
-with `[crewai]` (`python -m pytest tests/`; later phases below added the daemon, server,
-scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP and crew suites). The original set covers permission classify, store
+**Tests:** ~920 passing — 902 on Python 3.14 (the CrewAI modules skip), 925 in the 3.12 `.venv`
+with `[crewai]` + `[vector]` + `[embeddings]` (`python -m pytest tests/`; later phases below added the daemon, server,
+scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP, crew, hardening,
+scaling, budget and session-persistence suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
 ledger + ledger MCP tools, and the **cognitive memory v2** layer — activation/decay
 math, schema migration + two-stage fused recall + reinforcement/archival, workflows,
@@ -128,7 +135,10 @@ HOW_IT_WORKS.md             # plain-English guide;  MODULE_DEEP_DIVE.md — arch
 relife/
   cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */mcp/crew/crews
   __main__.py               # `python -m relife` (what MCP client configs launch)
-  agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens
+  agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens;
+                            #   writes re-read under a thread lock + OS file lock
+  budget.py                 # spend ledger (data/spend.db), CostMeter (cumulative → per turn), daily cap
+  _atomic.py / _filelock.py / _proc.py  # Windows-safe replace/read retry; cross-process lock; pid_alive
   agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming), to_event
   config.py                 # MODEL, EFFORT, paths (RELIFE_HOME), agent_env() (gh PATH), default_mcp_servers()
   permissions.py            # classify() + callbacks (TTY / UI); gh + connector verb policy; schedule grants
@@ -139,8 +149,12 @@ relife/
   web/index.html            # self-contained web console served by `relife serve`
   memory/                   # cognitive memory: relevance rises w/ use, fades when idle
     cognitive.py            # pure ACT-R-style activation/fused_score/should_archive/should_hard_delete
-    store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay
-    vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested)
+    store.py                # injectable MemoryStore: SQLite (user_version migrations), two-stage fused recall, decay,
+                            #   bounded writes, reinforcement scoped to the reader's space
+    _sqlite.py              # one cached connection per thread per file, WAL + synchronous=NORMAL
+    _procedure.py           # skill/workflow bounds, one-line header values, parsed-file cache
+    vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested,
+                            #   per dimension, incremental sync with its state in the DB)
     spaces.py               # memory spaces: names, MemoryScope(read, write, source), per-space dirs
     tools.py                # the memory tools, defined once (ToolSpec) for every transport
     context.py              # the recalled-context block (recall hook + memory_context tool)
@@ -152,7 +166,8 @@ relife/
     skills.py               # single reusable procedures (Markdown files)
     workflows.py            # multi-step procedures (ordered skill/action chains)
     events.py               # injectable EventLog (tool-event log for pattern detection)
-    consolidate.py          # "sleep" pass: decay/forget + hard-delete, (semantic) dedupe, learn workflows
+    consolidate.py          # "sleep" pass: decay/forget + hard-delete, indexed incremental dedupe, per-space
+                            #   pattern mining, event pruning, learn workflows
     rem.py                  # opt-in "dream" pass (`relife dream`): LLM adversarial critic; prunes/reweights, reversibly
     server.py               # MCP server (tools route through default_client()): memory/skill/workflow tools
     _text.py                # shared tokenizer w/ stopwords
@@ -169,16 +184,18 @@ relife/
     orchestrator.py         # run_build(): decompose → delegate → resume
     prompts/orchestrator.md # orchestrator persona (architect/PM, delegates building)
   server/
-    session.py              # AgentSession (busy flag, per-turn grants) / ApprovalBroker / SessionManager
-    app.py                  # create_app (sessions, SSE, approvals, /schedules) + serve()
+    session.py              # AgentSession (lazy client + resume, cost meter, per-turn grants) / ApprovalBroker /
+                            #   SessionStore (data/sessions/) / SessionManager (ceiling, reaper that sleeps, restore)
+    app.py                  # create_app (sessions, SSE, approvals, schedules, agents, crews, /budget) + serve()
+    crews.py                # CrewHost (a crew run hosted like a session), LoopBroker, CrewService
     security.py             # pure auth/CSRF/bind/DNS-rebinding/workspace-confinement policy
     schedules.py            # Schedule record (grants, work), spec parsing, next_run(), JSON ScheduleStore
     scheduler.py            # lifespan tick loop: fire due schedules (incl. work schedules) + record outcomes
     runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
-data/                       # gitignored runtime: relife.db, skills/, workflows/, spaces/, agents.json,
-                            #   builds/, crews/, runs/, schedules.json
+data/                       # gitignored runtime: relife.db, skills/, workflows/, spaces/, agents.json(.lock),
+                            #   builds/, crews/, runs/, schedules.json, spend.db, sessions/
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # ~800 tests (deterministic + 4 semantic, embeddings forced off)
+tests/                      # ~920 tests (deterministic + 4 semantic, embeddings forced off)
 .venv/                      # gitignored Python 3.12 env for `[crewai]` (CrewAI needs < 3.14)
 ```
 
@@ -216,6 +233,15 @@ py -3.12 -m venv .venv
 - **Inherited claude.ai MCP connectors.** The subscription attaches Gmail/Calendar/Drive MCP
   servers to every session (`setting_sources=None` doesn't exclude them). Linked in-session
   on first use; gated by the verb-based connector policy (see MVP pass 2 and post-1.0 below).
+- **`total_cost_usd` is cumulative per CLI process.** A long-lived client reports a running
+  total after each turn (found 2026-10-11 by reading the bundled CLI); `budget.CostMeter` turns it
+  into per-turn spend. Every model path must record into the ledger or the cap undercounts.
+- **Windows sharing violations.** A file open for reading can't be replaced (and vice versa), so
+  every atomic JSON store goes through `relife/_atomic.py`; CI's windows-latest jobs catch what
+  local runs rarely do. And never probe a pid with `os.kill(pid, 0)` on Windows — it terminates it.
+- **A script folder can shadow libraries.** Running a helper script from a folder that also holds
+  ad-hoc `.py` files (an `h11.py`) made `httpx` import that file instead of the `h11` package — and
+  that file edited the repo. Run helpers from an empty folder, or with `python -P`.
 - **git author identity.** This machine's *global* git config is `tezoo2002@live.com` /
   "ReLife" (the system email) — so commits ReLife makes are authored as that unless changed.
   See open items.
@@ -743,8 +769,15 @@ name: evil` can no longer close the frontmatter and forge
   works). (4) **Stale records**: crew records carry their owner pid (`_proc.pid_alive`, Windows-safe);
   schedule history `submitted` → `interrupted` at startup. (5) Non-Claude crew agents reading default
   memory: kept as is (user's decision). Tests: `test_budget.py` (10), `test_session_persistence.py`
-  (12), plus registry/crew cases. Still open: crew members are still one `claude` process per task
-  (fresh context by design); TLS/multi-user remain out of scope.
+  (12), plus registry/crew cases. Merged as PR #10. **Live resume check (2026-10-11, scratch
+  `RELIFE_HOME`, real CLI) — ✅ PASSED** (~$0.94, three turns): creating a session started no
+  `claude` process, the first turn did; turn 1 set a code word ("don't save it, no tools"); the
+  session slept after 20 idle seconds and its process was released; turn 2 woke it and the agent
+  recalled the word; the server was then force-killed and restarted, the reattached session replayed
+  both turns, and turn 3 quoted the first message verbatim. The scratch home held **0 memories and 0
+  tool events**, so only the resumed conversation could answer; the ledger held exactly three
+  per-turn costs ($0.298 / $0.314 / $0.331). Still open: crew members are still one `claude`
+  process per task (fresh context by design); TLS/multi-user remain out of scope.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
