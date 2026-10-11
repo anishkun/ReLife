@@ -424,3 +424,53 @@ def test_a_member_without_tools_gets_none(env, tmp_path):
     critic = next(a for a in crew.agents if getattr(a, "role", "") == "Reviewer")
     names = {t.name for t in critic.tools}
     assert "memory_save" in names and not names & {"read_file", "write_file", "run_shell"}
+
+
+# --- what a CrewAI member's task cost ---------------------------------------------------------
+LLM_ONLY = {
+    "goal": "critique twice, then build",
+    "agents": [
+        {"name": "critic", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "claude-max"},
+        {"name": "builder", "role": "Engineer", "goal": "build", "runtime": "relife"},
+    ],
+    "tasks": [
+        {"name": "first", "agent": "critic", "description": "Critique the idea.", "expected_output": "notes"},
+        {"name": "second", "agent": "critic", "description": "Critique it again.", "expected_output": "notes",
+         "context": ["first"]},
+        {"name": "build", "agent": "builder", "description": "Build it.", "expected_output": "code",
+         "context": ["second"]},
+    ],
+}
+
+
+def test_a_crewai_members_cost_and_output_reach_the_record(env, tmp_path):
+    """The live smoke caught it: a `claude-max` member spent ~$0.59 (the budget
+    ledger had it) while its crew's record said $0.00 — only ReLife turns were
+    counted. Each task is charged its own share of the member's running total."""
+    store, client, _ = env
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=LLM_ONLY, yes=True, echo=lambda s: None,
+        runner=FakeRunner(), llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "done", rec.error
+    first, second = rec.outcome("first"), rec.outcome("second")
+    assert first.cost_usd == pytest.approx(0.02) and second.cost_usd == pytest.approx(0.02)
+    assert first.output == "looks good, ship it"
+    assert rec.cost_usd == pytest.approx(0.02 + 0.02 + 0.5)
+
+
+def test_a_crewai_members_finished_task_survives_a_later_failure(env, tmp_path):
+    store, client, _ = env
+
+    async def boom(agent, prompt, extra):
+        raise RuntimeError("disk full")
+
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=LLM_ONLY, yes=True, echo=lambda s: None,
+        runner=boom, llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "error" and "disk full" in rec.error
+    assert [t.name for t in rec.tasks] == ["first", "second"]
+    assert rec.outcome("second").runtime == "llm" and rec.cost_usd == pytest.approx(0.04)

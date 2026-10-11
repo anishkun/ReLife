@@ -164,6 +164,7 @@ def execute_crew(
 
     crew_ws.mkdir(parents=True, exist_ok=True)
     relife_results: dict[str, TurnResult] = {}
+    llm_results: dict[str, dict[str, Any]] = {}  # CrewAI members' tasks: output + cost
 
     def on_outcome(task_obj: Any, agent: Any, result: TurnResult) -> None:
         name = getattr(task_obj, "name", "") or ""
@@ -196,6 +197,7 @@ def execute_crew(
             on_step=on_step,
             should_stop=should_stop,
             approvals=approvals,
+            llm_outcomes=llm_results,
         )
         echo(f"running crew {record.id} in {crew_ws}")
         out = crew.kickoff()
@@ -205,14 +207,15 @@ def execute_crew(
             agent_spec = spec.agent(t.agent)
             raw = str(getattr(outputs[i], "raw", "")) if i < len(outputs) else ""
             r = relife_results.get(t.name)
+            lr = llm_results.get(t.name, {})
             record.tasks.append(
                 TaskOutcome(
                     name=t.name,
                     agent=t.agent,
                     runtime=agent_spec.runtime,
-                    output=raw or (r.output if r else ""),
+                    output=raw or (r.output if r else lr.get("output", "")),
                     tool_calls=r.tool_calls if r else 0,
-                    cost_usd=r.cost_usd if r else None,
+                    cost_usd=r.cost_usd if r else lr.get("cost_usd"),
                     error=r.error if r else None,
                     denied=r.denied if r else [],
                 )
@@ -232,6 +235,15 @@ def execute_crew(
                         name=name, agent=t.agent if t else "?", runtime="relife",
                         output=r.output, tool_calls=r.tool_calls, cost_usd=r.cost_usd,
                         error=r.error, denied=r.denied,
+                    )
+                )
+        for name, lr in llm_results.items():  # and CrewAI members' finished tasks
+            if record.outcome(name) is None:
+                t = next((x for x in spec.tasks if x.name == name), None)
+                record.tasks.append(
+                    TaskOutcome(
+                        name=name, agent=t.agent if t else "?", runtime="llm",
+                        output=lr.get("output", ""), cost_usd=lr.get("cost_usd"),
                     )
                 )
     finally:
