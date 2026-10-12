@@ -34,6 +34,8 @@ class TaskOutcome:
     cost_usd: float | None = None
     error: str | None = None
     denied: list[dict[str, Any]] = field(default_factory=list)
+    # A CrewAI member's model fallbacks during the task ("gemini/x → claude-max (…)").
+    model_switches: list[str] = field(default_factory=list)
 
 
 @dataclass

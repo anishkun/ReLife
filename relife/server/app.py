@@ -65,6 +65,10 @@ Endpoints:
   POST   /crews/{id}/stop                     → stop a running crew
   DELETE /crews/{id}                          → discard a planned crew
   GET    /budget                              → today's Max spend + the daily cap
+  GET    /llms                                → crew models: limits, learned back-off, usage
+  PUT    /llms/{model}                        → declare a model's limits (rpm/rpd/…/fallback)
+  DELETE /llms/{model}                        → remove a declaration
+  POST   /llms/{model}/reset                  → forget what its 429s taught
 """
 
 from __future__ import annotations
@@ -649,6 +653,45 @@ def create_app(
     async def budget_route() -> dict[str, Any]:
         """Today's spend across everything ReLife started, and the cap (if set)."""
         return await off_loop(budget.status)
+
+    # --- crew model limits (llm_limits / llm_usage) ---------------------------------
+    def _llms_view() -> dict[str, Any]:
+        from ..llm_usage import LimitsStore, model_status
+
+        store = LimitsStore()
+        names = list(dict.fromkeys([*store.declared(), *config.CREW_LLMS, config.CREW_CLAUDE_LLM]))
+        return {"models": [model_status(store.match(m)) for m in names], "problem": store.problem}
+
+    @app.get("/llms", dependencies=auth)
+    async def llms_route() -> dict[str, Any]:
+        """Each crew model's declared/learned limits and its recent usage."""
+        return await off_loop(_llms_view)
+
+    @app.put("/llms/{model:path}", dependencies=mutate)
+    async def llm_put(model: str, request: Request) -> dict[str, Any]:
+        from ..llm_usage import LimitsStore, model_status
+
+        body = await request.json()
+        try:
+            lim = await off_loop(lambda: LimitsStore().set(model, body))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return await off_loop(lambda: model_status(lim))
+
+    @app.delete("/llms/{model:path}", dependencies=mutate)
+    async def llm_delete(model: str) -> dict[str, Any]:
+        from ..llm_usage import LimitsStore
+
+        if not await off_loop(lambda: LimitsStore().remove(model)):
+            raise HTTPException(status_code=404, detail=f"no limits declared for {model!r}")
+        return {"ok": True}
+
+    @app.post("/llms/{model:path}/reset", dependencies=mutate)
+    async def llm_reset(model: str) -> dict[str, Any]:
+        from .. import llm_usage
+
+        await off_loop(lambda: llm_usage.reset(model))
+        return {"ok": True}
 
     def _crew_view(rec: Any, *, full: bool = False) -> dict[str, Any]:
         from ..crew.runner import describe_plan

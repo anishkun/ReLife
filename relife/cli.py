@@ -1080,9 +1080,110 @@ def crews_cmd(
         typer.secho(f"\n## {t.name} ({t.agent}, {t.runtime})", bold=True)
         if t.error:
             typer.secho(f"error: {t.error}", fg=typer.colors.RED)
+        if t.model_switches:
+            typer.secho("models: " + "; ".join(t.model_switches), fg=typer.colors.YELLOW)
         typer.echo(t.output or "(no output)")
     if r.error:
         typer.secho(f"\nerror: {r.error}", fg=typer.colors.RED)
+
+
+llm_app = typer.Typer(
+    help="Model limits: how fast each crew model may be called (pacing, fallback, learned back-off)."
+)
+app.add_typer(llm_app, name="llm")
+
+
+def _when(ts: float | None) -> str:
+    import time as _time
+
+    return _time.strftime("%H:%M", _time.localtime(ts)) if ts else ""
+
+
+@llm_app.command("list")
+def llm_list() -> None:
+    """Declared + learned limits and the last day's usage of every known model."""
+    from .llm_limits import describe
+    from .llm_usage import LimitsStore, model_status
+
+    store = LimitsStore()
+    if store.problem:
+        typer.secho(f"llm_limits.json: {store.problem}", fg=typer.colors.YELLOW)
+    models = list(dict.fromkeys([*store.declared(), *config.CREW_LLMS, config.CREW_CLAUDE_LLM]))
+    for m in models:
+        lim = store.match(m)
+        st = model_status(lim)
+        typer.secho(f"  {m:<32}", bold=True, nl=False)
+        typer.echo(describe(lim) + (f" → {', '.join(lim.fallback)}" if lim.fallback else ""))
+        state = {"ok": "", "cooling": f"  · cooling down until {_when(st['until'])}",
+                 "exhausted": f"  · out of quota until {_when(st['until'])}"}[st["state"]]
+        slowed = f"  · paced at {st['factor']:.0%} after 429s" if st["factor"] < 1 else ""
+        typer.secho(
+            f"  {'':<32}{st['calls_last_minute']} calls last minute · {st['calls_last_day']} today"
+            f" · {st['tightness']}{slowed}{state}",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+    if not store.declared():
+        typer.secho(
+            "\nno limits declared — undeclared remote models are paced at "
+            f"{config.LLM_DEFAULT_RPM or 'no'} rpm.\n"
+            "  relife llm set MODEL --rpm 10 --rpd 250 --fallback claude-max",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+
+
+@llm_app.command("set")
+def llm_set(
+    model: str = typer.Argument(
+        ..., help="Model string as a crew names it (gemini/gemini-2.0-flash), or a glob (openrouter/*:free)."
+    ),
+    rpm: Optional[int] = typer.Option(None, "--rpm", help="Requests per minute."),
+    rpd: Optional[int] = typer.Option(None, "--rpd", help="Requests per day."),
+    tpm: Optional[int] = typer.Option(None, "--tpm", help="Tokens per minute."),
+    tpd: Optional[int] = typer.Option(None, "--tpd", help="Tokens per day."),
+    tier: str = typer.Option("unknown", "--tier", help="free | paid | local | subscription | unknown."),
+    fallback: Optional[list[str]] = typer.Option(
+        None, "--fallback", help="Model to switch to when this one's quota is spent (repeatable, in order)."
+    ),
+    max_wait: Optional[float] = typer.Option(
+        None, "--max-wait", help="Seconds to wait for a reset before falling back / pausing."
+    ),
+    headroom: float = typer.Option(0.8, "--headroom", help="Pace per-minute limits at this fraction (0.1-1)."),
+) -> None:
+    """Declare (replace) a model's limits."""
+    from .llm_limits import describe
+    from .llm_usage import LimitsStore
+
+    values = {"rpm": rpm, "rpd": rpd, "tpm": tpm, "tpd": tpd, "tier": tier,
+              "fallback": fallback or [], "max_wait_s": max_wait, "headroom": headroom}
+    try:
+        lim = LimitsStore().set(model, values)
+    except ValueError as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2) from e
+    typer.secho(
+        f"{lim.model}: {describe(lim)}" + (f" → {', '.join(lim.fallback)}" if lim.fallback else ""),
+        fg=typer.colors.GREEN,
+    )
+
+
+@llm_app.command("unset")
+def llm_unset(model: str = typer.Argument(...)) -> None:
+    """Remove a model's declared limits (it falls back to the defaults)."""
+    from .llm_usage import LimitsStore
+
+    if not LimitsStore().remove(model):
+        typer.secho(f"no limits declared for {model!r}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(f"{model}: limits removed", fg=typer.colors.GREEN)
+
+
+@llm_app.command("reset")
+def llm_reset(model: str = typer.Argument(...)) -> None:
+    """Forget what was learned from a model's 429s (back-off, cooldown, out-of-quota)."""
+    from . import llm_usage
+
+    llm_usage.reset(model)
+    typer.secho(f"{model}: learned limits cleared", fg=typer.colors.GREEN)
 
 
 @app.command("mcp")

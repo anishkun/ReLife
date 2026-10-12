@@ -2490,6 +2490,86 @@ the stop words (`"\nObservation:"`) by truncation. The sync `call` runs the coro
 through `turns.run_sync`: `anyio.run` on the calling thread, or a helper thread when a
 loop is already running there. Cost accumulates for the run record.
 
+### Model limits: pacing, back-off, fallback (`llm_limits.py`, `llm_usage.py`, `crew/governed.py`)
+
+**The problem.** A CrewAI member on a free tier (say 10 requests a minute, 250 a day)
+gets called as fast as CrewAI's agent loop can go. CrewAI's only guard is a short retry
+(`crewai/llms/retry.py`: three tries, at most 8 s), so you get a burst of 429s, and once
+the day's quota is gone the crew dies with `status: error`, losing every task after it.
+
+**Three layers, split the house way** (pure policy, a small I/O layer, a thin adapter):
+
+- `llm_limits.py` is **pure** (no I/O, no clock), like `cognitive.py`.
+  - `ModelLimits` is what was declared: rpm/rpd/tpm/tpd, tier, a `headroom` (0.8), a
+    `fallback` chain and a `max_wait_s`.
+  - `match_limits` looks for an exact name, then the longest declared glob, then the
+    built-ins (`claude-max` = subscription; `ollama/*` = local, unlimited), then a
+    conservative `RELIFE_LLM_DEFAULT_RPM` for anything undeclared.
+  - `decide(limits, usage, learned, now, est_tokens)` returns `go`, `wait` (how long, why)
+    or `exhausted` (until when). It checks a sliding 60 s window and a **rolling 24 h**
+    window, so it is right whatever time of day the provider resets. Per-minute limits are
+    paced at headroom × the learned factor. Daily limits are used in full; a quota error
+    still catches a key that another app shares.
+  - `adapt` is AIMD: a 429 halves the factor (floor 0.1) and sets a cooldown (from
+    `retry-after` when given), and the factor recovers 10% per quiet minute (computed
+    lazily in `effective_factor`, so nothing is written on success). A *daily* quota error
+    marks the model exhausted.
+  - `classify_error` walks the cause chain for a 429 status, a throttle code or rate-limit
+    text, plus retry hints (headers, Gemini's `retryDelay`, OpenAI/Groq's "try again in
+    7.66s"). It separates **throttle** (slow down) from **quota** (`insufficient_quota`,
+    "per day"). Gemini words its per-minute and per-day 429s identically except for the
+    metric name, so the marker list is deliberately specific.
+  - `tightness` counts only *declared* numbers. The default rpm is a guess, and a guess
+    shouldn't decide anything that lasts longer than one call's pacing.
+- `llm_usage.py` holds the state.
+  - A SQLite ledger (`data/llm_usage.db`, next to `spend.db` and built the same way): one
+    row per request, refused ones included because the provider counted them, plus the
+    `learned` row per model. It is one file, so the CLI, the server and two crews on the
+    same free key are paced *together*.
+  - `LimitsStore` is the declared-limits JSON file (`relife llm set`), with `AgentStore`'s
+    rules: nothing written until a change, atomic, unreadable records dropped (never
+    widened to unlimited), the original kept aside.
+  - Ledger errors are swallowed, like `budget.record`.
+- `crew/governed.py` has `GovernedLLM(BaseLLM)`, a delegating wrapper that `build_crew`
+  puts around **every** CrewAI LLM: each member's (from whatever `llm_factory` built it,
+  so injected test models are governed too) and the hierarchical manager. On each call:
+  1. Ask `decide` for each model in `[preferred, *fallback]`. The first one that can go
+     (or must wait no longer than its budget) is used, so a fallback switches back to the
+     preferred model as soon as that one resets.
+  2. Sleep in ≤5 s slices so a crew stop is seen.
+  3. Call the model and record the tokens (the LLM's own usage counter if it has one,
+     else chars/4).
+  4. If the provider refuses, record it and loop; if it raises anything else, re-raise.
+  - With every model spent, wait if the soonest reset is within the wait budget, else
+    raise `QuotaPaused`.
+  - Switches are kept per member and charged to the task they happened in
+    (`TaskOutcome.model_switches`); the plan display shows each model's limits and
+    fallback.
+
+**CrewAI contract details the wrapper depends on** (read from the pinned 1.15.27
+source, then pinned by `tests/test_governed.py`):
+
+- `BaseLLM.__init_subclass__` wraps every subclass's `call`/`acall` in that short retry,
+  and **skips it for a nested call** (a context variable). Inside our `call`, the inner
+  model's 429 therefore reaches us on its first try.
+- Whatever *we* raise must never look like a throttle, or CrewAI retries us. So the
+  refusal is handled after the `except` block (no `__context__` to walk), and the pause
+  message avoids CrewAI's markers.
+- CrewAI's agent re-runs a failed task up to `max_retry_limit` times, except for
+  `HookAborted`. `QuotaPaused` and `GovernorStopped` subclass it: re-running a task
+  against an empty quota only burns time.
+- The per-call stop-word override is keyed by `id(llm)`, so the wrapper re-applies it to
+  the inner model (`call_stop_override(inner, self.stop_sequences)`).
+- The executor reads only `call`/`acall`, `supports_function_calling`/`stop_words`,
+  `stop`, `stream`, `get_context_window_size` and `get_token_usage_summary`, and the
+  wrapper forwards all of them. A real `kickoff()` with a native-function-calling fake
+  behind the wrapper is the spike test.
+
+**Up-front frugality.** A *tight* model's member also gets `max_iter =
+RELIFE_LLM_TIGHT_MAX_ITER` (8, against CrewAI's 25) and `respect_context_window`, since
+every loop iteration is one request. The planner is shown each model's limits and told to
+give tight ones few, short tasks.
+
 ### Contract surprises, and the defaults that stay off
 
 Two things CrewAI's docs don't say, found by reading the pinned 1.15.27 source and
@@ -2961,10 +3041,12 @@ multi-process test, not locally — which is why those tests exist.
 
 | File | Responsibility |
 |---|---|
-| `cli.py` | Typer CLI: `do`/`chat` (`--agent`)/`work`/`build`/`serve`/`doctor`/`consolidate`/`dream` + `memory {search,list,show,forget,stats,serve,ping,spaces,export,import}` + `agent {list,create,show,attach,detach,promote,token,connect,delete}` + `mcp` + `crew`/`crews`; wires permissions + MCP + hooks. |
+| `cli.py` | Typer CLI: `do`/`chat` (`--agent`)/`work`/`build`/`serve`/`doctor`/`consolidate`/`dream` + `memory {search,list,show,forget,stats,serve,ping,spaces,export,import}` + `agent {list,create,show,attach,detach,promote,token,connect,delete}` + `llm {list,set,unset,reset}` + `mcp` + `crew`/`crews`; wires permissions + MCP + hooks. |
 | `__main__.py` | `python -m relife` (what MCP client configs launch). |
 | `agents.py` | `AgentProfile` (identity → `MemoryScope`), `AgentStore` (`data/agents.json`; writes re-read under a thread lock + file lock, `put(new=)`), `create_agent` (inherit/fork), `attach`/`detach`/`promote`/`delete_agent`, hashed `rla_` tokens, `mcp_config`. |
 | `budget.py` | The spend ledger (`data/spend.db`): `record`, `CostMeter` (cumulative → per turn), `spent`/`by_kind`/`status`, the optional daily cap (`check`, `exceeded`, `BudgetExceeded`). |
+| `llm_limits.py` | Pure model-limits policy: `ModelLimits`/`Learned`/`Usage`, `match_limits` (exact → glob → built-in → default), `decide` (60 s + rolling 24 h windows, headroom, AIMD factor), `adapt`, `classify_error` (throttle vs quota, retry hints), `tightness`. |
+| `llm_usage.py` | The model-usage ledger (`data/llm_usage.db`: calls + learned back-off, shared across processes) and `LimitsStore` (`data/llm_limits.json`); `model_status` for CLI/doctor/`GET /llms`. |
 | `_atomic.py` | `replace`/`read_text` retrying Windows sharing violations — every atomic JSON store uses it. |
 | `_filelock.py` | `file_lock(path)`: cross-process exclusive lock on a `.lock` sidecar (`msvcrt` / `fcntl`). |
 | `_proc.py` | `pid_alive` (Windows: `OpenProcess`/`GetExitCodeProcess`, never `os.kill`). |
@@ -2972,7 +3054,7 @@ multi-process test, not locally — which is why those tests exist.
 | `agent.py` | `build_options`, `run_task`/`run_chat`, `to_event` (shared taxonomy), `_render`, `ask_model_oneshot`, `maybe_consolidate` (+ `_off_loop`), `_tool_brief`, Windows UTF-8 fix. |
 | `permissions.py` | `classify()` pure policy; nested-shell re-classification; `_OUTWARD_SHELL` denylist (both shells); `_global_install`; `_gh_outward` (verb-based `gh`); `_write_targets`/`_delete_targets`/`_escapes` shell containment (+ `_msys_to_windows`); `_under()`; connector verb policy; grants (`normalize_grants`, `grant_allows`, `_pr_create_matches`); `make_permission_callback` (TTY) + `make_approval_callback` (UI, `preauthorize`). |
 | `hooks.py` | `_make_hooks(get_client)` → recall (inject+reinforce via `build_context`), event (journal), episode (capture); module trio over `default_client()`; `memory_hooks(client)` for a scoped agent; every call `off_loop`. |
-| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/budget/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/agents), `default_probes()`, `to_json`. |
+| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/budget/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/model limits/agents), `default_probes()`, `to_json`. |
 | `config.py` | All paths (`RELIFE_HOME`), model id, every cognitive/recall/REM/daemon/server/scheduler/grant/crew tunable, `default_mcp_servers(memory_client)`, `agent_env`. |
 | `web/index.html` | Self-contained console: auth prompt, transcript via `EventSource`, approval cards, reattach via `localStorage` + `?last_id=0`, schedules panel with watch/run/runs, work toggle and pre-approvals. |
 | `memory/cognitive.py` | Pure ACT-R math: `activation`, `sigmoid`, `fused_score`, `should_archive`, `should_hard_delete`. |
@@ -3013,6 +3095,7 @@ multi-process test, not locally — which is why those tests exist.
 | `crew/turns.py` | `run_relife_turn` (one fresh scoped ReLife turn), `TurnResult`, `result_from_events`, `run_sync`. |
 | `crew/agent.py` | `ReLifeAgent(BaseAgentAdapter)`, `crew_tools_server` (outside the trusted prefix), `task_prompt` (context fenced). |
 | `crew/llm.py` | `ClaudeMaxLLM(BaseLLM)`: Claude via `ask_model_oneshot`, ReAct text, stop words by truncation. |
+| `crew/governed.py` | `GovernedLLM(BaseLLM)`: every crew model call paced under its limits; fallback chain; `QuotaPaused`/`GovernorStopped` (`HookAborted` subclasses, never retried by CrewAI). |
 | `crew/native.py` | `default_llm`, `llm_agent` (CrewAI `Agent` with ReLife memory tools, no delegation), `journal_step`. |
 | `crew/memory_tools.py` | `RelifeMemoryTool(BaseTool)` over a `ToolSpec`; `memory_tools(client)`. |
 | `crew/build.py` | `ensure_profiles` (the handoff point), `run_scope` (a reused agent's run-only reads), `build_crew` (scoped members, recall block for CrewAI tasks, stop + budget check per task, CrewAI memory/planning off). |
@@ -3100,6 +3183,12 @@ to asking).
 **Crews:** `CREW_MAX_AGENTS = 5`, `CREW_MAX_TASKS = 8`, `CREW_LLMS` (`RELIFE_CREW_LLMS`,
 comma-separated non-Claude models the planner may staff; keys stay in the env for
 CrewAI/LiteLLM), `CREW_CLAUDE_LLM = claude-max` (always available).
+
+**Model limits:** `LLM_LIMITS_PATH = data/llm_limits.json` (`relife llm set`), `LLM_USAGE_PATH =
+data/llm_usage.db`, `LLM_DEFAULT_RPM = 10` (undeclared remote models; 0 = unpaced),
+`LLM_MAX_WAIT = 900s` (wait for a reset before falling back / pausing), `LLM_QUOTA_BACKOFF =
+3600s` (a daily-quota error with no retry-after), `LLM_TIGHT_RPM = 15` / `LLM_TIGHT_RPD = 500`
+(declared limits at or under these make a model *tight*), `LLM_TIGHT_MAX_ITER = 8`.
 
 Most are overridable via `RELIFE_*` environment variables (see `config.py`).
 

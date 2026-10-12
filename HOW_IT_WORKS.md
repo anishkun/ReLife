@@ -662,6 +662,23 @@ and it can't run the housekeeping or "dream" passes.
    task produced, what it cost and anything that was denied. (If the terminal or server
    running a crew dies, its record says *interrupted* rather than "running" forever.) Each agent's lessons
    land in its own memory; `relife agent promote` brings the good ones into yours.
+**Free and rate-limited models.** Every model has limits: requests per minute, per
+day. ReLife keeps a model *under* them instead of running into them. Tell it yours once:
+
+```
+relife llm set gemini/gemini-2.0-flash --rpm 10 --rpd 250 --tier free --fallback claude-max
+```
+
+From then on, every call a crew makes to that model is paced (at 80% of the per-minute
+limit). If the provider still says "slow down", ReLife backs off and remembers it for a
+while. If the day's quota runs out, the agent switches to the fallback model (here,
+Claude on your subscription) and goes back to the free one once its quota resets. The
+plan you approve shows each model's limits, and the planner gives a model with tight
+limits only small jobs. A model you haven't described is paced cautiously (10 requests a
+minute), except local Ollama models, which have no limit. `relife llm list` shows what
+each model has used today and whether it is cooling down or out of quota. `relife
+doctor` warns about crew models with no declared limits, and the console's Crews panel
+has a **Models** section where you can view and set them.
 
 CrewAI doesn't run on Python 3.14 yet, so crews run from a Python 3.12 virtual
 environment (`py -3.12 -m venv .venv`, then `.venv\Scripts\pip install -e ".[crewai]"`

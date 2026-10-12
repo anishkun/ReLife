@@ -12,7 +12,10 @@
    memory attached, plus the gated machine tools the plan names for it (each
    call checked by the ``can_use_tool`` that ``approvals`` builds — the
    terminal prompt by default, a browser card under the server). Each gets a
-   ``ScopedMemoryClient`` for its own scope.
+   ``ScopedMemoryClient`` for its own scope, and its LLM is wrapped in a
+   :class:`GovernedLLM` — paced under that model's declared/learned limits,
+   switching to its fallback model when its quota is spent (``governed.py``);
+   a *tight* model also gets a short agent loop (``RELIFE_LLM_TIGHT_MAX_ITER``).
 3. **Tasks** in plan order, each reading only the earlier tasks it names.
 4. **The crew**, with CrewAI's own memory, planning and knowledge OFF: they
    default to OpenAI embeddings/models (they'd demand a key), and ReLife's
@@ -27,12 +30,15 @@ from typing import Any, Callable
 
 from crewai import Crew, Process, Task
 
-from .. import budget
+from .. import budget, config
 from ..agents import AgentStore, create_agent
+from ..llm_limits import tightness
+from ..llm_usage import LimitsStore
 from ..memory.client import ScopedMemoryClient
 from ..memory.spaces import MemoryScope
 from ..memory.context import build_context
 from .agent import OnOutcome, ReLifeAgent, TurnRunner
+from .governed import govern
 from .machine import CanUseTool, MachineTools
 from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
 from .spec import CrewSpec
@@ -105,18 +111,23 @@ def build_crew(
     should_stop: Callable[[], bool] | None = None,
     approvals: Approvals | None = None,
     llm_outcomes: dict[str, dict[str, Any]] | None = None,
+    on_note: Callable[[str, str], None] | None = None,
+    limits: LimitsStore | None = None,
 ) -> Crew:
     """``should_stop`` is checked after every task (any member kind): once it
     says so — or the daily budget is reached — the next task never starts and
     ``kickoff()`` raises. ``approvals`` builds the gate for an ``llm`` member's
     machine tools (default: :func:`terminal_approvals`). ``llm_outcomes``, if
     given, is filled as each ``llm`` member's task finishes: ``{task: {"output",
-    "cost_usd"}}`` — CrewAI members have no turn result, so this is where their
-    cost (the change in their LLM's running total) comes from."""
+    "cost_usd", "model_switches"}}`` — CrewAI members have no turn result, so
+    this is where their cost (the change in their LLM's running total) comes
+    from. ``on_note(agent, text)`` hears the governor pace, back off or switch
+    models; ``limits`` is the declared-limits table (default: the user's file)."""
     from ..permissions import classify_confined
 
     llm_factory = llm_factory or default_llm
     approvals = approvals or terminal_approvals
+    limits = limits or LimitsStore()
     members: dict[str, Any] = {}
     llms: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
@@ -148,7 +159,12 @@ def build_crew(
                     journal=lambda tool, brief, m=mem, t=task_id: m.log_event(tool, brief=brief, task_id=t),
                 )
                 gated = machine_tools(tools, a.tools)
-            llms[a.name] = llm_factory(a.llm)
+            llms[a.name] = govern(
+                llm_factory(a.llm), a.llm,
+                factory=llm_factory, limits_for=limits.match, should_stop=should_stop,
+                on_note=(lambda text, n=a.name: on_note(n, text)) if on_note else None,
+            )
+            tight = tightness(limits.match(a.llm)) == "tight"
             members[a.name] = llm_agent(
                 a,
                 memory_client=scoped[a.name],
@@ -156,9 +172,11 @@ def build_crew(
                 task_id=task_id,
                 on_step=(lambda s, n=a.name: on_step(n, s)) if on_step else None,
                 tools=gated,
+                max_iter=config.LLM_TIGHT_MAX_ITER if tight else None,
             )
 
     spent: dict[str, float] = {}  # agent -> its LLM's running total at its last task's end
+    switched: dict[str, int] = {}  # agent -> model switches already charged to a task
 
     def llm_task_done(task_name: str, agent_name: str) -> Callable[[Any], None]:
         def done(output: Any) -> None:
@@ -167,8 +185,15 @@ def build_crew(
             if isinstance(total, (int, float)):
                 cost = float(total) - spent.get(agent_name, 0.0)
                 spent[agent_name] = float(total)
+            switches = llms[agent_name].switches
+            new = switches[switched.get(agent_name, 0):]
+            switched[agent_name] = len(switches)
             if llm_outcomes is not None:
-                llm_outcomes[task_name] = {"output": str(getattr(output, "raw", "") or ""), "cost_usd": cost}
+                llm_outcomes[task_name] = {
+                    "output": str(getattr(output, "raw", "") or ""),
+                    "cost_usd": cost,
+                    "model_switches": [s.line() for s in new],
+                }
 
         return done
 
@@ -199,7 +224,9 @@ def build_crew(
     if hierarchical and manager_llm is None:
         from .llm import ClaudeMaxLLM
 
-        manager_llm = ClaudeMaxLLM()
+        manager_llm = govern(
+            ClaudeMaxLLM(), config.CREW_CLAUDE_LLM, limits_for=limits.match, should_stop=should_stop,
+        )
 
     def stop_check(_output: Any) -> None:
         if should_stop is not None and should_stop():

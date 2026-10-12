@@ -474,3 +474,37 @@ def test_a_crewai_members_finished_task_survives_a_later_failure(env, tmp_path):
     assert rec.status == "error" and "disk full" in rec.error
     assert [t.name for t in rec.tasks] == ["first", "second"]
     assert rec.outcome("second").runtime == "llm" and rec.cost_usd == pytest.approx(0.04)
+
+
+# --- model limits: a member on a spent model falls back -------------------------------------
+def test_a_member_whose_model_is_spent_falls_back_and_the_record_says_so(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    llm_usage.LimitsStore().set("free/model", {"rpd": 1, "fallback": ["claude-max"]})
+    llm_usage.record_call("free/model")  # today's one request is already used
+    spec_raw = {
+        "goal": "critique",
+        "agents": [{"name": "critic", "role": "Reviewer", "goal": "review", "runtime": "llm",
+                    "llm": "free/model"}],
+        "tasks": [{"name": "review", "agent": "critic", "description": "Critique the idea.",
+                   "expected_output": "notes"}],
+    }
+    built: list[str] = []
+
+    def factory(model):
+        built.append(model)
+        return ClaudeMaxLLM(ask_model=StubModel())
+
+    lines: list[str] = []
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=spec_raw, yes=True, echo=lines.append,
+        llm_factory=factory, store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "done", rec.error
+    assert built == ["free/model", "claude-max"]
+    out = rec.outcome("review")
+    assert out.output == "looks good, ship it"
+    assert [s.split(" (")[0] for s in out.model_switches] == ["free/model → claude-max"]
+    assert any("switching free/model → claude-max" in line for line in lines)
+    assert any("1/day" in line and "falls back to claude-max" in line for line in lines)  # the plan said so

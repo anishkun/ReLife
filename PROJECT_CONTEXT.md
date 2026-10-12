@@ -136,11 +136,13 @@ PROJECT_CONTEXT.md          # this file
 README.md / CHANGELOG.md / RELEASE_TESTING.md / CLAUDE.md
 HOW_IT_WORKS.md             # plain-English guide;  MODULE_DEEP_DIVE.md — architecture + reasoning (M1–M16)
 relife/
-  cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */mcp/crew/crews
+  cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */llm */mcp/crew/crews
   __main__.py               # `python -m relife` (what MCP client configs launch)
   agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens;
                             #   writes re-read under a thread lock + OS file lock
   budget.py                 # spend ledger (data/spend.db), CostMeter (cumulative → per turn), daily cap
+  llm_limits.py             # pure model-limits policy: decide (go/wait/exhausted), AIMD adapt, classify_error
+  llm_usage.py              # model-usage ledger (data/llm_usage.db) + declared limits (data/llm_limits.json)
   _atomic.py / _filelock.py / _proc.py  # Windows-safe replace/read retry; cross-process lock; pid_alive
   agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming), to_event
   config.py                 # MODEL, EFFORT, paths (RELIFE_HOME), agent_env() (gh PATH), default_mcp_servers()
@@ -178,6 +180,7 @@ relife/
     spec.py / planner.py    # pure: validated CrewSpec; Claude plans it (one tool-less call)
     agent.py                # ReLifeAgent(BaseAgentAdapter): a crew member = a fresh ReLife turn
     llm.py                  # ClaudeMaxLLM(BaseLLM): Claude via the CLI for CrewAI (no API key)
+    governed.py             # GovernedLLM: every crew model call paced under its limits; fallback; QuotaPaused
     native.py / memory_tools.py  # CrewAI agents on other models + ReLife memory as CrewAI tools
     build.py / runner.py / record.py  # profiles+handoff → Crew → kickoff → data/crews/<id>/
   build/                    # `relife build`: orchestrated, resumable large builds
@@ -814,6 +817,18 @@ name: evil` can no longer close the frontmatter and forge
   record (pre-existing, since crews shipped). Fixed: `build_crew(llm_outcomes=)` charges each `llm`
   task the change in its member's LLM running total (CrewAI's per-task `callback`) and keeps its output
   if a later task fails; two regression tests.
+- **Limit-aware models, individual vs collective memory, pause/resume (2026-10-12, in progress).**
+  Plan: `C:\Users\HP\.claude\plans\frolicking-dazzling-frog.md`, three PRs. **PR 1 — model limits
+  and pacing — built:** `llm_limits.py` (pure: declared `ModelLimits` matched exact → glob → built-in →
+  conservative default; `decide` over a 60 s and a rolling 24 h window with headroom and an AIMD factor;
+  `adapt`; `classify_error` telling a throttle from a daily quota, with retry hints), `llm_usage.py`
+  (SQLite ledger shared across processes + `LimitsStore`), `crew/governed.py` (`GovernedLLM` around every
+  CrewAI LLM: pace, back off, walk the fallback chain, `QuotaPaused` as a `HookAborted` so CrewAI never
+  re-runs the task). Tight models get `max_iter=8`; the planner and the plan display show each model's
+  limits; `relife llm list|set|unset|reset`, `GET/PUT/DELETE /llms`, a Models section in the Crews panel,
+  a doctor check. Spike confirmed by test: a native-function-calling model drives a real `kickoff()`
+  through the wrapper. 997 tests on the 3.12 venv, 959 on 3.14. **Next:** PR 2 (collective memory +
+  lean access + outcome episodes for every `llm` member), PR 3 (pause/resume when every model is spent).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

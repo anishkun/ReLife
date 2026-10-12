@@ -56,3 +56,7 @@ def _spend_ledger_isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DAILY_BUDGET_USD", 0.0)
     # Likewise sleeping server sessions (server/session.SessionStore).
     monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
+    # And the model-limits file + usage ledger (llm_limits.py / llm_usage.py):
+    # no test may pace against, or learn into, the user's real ones.
+    monkeypatch.setattr(config, "LLM_LIMITS_PATH", tmp_path / "llm_limits.json")
+    monkeypatch.setattr(config, "LLM_USAGE_PATH", tmp_path / "llm_usage.db")

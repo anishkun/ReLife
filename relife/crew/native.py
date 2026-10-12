@@ -73,9 +73,15 @@ def llm_agent(
     task_id: str,
     on_step: Callable[[Any], None] | None = None,
     tools: list[Any] | None = None,
+    max_iter: int | None = None,
 ) -> Agent:
     """``tools`` are extra CrewAI tools beyond memory — the gated machine tools
-    (``machine_tools.py``) when the plan gives the agent any."""
+    (``machine_tools.py``) when the plan gives the agent any. ``max_iter`` caps
+    its agent loop (set for a model with tight limits: every iteration is a
+    request); ``None`` keeps CrewAI's default."""
+    extra: dict[str, Any] = {}
+    if max_iter is not None:
+        extra = {"max_iter": max_iter, "respect_context_window": True}
     journal = journal_step(memory_client, task_id)
 
     def step(s: Any) -> None:
@@ -98,4 +104,5 @@ def llm_agent(
             allow_delegation=False,
             verbose=False,
             step_callback=step,
+            **extra,
         )

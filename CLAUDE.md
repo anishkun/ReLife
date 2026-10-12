@@ -47,6 +47,8 @@ relife mcp --agent NAME           # ReLife memory as a stdio MCP server, scoped 
 relife crew "<task>" [--spec F] [--plan-only] [--yes]   # CrewAI plans a team; ReLife staffs + runs it
 relife crews [ID]                 # recent crew runs / one run's per-task outcomes (data/crews/<id>/)
                                   #   (also from the web console: /agents, /crews routes + panels under `relife serve`)
+relife llm list|set|unset|reset   # crew model limits: `set MODEL --rpm 10 --rpd 250 --fallback claude-max`;
+                                  #   every crew model call is paced under them (also /llms routes + console panel)
 relife serve [--host --port]      # always-on agent server + web UI (needs [server] extra; default :8600)
 # RELIFE_HOME: where data/ and workspace/ live. Default: beside the code in a source checkout, ~/.relife for an
 #   installed wheel (never site-packages — an upgrade would wipe memory)
@@ -66,6 +68,10 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 #   env, read by CrewAI/LiteLLM; ReLife never stores them); `claude-max` (Claude via the CLI) is always available
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 # RELIFE_AGENT_MAX_CREWS (default 1) caps crews running at once under `relife serve`
+# model limits: data/llm_limits.json (declared) + data/llm_usage.db (calls + learned back-off, shared across
+#   processes); RELIFE_LLM_DEFAULT_RPM (10; 0 = unpaced) paces undeclared remote models; RELIFE_LLM_MAX_WAIT
+#   (900s) waits for a quota reset before falling back / pausing; RELIFE_LLM_TIGHT_RPM/_RPD (15/500) mark a
+#   model "tight" (short agent loop: RELIFE_LLM_TIGHT_MAX_ITER=8)
 # RELIFE_DAILY_BUDGET_USD — daily cap on Max usage across everything ReLife starts (off unless set; spend is
 #   always tracked in data/spend.db — relife doctor, GET /budget). Reached ⇒ new work refused, crews stop at a task boundary
 # server sessions sleep after RELIFE_AGENT_SESSION_IDLE_TIMEOUT (default 900s): subprocess released, record kept in
@@ -151,6 +157,20 @@ stricter). Calls journal themselves under the ReLife tool name; no browser or co
 `spec.py`/`planner.py`/`record.py`/`machine.py` are pure (no CrewAI import); the turn runner and the LLM's model call are injected, so `tests/test_crew.py` runs a real
 `Crew.kickoff()` with zero model calls. `runner.py` is `prepare_crew` (plan/validate + record `planned`) and
 `execute_crew` (run a recorded plan), composed by `run_crew` for the CLI.
+
+**Model limits** (`llm_limits.py` pure policy · `llm_usage.py` ledger + `LimitsStore` · `crew/governed.py`):
+`build_crew` wraps **every** CrewAI LLM (members, whatever `llm_factory` built; the hierarchical manager) in
+`GovernedLLM`, which asks `decide()` before each call — `go`, `wait` (60 s window at `headroom` × the AIMD
+factor, or a cooldown after a 429), or `exhausted` (rolling 24 h window, or a daily-quota error) — and walks the
+model's declared `fallback` chain, preferring the original again once it resets. Provider refusals go through
+`classify_error` (throttle vs quota; `retry-after`, Gemini `retryDelay`, "try again in 7.66s") into the shared
+ledger, so two crews on one free key back off together. CrewAI wraps every `BaseLLM.call` in a 3-try retry that it
+**skips for nested calls** — so the inner model's 429 reaches us first-try — and our own exceptions must never
+look like a throttle (raised outside the `except`, no rate-limit words) or CrewAI retries *us*. With every model in
+the chain spent beyond `max_wait_s`, `QuotaPaused` is raised: a `HookAborted` subclass, the one exception CrewAI's
+agent passes through instead of re-running the task. The stop-word override is keyed by `id(llm)`, so the wrapper
+re-applies it to the inner model. Switches land on `TaskOutcome.model_switches`; `tightness()` counts only
+*declared* limits.
 
 A plan reusing a **registered** agent never changes it: its `inherit` widens reads for that run only
 (`build.run_scope`) — a plan is model output, and attaching is the user's act.

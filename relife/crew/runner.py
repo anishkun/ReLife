@@ -49,16 +49,22 @@ def roster(store: AgentStore, client: Any) -> list[dict[str, Any]]:
     ]
 
 
-def describe_plan(spec: CrewSpec) -> list[str]:
-    """The plan as the user reviews it before anything runs."""
+def describe_plan(spec: CrewSpec, limits: Any = None) -> list[str]:
+    """The plan as the user reviews it before anything runs. ``limits`` (a
+    ``LimitsStore``; default the user's file) adds each model's limits."""
+    from ..llm_limits import describe
+    from ..llm_usage import LimitsStore
+
+    limits = limits or LimitsStore()
     lines = [f"goal: {spec.goal}", f"process: {spec.process}", "agents:"]
     for a in spec.agents:
         if a.runtime == "relife":
             engine = "ReLife agent (Claude + tools)"
-        elif a.tools:
-            engine = f"CrewAI agent on {a.llm} (gated {' + '.join(a.tools)} tools)"
         else:
-            engine = f"CrewAI agent on {a.llm} (no tools)"
+            lim = limits.match(a.llm)
+            fallback = f" → falls back to {', '.join(lim.fallback)}" if lim.fallback else ""
+            tools = f"gated {' + '.join(a.tools)} tools" if a.tools else "no tools"
+            engine = f"CrewAI agent on {a.llm} ({tools}; {describe(lim)}{fallback})"
         lineage = []
         if a.inherit:
             lineage.append("inherits " + ", ".join(a.inherit))
@@ -140,6 +146,7 @@ def execute_crew(
     on_task: Callable[[str, str, TurnResult | None], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     approvals: Any = None,
+    limits: Any = None,
 ) -> CrewRunRecord:
     """Run a recorded plan: agents and their memory, kickoff, per-task outcomes.
 
@@ -198,6 +205,9 @@ def execute_crew(
             should_stop=should_stop,
             approvals=approvals,
             llm_outcomes=llm_results,
+            # Pacing, back-off and model switches, as the governor makes them.
+            on_note=lambda agent, text: echo(f"  ⏳ {agent}: {text}"),
+            limits=limits,
         )
         echo(f"running crew {record.id} in {crew_ws}")
         out = crew.kickoff()
@@ -218,6 +228,7 @@ def execute_crew(
                     cost_usd=r.cost_usd if r else lr.get("cost_usd"),
                     error=r.error if r else None,
                     denied=r.denied if r else [],
+                    model_switches=lr.get("model_switches", []),
                 )
             )
         record.status = "done"
@@ -244,6 +255,7 @@ def execute_crew(
                     TaskOutcome(
                         name=name, agent=t.agent if t else "?", runtime="llm",
                         output=lr.get("output", ""), cost_usd=lr.get("cost_usd"),
+                        model_switches=lr.get("model_switches", []),
                     )
                 )
     finally:

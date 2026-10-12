@@ -574,3 +574,26 @@ def test_a_stopped_crews_machine_tools_do_nothing_even_auto_allowed(env, tmp_pat
         assert type(await gate("Write", args, None)).__name__ == "PermissionResultDeny"
 
     anyio.run(flow)
+
+
+# --- crew model limits over HTTP ---------------------------------------------------------
+def test_llm_limits_routes(env):
+    from relife import llm_usage
+
+    _, c = make_app(env)
+    with c:
+        r = c.put("/llms/gemini/gemini-2.0-flash",
+                  json={"rpm": 10, "rpd": 250, "tier": "free", "fallback": ["claude-max"]})
+        assert r.status_code == 200, r.text
+        assert r.json()["tightness"] == "tight" and r.json()["limits"]["fallback"] == ["claude-max"]
+        assert c.put("/llms/x", json={"rpm": -3}).status_code == 400
+        models = {m["model"]: m for m in c.get("/llms").json()["models"]}
+        assert models["gemini/gemini-2.0-flash"]["limits"]["rpd"] == 250
+        assert models["claude-max"]["declared"] is False
+        llm_usage.record_error("gemini/gemini-2.0-flash", "throttle", 5)
+        assert c.post("/llms/gemini/gemini-2.0-flash/reset").json() == {"ok": True}
+        assert llm_usage.learned("gemini/gemini-2.0-flash").factor == 1.0
+        assert c.delete("/llms/gemini/gemini-2.0-flash").json() == {"ok": True}
+        assert c.delete("/llms/gemini/gemini-2.0-flash").status_code == 404
+        # A cross-site page can't change limits with the ambient cookie.
+        assert c.put("/llms/m", json={"rpm": 1}, headers={"Origin": "https://evil.example"}).status_code == 403

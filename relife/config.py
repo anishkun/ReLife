@@ -264,6 +264,24 @@ CREW_LLMS = tuple(
 # The model string that means "Claude through the logged-in CLI" (no API key).
 CREW_CLAUDE_LLM = "claude-max"
 
+# Model limits (llm_limits.py policy, llm_usage.py ledger, crew/governed.py wrapper).
+# Every crew model is paced under the limits declared in LLM_LIMITS_PATH (`relife llm
+# set MODEL --rpm 10 --rpd 250`), tightened automatically after a 429. A model with no
+# declaration is paced at LLM_DEFAULT_RPM (0 = unpaced); claude-max and ollama/* are not.
+LLM_LIMITS_PATH = DATA_DIR / "llm_limits.json"
+LLM_USAGE_PATH = DATA_DIR / "llm_usage.db"
+LLM_DEFAULT_RPM = int(os.environ.get("RELIFE_LLM_DEFAULT_RPM", "10") or 0)
+# A model's quota ran out: wait up to this long for the reset before falling back /
+# pausing the crew (per-model `max_wait_s` overrides it).
+LLM_MAX_WAIT = float(os.environ.get("RELIFE_LLM_MAX_WAIT", "900"))
+# How long a daily-quota error with no retry-after marks a model exhausted.
+LLM_QUOTA_BACKOFF = float(os.environ.get("RELIFE_LLM_QUOTA_BACKOFF", "3600"))
+# Declared limits at or under these make a model "tight": its agents get frugal
+# memory (collective + lean) and fewer agent-loop iterations.
+LLM_TIGHT_RPM = int(os.environ.get("RELIFE_LLM_TIGHT_RPM", "15"))
+LLM_TIGHT_RPD = int(os.environ.get("RELIFE_LLM_TIGHT_RPD", "500"))
+LLM_TIGHT_MAX_ITER = int(os.environ.get("RELIFE_LLM_TIGHT_MAX_ITER", "8"))
+
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
 

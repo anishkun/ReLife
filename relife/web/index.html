@@ -305,6 +305,21 @@
       <button class="primary" type="submit" id="crPlan">Plan crew</button>
     </form>
     <div id="crewList"></div>
+    <h2>Models</h2>
+    <p class="note">How fast each crew model may be called. ReLife paces every model
+       under its limits, backs off after a 429, and switches to the fallback when a
+       quota runs out. Declare limits from your provider's plan.</p>
+    <div id="llmList"></div>
+    <form class="addform" id="llmForm" autocomplete="off">
+      <input id="lmModel" placeholder="model, e.g. gemini/gemini-2.0-flash" maxlength="200" required />
+      <div class="split">
+        <input id="lmRpm" type="number" min="1" placeholder="requests / min" />
+        <input id="lmRpd" type="number" min="1" placeholder="requests / day" />
+      </div>
+      <input id="lmFallback" placeholder="fallback when spent: claude-max (optional)" />
+      <div class="err" id="lmErr"></div>
+      <button class="primary" type="submit">Save limits</button>
+    </form>
   </aside>
 
   <aside class="panel schedules" id="schedules" hidden>
@@ -1117,8 +1132,58 @@
     crewsPanel.hidden = !show;
     crewsBtn.setAttribute("aria-pressed", String(show));
     if (crewTimer) { clearInterval(crewTimer); crewTimer = null; }
-    if (show) { loadCrews(); crewTimer = setInterval(() => loadCrews(true), 5000); }
+    if (show) { loadCrews(); loadLlms(); crewTimer = setInterval(() => loadCrews(true), 5000); }
   }
+
+  // --- crew model limits -------------------------------------------------------
+  const llmList = document.getElementById("llmList");
+  const lmErr = document.getElementById("lmErr");
+  const clock = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  async function loadLlms() {
+    try {
+      const r = await api("GET", "/llms");
+      if (!r.ok) throw new Error(await fail(r));
+      const data = await r.json();
+      llmList.innerHTML = "";
+      for (const m of data.models) {
+        const l = m.limits || {};
+        const parts = [l.rpm && `${l.rpm} rpm`, l.rpd && `${l.rpd}/day`, l.tier && l.tier !== "unknown" && l.tier]
+          .filter(Boolean).join(" · ") || "no rate limits";
+        const state = m.state === "exhausted" ? ` · out of quota until ${clock(m.until)}`
+          : m.state === "cooling" ? ` · cooling down until ${clock(m.until)}` : "";
+        const el = document.createElement("div");
+        el.className = "sched";
+        el.innerHTML = `
+          <div class="top"><span class="name">${esc(m.model)}</span><span class="cadence">${esc(m.tightness)}${m.declared ? "" : " · default"}</span></div>
+          <div class="meta">${esc(parts)}${l.fallback ? ` → ${esc(l.fallback.join(", "))}` : ""}${esc(state)}</div>
+          <div class="meta">${m.calls_last_minute} calls last minute · ${m.calls_last_day} today${m.factor < 1 ? ` · paced at ${Math.round(m.factor * 100)}% after 429s` : ""}</div>
+          ${m.declared ? `<div class="acts"><button type="button" class="danger" data-act="unset">remove</button></div>` : ""}`;
+        const b = el.querySelector("[data-act=unset]");
+        if (b) b.onclick = async () => {
+          if (!armed(b, "remove")) return;
+          await api("DELETE", `/llms/${m.model.split("/").map(encodeURIComponent).join("/")}`);
+          loadLlms();
+        };
+        llmList.appendChild(el);
+      }
+    } catch (e) {
+      if (e.message !== "auth") llmList.innerHTML = `<p class="note">could not load models</p>`;
+    }
+  }
+  document.getElementById("llmForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    lmErr.textContent = "";
+    const v = (id) => document.getElementById(id).value.trim();
+    const num = (id) => v(id) ? Number(v(id)) : null;
+    const model = v("lmModel");
+    const body = { rpm: num("lmRpm"), rpd: num("lmRpd"), fallback: v("lmFallback").split(/[\s,]+/).filter(Boolean) };
+    try {
+      const r = await api("PUT", `/llms/${model.split("/").map(encodeURIComponent).join("/")}`, body);
+      if (!r.ok) { lmErr.textContent = await fail(r); return; }
+      e.target.reset();
+      loadLlms();
+    } catch (err) { if (err.message !== "auth") lmErr.textContent = "could not reach the server"; }
+  });
   crewsBtn.addEventListener("click", () => toggleCrews());
   document.getElementById("crewForm").addEventListener("submit", async (e) => {
     e.preventDefault();
