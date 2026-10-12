@@ -27,6 +27,9 @@ from .machine import TOOLSETS
 RUNTIMES = ("relife", "llm")
 MEMORY = ("auto", "individual", "collective")
 PROCESSES = ("sequential", "hierarchical")
+# A resumed task carries a finished task's output after this line (runner.remaining_spec);
+# what the task *is* — the part a memory episode keeps — comes before it.
+CARRIED_MARK = "\n\n## Output of the earlier task "
 MAX_TEXT = 4000  # per free-text field; the planner can ramble
 
 

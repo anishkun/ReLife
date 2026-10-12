@@ -48,7 +48,7 @@ from .governed import govern
 from .memory_policy import MemoryPlan, resolve
 from .machine import CanUseTool, MachineTools
 from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
-from .spec import CrewSpec
+from .spec import CARRIED_MARK, CrewSpec
 from .turns import OnEvent
 
 # (agent name, workspace, policy) -> the can_use_tool its machine tools ask.
@@ -209,7 +209,7 @@ def build_crew(
         """The task's outcome as an episode in the member's memory — written by
         ReLife, no model call, so a member learns whether or not it ever calls a
         memory tool (and a lean one, which has none, still does)."""
-        what = " ".join(description.split())[:200]
+        what = " ".join(description.split(CARRIED_MARK)[0].split())[:200]  # not a resume's carried output
         got = " ".join(output.split())[:600]
         if not got:
             return

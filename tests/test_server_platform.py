@@ -216,6 +216,7 @@ def test_plan_a_crew_then_discard_it(env):
     listed = tc.get("/crews").json()
     assert [c["id"] for c in listed["crews"]] == [crew["id"]]
     assert "claude-max" in listed["llms"]
+    assert listed["auto_resume"] is False  # this app runs no scheduler, so nothing resumes on its own
     assert tc.delete(f"/crews/{crew['id']}").json() == {"discarded": True}
     assert tc.get(f"/crews/{crew['id']}").json()["status"] == "cancelled"
     assert tc.delete(f"/crews/{crew['id']}").status_code == 409

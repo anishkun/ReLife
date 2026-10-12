@@ -645,6 +645,10 @@ def test_a_paused_crew_refuses_to_resume_until_the_reset_then_runs_the_rest(env,
     assert len(runner.prompts) == 1  # the builder's task was not run twice
     # The review read the build's recorded output, fenced as data.
     assert any("Output of the earlier task 'build'" in p and "built the CSV export" in p for _, p in model.calls)
+    # ...but the review's memory episode says what the task was, not the carried output.
+    episodes = [m.text for m in client.all_memories() if m.text.startswith("[crew task] ")]
+    assert any(e.startswith("[crew task] Review") for e in episodes), episodes
+    assert not any("Output of the earlier task" in e for e in episodes)
     assert records.get(rec.id).status == "done"
     with pytest.raises(ValueError, match="only a paused or interrupted crew"):
         crew_runner.prepare_resume(done, records=records)

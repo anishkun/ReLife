@@ -1058,13 +1058,13 @@
       const sig = JSON.stringify(data.crews);
       if (background && (crewList.matches(":hover") || sig === crewSig)) return;
       crewSig = sig;
-      renderCrews(data.crews, data.crewai);
+      renderCrews(data.crews, data.crewai, data.auto_resume);
     } catch (e) {
       if (e.message !== "auth") crewList.innerHTML = `<p class="note">could not load crews</p>`;
     }
   }
   const crewCls = (st) => st === "done" ? "done" : ["running", "planned", "paused"].includes(st) ? "amber" : "bad";
-  function renderCrews(items, crewai) {
+  function renderCrews(items, crewai, autoResume) {
     crewList.innerHTML = items.length ? "" : `<p class="note">No crews yet.</p>`;
     for (const c of items) {
       const el = document.createElement("div");
@@ -1078,7 +1078,7 @@
       }
       if (live) acts.push(`<button type="button" data-act="watch">watch</button>`);
       if (running && live) acts.push(`<button type="button" class="danger" data-act="stop">stop</button>`);
-      if (["paused", "interrupted"].includes(c.status) && !live) acts.push(`<button type="button" data-act="resume" ${crewai ? "" : "disabled"} title="Run the tasks it didn't finish">resume</button>`);
+      if (["paused", "interrupted"].includes(c.status)) acts.push(`<button type="button" data-act="resume" ${crewai ? "" : "disabled"} title="Run the tasks it didn't finish">resume</button>`);
       if (["done", "error", "cancelled", "interrupted"].includes(c.status)) acts.push(`<button type="button" data-act="again" ${crewai ? "" : "disabled"}>run again</button>`);
       acts.push(`<button type="button" data-act="details" aria-pressed="false">details</button>`);
       const tasks = (c.tasks || []).map(t =>
@@ -1087,7 +1087,7 @@
         <div class="top"><span class="name">${esc(c.task.slice(0, 90))}</span><span class="cadence"><span class="st ${crewCls(c.status)}">${esc(c.status)}</span></span></div>
         <div class="meta">${esc(c.id)} · ${esc(rel(c.created_at))}${esc(money(c.cost_usd))}</div>
         ${c.error ? `<div class="meta"><span class="bad">${esc(c.error)}</span></div>` : ""}
-        ${c.status === "paused" ? `<div class="meta">${esc(c.paused_reason || "out of quota")} — resumes on its own after ${esc(clock(c.resume_after))}</div>` : ""}
+        ${c.status === "paused" ? `<div class="meta">${esc(c.paused_reason || "out of quota")} — ${autoResume ? "resumes on its own" : "resume it"} after ${esc(clock(c.resume_after))}</div>` : ""}
         ${c.final_output ? `<div class="outcome">${esc(c.final_output)}</div>` : ""}
         <div class="acts">${acts.join("")}</div>
         <div class="runs" hidden>

@@ -50,7 +50,14 @@ def default_llm(model: str) -> Any:
         return ClaudeMaxLLM()
     from crewai import LLM
 
-    return LLM(model=model)
+    # The governor (governed.py) retries a refusal itself, after counting it
+    # and backing off. A provider SDK's own retry (OpenAI/Anthropic/Azure:
+    # 2 by default) would resend unseen — on a free tier, quota spent that the
+    # ledger never counts — so it is turned off where the provider has one.
+    llm = LLM(model=model, max_retries=0)
+    if "max_retries" in (getattr(llm, "additional_params", None) or {}) and not getattr(llm, "is_litellm", False):
+        return LLM(model=model)  # no such setting here: don't forward it into the request
+    return llm
 
 
 def journal_step(client: Any, task_id: str) -> Callable[[Any], None]:

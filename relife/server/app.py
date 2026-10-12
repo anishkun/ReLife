@@ -746,6 +746,8 @@ def create_app(
             "crewai": crewai_available(),
             "hint": None if crewai_available() else CREWAI_HINT,
             "llms": [config.CREW_CLAUDE_LLM, *config.CREW_LLMS],
+            # Does this server resume a quota-paused crew by itself (the scheduler's tick)?
+            "auto_resume": bool(tick and config.CREW_AUTO_RESUME),
         }
 
     @app.post("/crews", dependencies=mutate, status_code=201)

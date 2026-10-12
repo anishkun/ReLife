@@ -2593,6 +2593,12 @@ source, then pinned by `tests/test_governed.py`):
   against an empty quota only burns time.
 - The per-call stop-word override is keyed by `id(llm)`, so the wrapper re-applies it to
   the inner model (`call_stop_override(inner, self.stop_sequences)`).
+- **The provider SDK's own retry is off** (`native.default_llm` builds with `max_retries=0`
+  where the provider class has that field; OpenAI-compatible, Anthropic and Azure do). The
+  OpenAI SDK otherwise resends a 429 twice on its own. Every resend is a request the
+  provider counts, but the ledger never sees it and the wrapper learns nothing from it. A
+  smoke against a throttling fake endpoint showed 4 requests reaching a 3-rpm model while
+  the ledger counted 2. With the SDK retry off, the wrapper is the only one that retries.
 - The executor reads only `call`/`acall`, `supports_function_calling`/`stop_words`,
   `stop`, `stream`, `get_context_window_size` and `get_token_usage_summary`, and the
   wrapper forwards all of them. A real `kickoff()` with a native-function-calling fake

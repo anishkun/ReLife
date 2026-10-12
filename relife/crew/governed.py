@@ -56,7 +56,8 @@ class QuotaPaused(HookAborted):  # noqa: N818 — a stop, not an error
 
     def __init__(self, model: str, reset_at: float, reason: str = "") -> None:
         when = time.strftime("%H:%M", time.localtime(reset_at))
-        super().__init__(f"{model} has no quota left until about {when}" + (f" ({reason})" if reason else ""))
+        why = reason.removeprefix(f"{model}: ")  # decide()'s reasons start with the model's name
+        super().__init__(f"{model} has no quota left until about {when}" + (f" ({why})" if why else ""))
         self.model = model
         self.reset_at = reset_at
         self.why = reason
@@ -109,6 +110,7 @@ class GovernedLLM(BaseLLM):
     _on_note: Callable[[str], None] | None = PrivateAttr(default=None)
     _switches: list[Switch] = PrivateAttr(default_factory=list)
     _waited: float = PrivateAttr(default=0.0)
+    _last_wait: tuple[float, str] | None = PrivateAttr(default=None)  # (until, reason) last noted
 
     def __init__(
         self,
@@ -190,7 +192,18 @@ class GovernedLLM(BaseLLM):
             self._inners[model] = self._factory(model)
         return self._inners[model]
 
-    def _admit(self, est: int, waited: float) -> tuple[str, float]:
+    def _note_wait(self, secs: float, reason: str, now: float) -> None:
+        """Say a wait once, when it starts — not on every slice of it."""
+        if self._on_note is None:
+            return
+        until = now + secs
+        last = self._last_wait
+        if last is not None and last[1] == reason and abs(last[0] - until) < 2 * SLICE:
+            return  # the same wait, still counting down
+        self._last_wait = (until, reason)
+        self._on_note(f"waiting {secs:.0f}s — {reason}")
+
+    def _admit(self, est: int, waited: float, *, quiet: bool = False) -> tuple[str, float]:
         """``("go", 0)`` with ``self._current`` set to the model to call, or
         ``("wait", seconds)``. Raises :class:`QuotaPaused` when waiting can't
         help within the budget."""
@@ -204,8 +217,8 @@ class GovernedLLM(BaseLLM):
                 self._use(model, blocked)
                 if d.action == "go":
                     return "go", 0.0
-                if self._on_note is not None:
-                    self._on_note(f"waiting {d.wait_s:.0f}s — {d.reason}")
+                if not quiet:
+                    self._note_wait(d.wait_s, d.reason, now)
                 return "wait", d.wait_s
             reset = d.reset_at if d.action == "exhausted" else now + d.wait_s
             blocked = blocked or d.reason
@@ -215,8 +228,8 @@ class GovernedLLM(BaseLLM):
         reset_at, model, reason = soonest
         if reset_at - now <= budget - waited:
             self._use(model, reason)
-            if self._on_note is not None:
-                self._on_note(f"every model in the chain is spent; waiting {reset_at - now:.0f}s for {model}")
+            if not quiet:
+                self._note_wait(reset_at - now, f"every model in the chain is spent; {model} is next free", now)
             return "wait", max(0.0, reset_at - now)
         raise QuotaPaused(self._preferred, reset_at, reason)
 
@@ -232,7 +245,7 @@ class GovernedLLM(BaseLLM):
         """Before the next task starts: raise :class:`QuotaPaused` if no model
         in the chain could take a call within the wait budget — so the crew
         pauses *between* tasks rather than part-way into one."""
-        self._admit(0, 0.0)
+        self._admit(0, 0.0, quiet=True)
 
     def _check_stop(self) -> None:
         if self._should_stop is not None and self._should_stop():

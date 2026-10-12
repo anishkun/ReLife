@@ -178,7 +178,8 @@ ledger, so two crews on one free key back off together. CrewAI wraps every `Base
 look like a throttle (raised outside the `except`, no rate-limit words) or CrewAI retries *us*. With every model in
 the chain spent beyond `max_wait_s`, `QuotaPaused` is raised: a `HookAborted` subclass, the one exception CrewAI's
 agent passes through instead of re-running the task. The stop-word override is keyed by `id(llm)`, so the wrapper
-re-applies it to the inner model. Switches land on `TaskOutcome.model_switches`; `tightness()` counts only
+re-applies it to the inner model. The inner model is built with `max_retries=0` (`native.default_llm`): a provider
+SDK's own silent retry would spend quota the ledger never counts. Switches land on `TaskOutcome.model_switches`; `tightness()` counts only
 *declared* limits. **Memory per member** (`crew/memory_policy.resolve`, pure): a plan's `memory: auto` makes a **new**
 agent on a tight model collective (a registered agent is never moved — the note names `relife agent set`), and a
 tight model's member reaches memory **lean** (no memory tools — each call is a request — and the recalled block at

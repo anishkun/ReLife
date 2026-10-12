@@ -202,3 +202,29 @@ def test_a_native_function_calling_model_runs_a_real_crew_through_the_wrapper():
                 memory=False, planning=False)
     assert crew.kickoff().raw == "the final answer"
     assert inner._calls and inner._calls[0]["tools"]  # native tools were handed through
+
+
+def test_a_wait_is_noted_once_not_on_every_slice():
+    clock = Clock()
+    notes: list[str] = []
+    llm = governed(FakeLLM("a", "b", "c"), clock, on_note=notes.append,
+                   limits_for=table(free__m={"rpm": 1, "headroom": 1.0}))
+    llm.call("hi")
+    llm.preflight()  # the between-tasks check says nothing about pacing
+    assert notes == []
+    llm.call("hi")  # waits a minute in 5 s slices
+    assert len(clock.slept) > 2
+    assert [n.split(" — ")[0] for n in notes] == ["waiting 60s"]
+    llm.call("hi")  # a new wait is a new note
+    assert len(notes) == 2
+
+
+def test_provider_sdk_retries_are_off_so_every_request_is_counted(monkeypatch):
+    # The governor retries refusals itself; the OpenAI SDK's own 2 silent retries
+    # would spend a free tier's quota that the ledger never sees.
+    from relife.crew.native import default_llm
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    llm = default_llm("openai/gpt-4o-mini")
+    assert llm.max_retries == 0
+    assert "max_retries" not in llm.additional_params
