@@ -751,10 +751,29 @@ def agent_list() -> None:
         typer.secho(f"{a.runtime:<9}", fg=typer.colors.CYAN, nl=False)
         reads = ", ".join(a.scope().read[1:]) or "nothing else"
         typer.echo(
-            f"{n:>4} memories in {a.own_space}  · reads {reads}"
+            f"{n:>4} memories in {a.own_space} ({a.memory_label})  · reads {reads}"
             + (f"  · {a.model}" if a.model else "")
             + ("  · token" if a.token_hash else "")
         )
+
+
+@agent_app.command("set")
+def agent_set(
+    name: str = typer.Argument(..., help="Agent name."),
+    memory: str = typer.Option(..., "--memory", help="individual | collective"),
+    collective: str = typer.Option("", "--collective", help="With --memory collective: which team's pool."),
+) -> None:
+    """Move an agent's memory home (its old one stays readable to it)."""
+    from .agents import set_memory
+
+    store, _ = _agents()
+    try:
+        a = set_memory(store, name, memory, collective)
+    except (ValueError, LookupError) as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2) from e
+    typer.secho(f"{a.name}: {a.memory_label} memory — writes {a.own_space}", fg=typer.colors.GREEN)
+    typer.echo(f"  reads:  {', '.join(a.scope().read)}")
 
 
 @agent_app.command("create")
@@ -779,6 +798,14 @@ def agent_create(
         False, "--isolated", help="Don't let it read your main (default) memory — e.g. an external "
         "agent whose model provider shouldn't see it."
     ),
+    memory: str = typer.Option(
+        "individual", "--memory",
+        help="individual = a memory of its own · collective = write the shared pool every agent reads "
+        "(for an agent on a free-tier model, or one that needs no private history).",
+    ),
+    collective: str = typer.Option(
+        "", "--collective", help="With --memory collective: a team's own pool (collective-NAME) instead of the global one."
+    ),
 ) -> None:
     """Register an agent and hand it memory from older agents."""
     from .agents import create_agent
@@ -789,6 +816,7 @@ def agent_create(
             store, client, name,
             runtime=runtime, model=model, description=description,
             inherit=list(inherit or []), fork=fork, space=space, isolated=isolated,
+            memory=memory, collective=collective,
         )
     except (ValueError, LookupError) as e:
         typer.secho(f"error: {e}", fg=typer.colors.RED)

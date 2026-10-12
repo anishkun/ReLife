@@ -42,7 +42,8 @@ relife memory forget <id>... | --query "<q>"  [--yes]   # archive (reversible); 
 relife memory serve [--host --port]  # run the long-lived memory daemon (needs [daemon] extra); also serves /mcp
 relife memory ping                # check the daemon is reachable (GET /health)
 relife memory spaces | export SPACE -o F | import F --space S   # per-agent spaces; portable packs
-relife agent list|create|show|attach|detach|promote|token|connect|delete   # agents + memory handoff
+relife agent list|create|show|set|attach|detach|promote|token|connect|delete   # agents + memory handoff
+                                  #   (`create/set --memory collective [--collective TEAM]`: write the shared pool)
 relife mcp --agent NAME           # ReLife memory as a stdio MCP server, scoped to that agent (any MCP client)
 relife crew "<task>" [--spec F] [--plan-only] [--yes]   # CrewAI plans a team; ReLife staffs + runs it
 relife crews [ID]                 # recent crew runs / one run's per-task outcomes (data/crews/<id>/)
@@ -71,7 +72,8 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 # model limits: data/llm_limits.json (declared) + data/llm_usage.db (calls + learned back-off, shared across
 #   processes); RELIFE_LLM_DEFAULT_RPM (10; 0 = unpaced) paces undeclared remote models; RELIFE_LLM_MAX_WAIT
 #   (900s) waits for a quota reset before falling back / pausing; RELIFE_LLM_TIGHT_RPM/_RPD (15/500) mark a
-#   model "tight" (short agent loop: RELIFE_LLM_TIGHT_MAX_ITER=8)
+#   model "tight" (short agent loop: RELIFE_LLM_TIGHT_MAX_ITER=8; lean memory: RELIFE_LLM_LEAN_MEMORY=auto|always|never,
+#   RELIFE_LLM_LEAN_INJECT_BUDGET=800); RELIFE_COLLECTIVE_MAX_IMPORTANCE (0.6) caps saves into a collective
 # RELIFE_DAILY_BUDGET_USD — daily cap on Max usage across everything ReLife starts (off unless set; spend is
 #   always tracked in data/spend.db — relife doctor, GET /budget). Reached ⇒ new work refused, crews stop at a task boundary
 # server sessions sleep after RELIFE_AGENT_SESSION_IDLE_TIMEOUT (default 900s): subprocess released, record kept in
@@ -119,7 +121,12 @@ transitive), `fork=` snapshots via `copy_space` (memories keep strength + proven
 present), `promote` copies an agent's space into `default` (the only path in besides the main agent and an
 explicit import), packs via `export_space`/`import_pack` (validated in full first; imports stamped `import:<space>`).
 Attachments are read-only by design — a save can only land in one place, so agents that should share writes get the
-same `space`. Tokens for HTTP MCP are `rla_…`, stored as sha256 only. **`ScopedMemoryClient`** (client.py) is the
+same `space`. **Memory mode**: `AgentProfile.memory` is `individual` (own space) or `collective` — it writes the global
+`collective` space (or `collective-<name>`, `.collective`), which **every non-isolated agent reads** (after own +
+inherits, before `default`); named collectives only their members/attachers. Saves into any `collective*` space are
+importance-capped (`COLLECTIVE_MAX_IMPORTANCE`, 0.6) in `ScopedMemoryClient.save`; a collective agent can't fork;
+deleting a member never archives the pool; `collective`/`collective-*` are refused as *new* agent names
+(`validate_new_agent_name` — old records still load); `set_memory` moves an agent and attaches its old home. Tokens for HTTP MCP are `rla_…`, stored as sha256 only. **`ScopedMemoryClient`** (client.py) is the
 enforcement point: its agent-facing methods take **no** space argument (passing one is a `TypeError`, not an
 override), `forget`/`archive` reach only `scope.write`, admin ops (`copy/export/import/archive_space`) and `dream`
 raise `PermissionError`. `memory_hooks(client)` / `memory_server(client)` / `config.default_mcp_servers(memory_client)`
@@ -170,7 +177,11 @@ look like a throttle (raised outside the `except`, no rate-limit words) or CrewA
 the chain spent beyond `max_wait_s`, `QuotaPaused` is raised: a `HookAborted` subclass, the one exception CrewAI's
 agent passes through instead of re-running the task. The stop-word override is keyed by `id(llm)`, so the wrapper
 re-applies it to the inner model. Switches land on `TaskOutcome.model_switches`; `tightness()` counts only
-*declared* limits.
+*declared* limits. **Memory per member** (`crew/memory_policy.resolve`, pure): a plan's `memory: auto` makes a **new**
+agent on a tight model collective (a registered agent is never moved — the note names `relife agent set`), and a
+tight model's member reaches memory **lean** (no memory tools — each call is a request — and the recalled block at
+`LLM_LEAN_INJECT_BUDGET`). **Every** `llm` member's finished task is saved as an `episode` in its memory by
+`build_crew`'s task callback — no model call — so a CrewAI member learns even if it never calls `memory_save`.
 
 A plan reusing a **registered** agent never changes it: its `inherit` widens reads for that run only
 (`build.run_scope`) — a plan is model output, and attaching is the user's act.

@@ -281,6 +281,15 @@ LLM_QUOTA_BACKOFF = float(os.environ.get("RELIFE_LLM_QUOTA_BACKOFF", "3600"))
 LLM_TIGHT_RPM = int(os.environ.get("RELIFE_LLM_TIGHT_RPM", "15"))
 LLM_TIGHT_RPD = int(os.environ.get("RELIFE_LLM_TIGHT_RPD", "500"))
 LLM_TIGHT_MAX_ITER = int(os.environ.get("RELIFE_LLM_TIGHT_MAX_ITER", "8"))
+# Memory access for a crew member on another model: "lean" = no memory tools (every
+# tool call is a request), recalled context injected up front at LLM_LEAN_INJECT_BUDGET
+# chars, and the task's outcome saved by ReLife with no model call. auto = lean for a
+# tight model, full otherwise; always / never force it.
+LLM_LEAN_MEMORY = os.environ.get("RELIFE_LLM_LEAN_MEMORY", "auto").strip().lower()
+LLM_LEAN_INJECT_BUDGET = int(os.environ.get("RELIFE_LLM_LEAN_INJECT_BUDGET", "800"))
+# Saves into a collective space (shared by every agent) are capped at this importance,
+# so no single writer can make its memories dominate everyone's recall.
+COLLECTIVE_MAX_IMPORTANCE = float(os.environ.get("RELIFE_COLLECTIVE_MAX_IMPORTANCE", "0.6"))
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

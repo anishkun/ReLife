@@ -54,6 +54,7 @@ def describe_plan(spec: CrewSpec, limits: Any = None) -> list[str]:
     ``LimitsStore``; default the user's file) adds each model's limits."""
     from ..llm_limits import describe
     from ..llm_usage import LimitsStore
+    from .memory_policy import resolve
 
     limits = limits or LimitsStore()
     lines = [f"goal: {spec.goal}", f"process: {spec.process}", "agents:"]
@@ -65,6 +66,8 @@ def describe_plan(spec: CrewSpec, limits: Any = None) -> list[str]:
             fallback = f" → falls back to {', '.join(lim.fallback)}" if lim.fallback else ""
             tools = f"gated {' + '.join(a.tools)} tools" if a.tools else "no tools"
             engine = f"CrewAI agent on {a.llm} ({tools}; {describe(lim)}{fallback})"
+        plan = resolve(a, limits.match(a.llm) if a.runtime == "llm" else None)
+        engine += f" · memory {plan.label}"
         lineage = []
         if a.inherit:
             lineage.append("inherits " + ", ".join(a.inherit))
@@ -188,7 +191,7 @@ def execute_crew(
         # Inside the try: the registry may have changed since the plan was
         # recorded (a fork parent deleted), and that must end the run as an
         # error on the record — not leave it "planned" with nothing running.
-        for n in ensure_profiles(spec, store, client):
+        for n in ensure_profiles(spec, store, client, limits):
             echo(f"  · {n}")
         crew = build_crew(
             spec,

@@ -164,7 +164,7 @@ def test_agents_routes_register_hand_down_and_promote(env):
     ScopedMemoryClient(client, store.require("builder").scope()).save("exports live in export.py")
 
     r = tc.post("/agents", json={"name": "critic", "inherit": ["builder"]})
-    assert r.status_code == 201 and r.json()["reads"] == ["critic", "builder", "default"]
+    assert r.status_code == 201 and r.json()["reads"] == ["critic", "builder", "collective", "default"]
     assert tc.post("/agents", json={"name": "critic"}).status_code == 400  # exists
     assert tc.post("/agents", json={"name": "x", "inherit": ["nobody"]}).status_code == 404
     assert tc.post("/agents", json={"name": "Bad Name"}).status_code == 400
@@ -177,7 +177,7 @@ def test_agents_routes_register_hand_down_and_promote(env):
     assert tc.get("/spaces").json()["spaces"]["builder"]["memories"] == 1
 
     r = tc.post("/agents/critic/detach", json={"other": "builder"})
-    assert r.json()["reads"] == ["critic", "default"]
+    assert r.json()["reads"] == ["critic", "collective", "default"]
     r = tc.post("/agents/critic/attach", json={"other": "builder"})
     assert "builder" in r.json()["reads"]
 
@@ -597,3 +597,21 @@ def test_llm_limits_routes(env):
         assert c.delete("/llms/gemini/gemini-2.0-flash").status_code == 404
         # A cross-site page can't change limits with the ambient cookie.
         assert c.put("/llms/m", json={"rpm": 1}, headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_agent_memory_mode_over_http(env):
+    _, c = make_app(env)
+    with c:
+        r = c.post("/agents", json={"name": "scout", "runtime": "llm", "model": "free/m",
+                                    "memory": "collective", "collective": "research"})
+        assert r.status_code == 201, r.text
+        assert r.json()["own_space"] == "collective-research"
+        assert r.json()["memory_label"] == "collective:research"
+        moved = c.patch("/agents/scout", json={"memory": "individual"})
+        assert moved.status_code == 200 and moved.json()["own_space"] == "scout"
+        assert "collective-research" in moved.json()["reads"]
+        assert c.patch("/agents/scout", json={"isolated": False}).status_code == 400
+        assert c.patch("/agents/nobody", json={"memory": "collective"}).status_code == 404
+        assert c.post("/agents", json={"name": "collective-x"}).status_code == 400
+        assert c.patch("/agents/scout", json={"memory": "collective"},
+                       headers={"Origin": "https://evil.example"}).status_code == 403

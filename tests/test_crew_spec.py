@@ -166,3 +166,49 @@ def test_planner_falls_back_to_one_relife_agent():
     spec, notes, _ = anyio.run(lambda: planner.plan_crew("tidy the README", roster=[], ask_model=stub, llms=()))
     assert [a.name for a in spec.agents] == ["generalist"]
     assert spec.agents[0].runtime == "relife" and "falling back" in notes[-1]
+
+
+# --- memory modes -----------------------------------------------------------------
+def _one(**agent):
+    base = {"name": "a", "role": "r", "goal": "g", "runtime": "llm", "llm": "m"}
+    base.update(agent)
+    return {"goal": "x", "agents": [base],
+            "tasks": [{"name": "t", "agent": "a", "description": "d", "expected_output": "e"}]}
+
+
+def test_memory_fields_are_validated():
+    assert normalize_spec(_one()).agents[0].memory == "auto"
+    a = normalize_spec(_one(memory="collective", collective="research")).agents[0]
+    assert (a.memory, a.collective) == ("collective", "research")
+    for bad in ({"memory": "hive"}, {"memory": "individual", "collective": "x"},
+                {"collective": "Bad Name"}, {"name": "collective"}, {"name": "collective-x"}):
+        with pytest.raises(ValueError):
+            normalize_spec(_one(**bad))
+    with pytest.raises(ValueError, match="can't fork"):
+        normalize_spec(_one(memory="collective", fork="old"), existing_agents={"old"})
+
+
+def test_memory_policy(monkeypatch):
+    from relife import config
+    from relife.crew.memory_policy import resolve
+    from relife.crew.spec import AgentSpec
+    from relife.llm_limits import limits_from_dict, match_limits
+
+    tight = limits_from_dict("free/m", {"rpm": 10})
+    ample = limits_from_dict("big/m", {"rpm": 500})
+    llm = AgentSpec(name="a", role="r", goal="g", runtime="llm", llm="free/m")
+    p = resolve(llm, tight)
+    assert (p.mode, p.access, p.label) == ("collective", "lean", "collective · lean")
+    assert "tight" in p.why
+    assert resolve(llm, ample).label == "individual · full"
+    assert resolve(llm, match_limits("gemini/x", {})).mode == "individual"  # an undeclared guess decides nothing
+    named = AgentSpec(name="a", role="r", goal="g", runtime="llm", llm="free/m", collective="team")
+    assert resolve(named, tight).label == "collective:team · lean"
+    pinned = AgentSpec(name="a", role="r", goal="g", runtime="llm", llm="free/m", memory="individual")
+    assert resolve(pinned, tight).label == "individual · lean"
+    relife = AgentSpec(name="b", role="r", goal="g", memory="collective")
+    assert resolve(relife, None).label == "collective · full"  # ReLife members reach memory by hooks
+    monkeypatch.setattr(config, "LLM_LEAN_MEMORY", "always")
+    assert resolve(llm, ample).access == "lean"
+    monkeypatch.setattr(config, "LLM_LEAN_MEMORY", "never")
+    assert resolve(llm, tight).access == "full"

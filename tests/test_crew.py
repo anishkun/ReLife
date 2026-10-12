@@ -204,7 +204,7 @@ def test_crew_kickoff_end_to_end(env, tmp_path):
     spec = normalize_spec(SPEC)
     notes = ensure_profiles(spec, store, client)
     assert notes[0] == "new agent builder" and "reads builder" in notes[1]
-    assert store.require("critic").scope().read == ("critic", "builder", "default")
+    assert store.require("critic").scope().read == ("critic", "builder", "collective", "default")
 
     stub, runner, outcomes = StubModel(), FakeRunner(), {}
     crew = build_crew(
@@ -508,3 +508,67 @@ def test_a_member_whose_model_is_spent_falls_back_and_the_record_says_so(env, tm
     assert [s.split(" (")[0] for s in out.model_switches] == ["free/model → claude-max"]
     assert any("switching free/model → claude-max" in line for line in lines)
     assert any("1/day" in line and "falls back to claude-max" in line for line in lines)  # the plan said so
+
+
+# --- memory for every member, whatever its model -------------------------------------------
+TIGHT_SPEC = {
+    "goal": "tidy notes",
+    "agents": [
+        {"name": "freebie", "role": "Formatter", "goal": "format", "runtime": "llm", "llm": "free/model"},
+        {"name": "critic", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "claude-max"},
+    ],
+    "tasks": [
+        {"name": "format", "agent": "freebie", "description": "Format the release notes as a table.",
+         "expected_output": "a table"},
+        {"name": "review", "agent": "critic", "description": "Review the formatted notes.",
+         "expected_output": "a verdict", "context": ["format"]},
+    ],
+}
+
+
+def test_a_tight_model_gets_collective_lean_memory_and_every_member_remembers(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    llm_usage.LimitsStore().set("free/model", {"rpm": 10, "rpd": 250, "tier": "free"})
+    spec = normalize_spec(TIGHT_SPEC)
+    notes = ensure_profiles(spec, store, client)
+    assert store.require("freebie").own_space == "collective"
+    assert any("freebie" in n and "collective memory (free/model has tight limits)" in n for n in notes)
+    assert store.require("critic").own_space == "critic"  # claude-max: ample → individual
+    crew = build_crew(spec, store=store, client=client, workspace=tmp_path, run_id="t1",
+                      llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()))
+    members = {a.role: a for a in crew.agents}
+    assert not {t.name for t in members["Formatter"].tools} & {"memory_save", "memory_recall"}  # lean
+    assert "memory_save" in {t.name for t in members["Reviewer"].tools}  # full
+    assert members["Formatter"].max_iter == 8 and members["Reviewer"].max_iter != 8
+    crew.kickoff()
+    # Both remember their task without a memory tool call — in their own homes.
+    pool = client.recall("release notes table", spaces=["collective"])
+    assert pool and pool[0].kind == "episode" and pool[0].source == "freebie"
+    assert pool[0].importance <= 0.6
+    own = client.recall("formatted notes review", spaces=["critic"])
+    assert own and own[0].text.startswith("[crew task] Review the formatted notes.")
+
+
+def test_a_plan_never_moves_a_registered_agents_memory(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    ag.create_agent(store, client, "freebie", runtime="llm", model="free/model")
+    llm_usage.LimitsStore().set("free/model", {"rpm": 5})
+    spec = normalize_spec(TIGHT_SPEC, existing_agents={"freebie"})
+    notes = ensure_profiles(spec, store, client)
+    assert store.require("freebie").own_space == "freebie"
+    note = next(n for n in notes if n.startswith("reusing freebie"))
+    assert "individual memory" in note and "relife agent set freebie --memory collective" in note
+
+
+def test_the_plan_shows_each_members_memory(env):
+    from relife import llm_usage
+    from relife.crew.runner import describe_plan
+
+    llm_usage.LimitsStore().set("free/model", {"rpd": 100})
+    lines = "\n".join(describe_plan(normalize_spec(TIGHT_SPEC)))
+    assert "free/model (no tools; 100/day · default" not in lines  # declared, so not "default"
+    assert "memory collective · lean" in lines and "memory individual · full" in lines

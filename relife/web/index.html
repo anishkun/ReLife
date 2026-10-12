@@ -269,9 +269,10 @@
 
   <aside class="panel" id="agentsPanel" hidden>
     <h2>Agents</h2>
-    <p class="note">Each agent keeps its own memory. It also reads what it inherits
-       (live, read-only) and your memory unless isolated. Promote copies what it
-       learned into yours.</p>
+    <p class="note">Each agent keeps its own memory — or, if it needs none of its own
+       (say, on a free-tier model), writes the shared <b>collective</b> every agent reads.
+       It also reads what it inherits (live, read-only) and your memory unless isolated.
+       Promote copies what it learned into yours.</p>
     <p class="note warn" id="agProblem" hidden></p>
     <div id="agentList"></div>
     <form class="addform" id="agentForm" autocomplete="off">
@@ -287,6 +288,13 @@
       </div>
       <input id="agInherit" placeholder="inherits from: builder, critic (optional)" />
       <input id="agFork" placeholder="fork from (a snapshot copy, optional)" />
+      <div class="split">
+        <select id="agMemory" title="individual = a memory of its own · collective = the shared pool every agent reads (good for free-tier models)">
+          <option value="individual">own memory</option>
+          <option value="collective">collective memory</option>
+        </select>
+        <input id="agCollective" placeholder="team pool (optional)" maxlength="37" />
+      </div>
       <label class="check"><input id="agIsolated" type="checkbox" /> isolated: doesn't read your memory</label>
       <div class="err" id="agErr"></div>
       <button class="primary" type="submit">Add agent</button>
@@ -971,12 +979,13 @@
       const engine = a.runtime === "relife" ? "ReLife" : a.runtime === "llm" ? (a.model || "other model") : "external";
       const inherits = (a.inherits || []).map(sp => `<button type="button" class="chip" data-detach="${esc(sp)}" title="stop reading ${esc(sp)}">${esc(sp)} ×</button>`).join("");
       el.innerHTML = `
-        <div class="top"><span class="name">${esc(a.name)}</span><span class="cadence">${esc(engine)}${a.isolated ? " · isolated" : ""}</span></div>
+        <div class="top"><span class="name">${esc(a.name)}</span><span class="cadence">${esc(engine)} · ${esc(a.memory_label || "individual")}${a.isolated ? " · isolated" : ""}</span></div>
         ${a.description ? `<div class="task">${esc(a.description)}</div>` : ""}
         <div class="meta">${a.memories} memor${a.memories === 1 ? "y" : "ies"} in ${esc(a.own_space)}${a.parent ? ` · from ${esc(a.parent)}` : ""}</div>
         <div class="chips"><span class="meta">reads:</span>${inherits || `<span class="meta">nothing inherited</span>`}</div>
         <div class="inline"><input placeholder="read another agent's memory…" data-attach /><button type="button" data-act="attach">attach</button></div>
         <div class="acts">
+          <button type="button" data-act="memory" title="${a.memory === "collective" ? "Give it a memory of its own again" : "Make it write the shared collective"}">${a.memory === "collective" ? "own memory" : "make collective"}</button>
           <button type="button" data-act="promote" title="Copy its memories into yours (default)">promote</button>
           <button type="button" class="danger" data-act="delete" title="Unregister; its memory is archived (reversible)">delete</button>
         </div>`;
@@ -994,6 +1003,7 @@
     try {
       const url = `/agents/${encodeURIComponent(a.name)}`;
       const r = act === "delete" ? await api("DELETE", url)
+        : act === "memory" ? await api("PATCH", url, { memory: a.memory === "collective" ? "individual" : "collective" })
         : await api("POST", `${url}/${act}`, act === "promote" ? {} : { other });
       if (!r.ok) { hint.textContent = `${act}: ${await fail(r)}`; }
       else if (act === "promote") {
@@ -1019,7 +1029,9 @@
       name: v("agName"), description: v("agDesc"), runtime: document.getElementById("agRuntime").value,
       model: v("agModel"), inherit: v("agInherit").split(/[\s,]+/).filter(Boolean),
       isolated: document.getElementById("agIsolated").checked,
+      memory: document.getElementById("agMemory").value,
     };
+    if (body.memory === "collective" && v("agCollective")) body.collective = v("agCollective");
     if (v("agFork")) body.fork = v("agFork");
     try {
       const r = await api("POST", "/agents", body);

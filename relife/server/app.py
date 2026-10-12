@@ -55,6 +55,7 @@ Endpoints:
   GET    /agents                              → registered agents
   POST   /agents                              → register one (inherit / fork)
   GET    /agents/{name}                       → one agent
+  PATCH  /agents/{name}                       → move its memory home (individual ⇄ collective)
   DELETE /agents/{name}                       → unregister (archives its memory)
   POST   /agents/{name}/attach|detach         → read another agent's memory, or stop
   POST   /agents/{name}/promote               → copy its memories into yours (default)
@@ -584,6 +585,8 @@ def create_app(
                 inherit=inherit,
                 fork=body.get("fork") or None,
                 isolated=bool(body.get("isolated", False)),
+                memory=str(body.get("memory") or "individual"),
+                collective=str(body.get("collective") or ""),
             )
 
         try:
@@ -599,6 +602,21 @@ def create_app(
         try:
             a = _agent_store().require(name)
         except LookupError as e:
+            raise _bad(e) from e
+        return _agent_view(a, await off_loop(crews.client.spaces))
+
+    @app.patch("/agents/{name}", dependencies=mutate)
+    async def patch_agent(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Move an agent's memory home: ``{"memory": "individual"|"collective",
+        "collective": "<team>"}`` (its old home stays readable to it)."""
+        if set(body) - {"memory", "collective"}:
+            raise HTTPException(status_code=400, detail="only memory and collective can be changed here")
+        try:
+            a = await off_loop(
+                agents_mod.set_memory, _agent_store(), name,
+                str(body.get("memory") or "individual"), str(body.get("collective") or ""),
+            )
+        except (ValueError, LookupError) as e:
             raise _bad(e) from e
         return _agent_view(a, await off_loop(crews.client.spaces))
 

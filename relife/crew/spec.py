@@ -21,9 +21,11 @@ from typing import Any
 
 from .. import config
 from ..agents import MAX_INHERITS, validate_agent_name
+from ..memory.spaces import collective_space, is_collective
 from .machine import TOOLSETS
 
 RUNTIMES = ("relife", "llm")
+MEMORY = ("auto", "individual", "collective")
 PROCESSES = ("sequential", "hierarchical")
 MAX_TEXT = 4000  # per free-text field; the planner can ramble
 
@@ -39,6 +41,10 @@ class AgentSpec:
     inherit: list[str] = field(default_factory=list)  # agents whose memory it reads
     fork: str | None = None  # agent whose memory it starts from (a copy)
     tools: list[str] = field(default_factory=list)  # runtime llm: gated toolsets (machine.TOOLSETS)
+    # Where a NEW agent's memory lives: auto (collective for a tight model, else
+    # individual) · individual · collective (``collective`` names a team's pool).
+    memory: str = "auto"
+    collective: str = ""
 
 
 @dataclass
@@ -176,6 +182,23 @@ def normalize_spec(
                 raise ValueError(f"{where}: unknown agent {ref!r} to inherit from / fork (define it first)")
         if fork and name in existing_agents:
             raise ValueError(f"{where}: already exists, so it can't be forked into")
+        if is_collective(name):
+            raise ValueError(f"{where}: that name is a collective memory space, not an agent")
+        memory = d.get("memory") or "auto"
+        if memory not in MEMORY:
+            raise ValueError(f"{where}: memory must be one of {', '.join(MEMORY)}")
+        collective = d.get("collective") or ""
+        if not isinstance(collective, str):
+            raise ValueError(f"{where}: collective must be a name")
+        if collective:
+            try:
+                collective_space(collective)
+            except ValueError as e:
+                raise ValueError(f"{where}: collective: {e}") from None
+            if memory == "individual":
+                raise ValueError(f"{where}: collective is only for memory collective (or auto)")
+        if fork and memory == "collective":
+            raise ValueError(f"{where}: a collective agent can't fork (it would copy a private memory into the pool)")
         agents.append(
             AgentSpec(
                 name=name,
@@ -187,6 +210,8 @@ def normalize_spec(
                 inherit=inherit,
                 fork=fork,
                 tools=tools,
+                memory=memory,
+                collective=collective.strip(),
             )
         )
         seen.add(name)

@@ -29,7 +29,7 @@ from .. import config
 from .events import Event
 from .service import MemoryService
 from .skills import Skill
-from .spaces import DEFAULT_SCOPE, DEFAULT_SPACE, MemoryScope
+from .spaces import DEFAULT_SCOPE, DEFAULT_SPACE, MemoryScope, is_collective
 from .store import Memory
 from .workflows import Workflow
 
@@ -195,6 +195,15 @@ class ScopedMemoryClient:
 
     # --- writes -------------------------------------------------------------
     def save(self, text, kind="fact", tags="", importance=None) -> int:
+        if is_collective(self.scope.write):
+            # A collective is a pool every agent reads: no one writer — least of
+            # all a small free model — gets to make its memory dominate recall.
+            from .store import clean_importance
+
+            imp = clean_importance(importance)
+            if imp is None:
+                imp = config.DEFAULT_IMPORTANCE.get(kind, 0.5)
+            importance = min(imp, config.COLLECTIVE_MAX_IMPORTANCE)
         return self._inner.save(
             text,
             kind=kind,

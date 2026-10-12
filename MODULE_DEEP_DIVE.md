@@ -2212,6 +2212,39 @@ The details that matter:
 - **`delete_agent`** (`:341`) archives the agent's space (reversibly), unless another
   agent still writes to it or `--keep-memory` is given.
 
+### Individual or collective memory
+
+An agent's memory is `individual` (above: a space of its own) or `collective`. A
+collective agent writes a **shared pool** instead: the global `collective` space, or a
+named `collective-<name>` for one team (`AgentProfile.memory` / `.collective`;
+`own_space` resolves them, `spaces.collective_space`). Every non-isolated agent's scope
+reads the global collective after its own space and inherits and before `default`. A
+named collective is read only by its members and by agents that `attach` it.
+
+**Why.** Memory isn't free for every agent. A CrewAI member reaches it through tool calls,
+and on a free tier each tool call is a request it can't spare. Some agents (a one-off
+reviewer, a formatter) also have no use for a private history. Pooling their learnings
+keeps them useful to everyone, without the cost of each one consulting a memory of its
+own.
+
+**What keeps a pool from becoming the poisonable heap that spaces were built to avoid:**
+
+- **Importance is capped.** `ScopedMemoryClient.save` caps saves into any `collective*`
+  space at `COLLECTIVE_MAX_IMPORTANCE` (0.6), explicit or kind-default. No single writer,
+  least of all a small model, can make its memories dominate everyone's recall, and the
+  cap is enforced at the one scoped seam rather than trusted to a caller.
+- **Provenance is kept.** `source` names the writer, and recall labels it `via collective`.
+- **`default` stays out of reach.** Nothing writes it except the main agent and promote.
+- **The pool is never collateral.** Deleting a member never archives a collective (it is
+  everyone's), and a collective agent can't `fork` (that would copy a private snapshot
+  into the pool).
+- **Names are reserved.** `validate_new_agent_name` refuses `collective`/`collective-*` as
+  *new* agent names; an older record so named still loads, because dropping it would be
+  worse.
+
+`set_memory` moves an agent between homes. Future writes go to the new one, and the old
+one joins `inherits`, so nothing the agent learned stops being visible to it.
+
 ### `ScopedMemoryClient` — the one enforcement point (`client.py:175`)
 
 Everything above is policy; this class is where it's enforced, and it's enforced by
@@ -2569,6 +2602,33 @@ source, then pinned by `tests/test_governed.py`):
 RELIFE_LLM_TIGHT_MAX_ITER` (8, against CrewAI's 25) and `respect_context_window`, since
 every loop iteration is one request. The planner is shown each model's limits and told to
 give tight ones few, short tasks.
+
+### Memory for every member, whatever its model (`memory_policy.py`)
+
+`memory_policy.resolve(spec_agent, limits)` (pure) decides two things per member:
+
+- **mode**, for a *new* agent: `auto` (the default in a plan) becomes collective when the
+  model's *declared* limits are tight, individual otherwise; an explicit `individual` or
+  `collective` wins.
+- **access**: `lean` for a tight model (`RELIFE_LLM_LEAN_MEMORY=always|never` overrides
+  it), else `full`. ReLife members are always full, because their memory arrives through
+  hooks rather than requests.
+
+`ensure_profiles` creates new agents with the resolved mode. It **never moves a
+registered agent**: when auto would choose differently, the note says so and names the
+command (`relife agent set NAME --memory …`), for the same reason a plan's `inherit` is
+run-only. The plan display shows each member's `memory <mode> · <access>`.
+
+**Lean access** in `build_crew`: no memory tools (`llm_agent(with_memory_tools=False)`)
+and the recalled block at `LLM_LEAN_INJECT_BUDGET` (800 chars; `build_context(budget=)`)
+instead of 2400.
+
+**Every** `llm` member, lean or full, also gets the outcome of each finished task saved
+as an `episode` in its own memory (or the collective): `"[crew task] <description> →
+<output>"`, importance 0.4. ReLife writes it from the task callback with no model call.
+Before this, a CrewAI member learned only if its model chose to call `memory_save`, so
+"every agent has its own memory" was true of the *space* but not of what landed in it. An
+exact duplicate is reinforced, not re-added (`save`'s duplicate path).
 
 ### Contract surprises, and the defaults that stay off
 
@@ -3095,6 +3155,7 @@ multi-process test, not locally — which is why those tests exist.
 | `crew/turns.py` | `run_relife_turn` (one fresh scoped ReLife turn), `TurnResult`, `result_from_events`, `run_sync`. |
 | `crew/agent.py` | `ReLifeAgent(BaseAgentAdapter)`, `crew_tools_server` (outside the trusted prefix), `task_prompt` (context fenced). |
 | `crew/llm.py` | `ClaudeMaxLLM(BaseLLM)`: Claude via `ask_model_oneshot`, ReAct text, stop words by truncation. |
+| `crew/memory_policy.py` | Pure `resolve(spec_agent, limits)` → `MemoryPlan(mode, collective, access, why)`: auto → collective for a tight model; lean access for a tight model. |
 | `crew/governed.py` | `GovernedLLM(BaseLLM)`: every crew model call paced under its limits; fallback chain; `QuotaPaused`/`GovernorStopped` (`HookAborted` subclasses, never retried by CrewAI). |
 | `crew/native.py` | `default_llm`, `llm_agent` (CrewAI `Agent` with ReLife memory tools, no delegation), `journal_step`. |
 | `crew/memory_tools.py` | `RelifeMemoryTool(BaseTool)` over a `ToolSpec`; `memory_tools(client)`. |
@@ -3188,7 +3249,8 @@ CrewAI/LiteLLM), `CREW_CLAUDE_LLM = claude-max` (always available).
 data/llm_usage.db`, `LLM_DEFAULT_RPM = 10` (undeclared remote models; 0 = unpaced),
 `LLM_MAX_WAIT = 900s` (wait for a reset before falling back / pausing), `LLM_QUOTA_BACKOFF =
 3600s` (a daily-quota error with no retry-after), `LLM_TIGHT_RPM = 15` / `LLM_TIGHT_RPD = 500`
-(declared limits at or under these make a model *tight*), `LLM_TIGHT_MAX_ITER = 8`.
+(declared limits at or under these make a model *tight*), `LLM_TIGHT_MAX_ITER = 8`, `LLM_LEAN_MEMORY = auto` (`always`/`never`), `LLM_LEAN_INJECT_BUDGET = 800`
+chars, `COLLECTIVE_MAX_IMPORTANCE = 0.6`.
 
 Most are overridable via `RELIFE_*` environment variables (see `config.py`).
 

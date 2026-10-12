@@ -603,7 +603,8 @@ covers one plain `gh pr create` for *that* issue's repo and branch, nothing else
 
 `relife agent create reviewer` registers an agent. It gets its own **memory space**
 — its own corner of the same database — and that's the only place it can *write*.
-It can *read* its own memory plus yours (the `default` space), unless you create it
+It can *read* its own memory, the shared collective (below) and yours (the `default`
+space), unless you create it
 with `--isolated`. Run it with `relife do --agent reviewer "…"`. Your memory only
 changes when you, or your main agent, change it.
 
@@ -619,6 +620,20 @@ changes when you, or your main agent, change it.
 Inheriting is read-only on purpose: a new memory can only be saved in one place. If
 two agents should *share* one memory, give them the same `--space`. Recalled memory
 that came from another agent is labelled (`via veteran`), so it's clear whose it is.
+
+### The collective — a memory everyone shares
+
+Not every agent needs a memory of its own. An agent on a free model can barely afford
+to look things up, since every lookup uses up its limited requests, and a one-off
+reviewer has nothing worth keeping privately. Give such an agent the **collective**
+instead: `relife agent create formatter --memory collective`. It writes into one shared
+pool, and every agent (except isolated ones) reads that pool, so what it learns still
+helps the team. `--collective research` gives a team its own pool, which only its
+members read. `relife agent set NAME --memory individual|collective` moves an agent
+later, and it keeps reading what it learned before. No single agent can make its
+collective memories crowd out everyone else's (their importance is capped), each memory
+still says who wrote it, and the collective never touches *your* memory unless you
+promote it.
 
 ### Other AI apps can use ReLife's memory
 
@@ -662,6 +677,15 @@ and it can't run the housekeeping or "dream" passes.
    task produced, what it cost and anything that was denied. (If the terminal or server
    running a crew dies, its record says *interrupted* rather than "running" forever.) Each agent's lessons
    land in its own memory; `relife agent promote` brings the good ones into yours.
+**Every agent remembers, whatever model it runs on.** After each task, ReLife saves what
+the agent was asked and what it produced into that agent's memory itself, with no
+extra model call. An agent on another model therefore learns even if it never thinks to
+save anything. When a crew creates a *new* agent on a model with tight limits, that
+agent gets the collective memory and a *lean* connection to it: no memory tools (each
+one would cost a request), just a short summary of what's relevant handed to it up front.
+The plan shows each agent's memory before you approve it. An agent you already have
+keeps its memory where it is; the plan only suggests moving it.
+
 **Free and rate-limited models.** Every model has limits: requests per minute, per
 day. ReLife keeps a model *under* them instead of running into them. Tell it yours once:
 

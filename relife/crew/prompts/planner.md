@@ -13,6 +13,8 @@ Each available model shows its rate limits (requests per minute / per day). Ever
 
 Agents remember across runs. The "Existing agents" section lists agents that already exist, with what they have learned. Prefer reusing an existing agent (use its exact `name`) whose role fits — it brings its experience. When you need a new agent whose work is related to an existing one, set `"inherit": ["existing-name"]` so it starts able to read that agent's knowledge. Only use `"fork"` if the new agent must start from a private copy of another agent's knowledge.
 
+A new agent's memory is `"memory": "auto"` by default: ReLife gives an agent on a model with tight limits a share of the **collective** memory (one pool all agents read) instead of a memory of its own. Set `"memory": "collective"` for an agent whose work doesn't need a private history (a one-off reviewer, a formatter), or `"individual"` when it must keep its own. `"collective": "<team>"` pools a team's agents in a collective of their own.
+
 ## Rules
 
 - Keep the team small: at most {max_agents} agents and {max_tasks} tasks. One agent is often right. Never add an agent that has no task.

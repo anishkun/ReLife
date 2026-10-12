@@ -181,6 +181,7 @@ relife/
     agent.py                # ReLifeAgent(BaseAgentAdapter): a crew member = a fresh ReLife turn
     llm.py                  # ClaudeMaxLLM(BaseLLM): Claude via the CLI for CrewAI (no API key)
     governed.py             # GovernedLLM: every crew model call paced under its limits; fallback; QuotaPaused
+    memory_policy.py        # pure: a member's memory mode (auto → collective on a tight model) + lean/full access
     native.py / memory_tools.py  # CrewAI agents on other models + ReLife memory as CrewAI tools
     build.py / runner.py / record.py  # profiles+handoff → Crew → kickoff → data/crews/<id>/
   build/                    # `relife build`: orchestrated, resumable large builds
@@ -827,8 +828,14 @@ name: evil` can no longer close the frontmatter and forge
   re-runs the task). Tight models get `max_iter=8`; the planner and the plan display show each model's
   limits; `relife llm list|set|unset|reset`, `GET/PUT/DELETE /llms`, a Models section in the Crews panel,
   a doctor check. Spike confirmed by test: a native-function-calling model drives a real `kickoff()`
-  through the wrapper. 997 tests on the 3.12 venv, 959 on 3.14. **Next:** PR 2 (collective memory +
-  lean access + outcome episodes for every `llm` member), PR 3 (pause/resume when every model is spent).
+  through the wrapper. 997 tests on the 3.12 venv, 959 on 3.14. **PR 2 — individual vs collective memory —
+  built:** `AgentProfile.memory` (`individual`|`collective`) + `.collective` (a team pool
+  `collective-<name>`); every non-isolated agent reads the global `collective`; collective saves capped at
+  importance 0.6; `relife agent set NAME --memory …` (old home attached), `PATCH /agents/{name}`, console
+  toggle. `crew/memory_policy.resolve`: plan `memory: auto` → collective for a **new** agent on a tight model
+  (registered agents never moved; the note says how), **lean** access (no memory tools, 800-char recalled
+  block) for tight models, and **every** `llm` member's finished task saved as an episode with no model call.
+  1009 tests on the 3.12 venv, 968 on 3.14. **Next:** PR 3 (pause/resume when every model is spent).
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

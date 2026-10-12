@@ -8,7 +8,10 @@ or on Claude through the subscription (``claude-max`` → :class:`ClaudeMaxLLM`)
 What they get from ReLife:
 
 - the external memory tools, bound to the agent's scoped client
-  (``memory_tools.py``) — saves land in its own space;
+  (``memory_tools.py``) — saves land in its own space — unless its memory is
+  *lean* (a model with tight limits: each tool call is one more request, so it
+  gets no memory tools, a smaller recalled block, and ReLife saves each task's
+  outcome for it with no model call — ``build.py``);
 - the recalled-context block for each task, prepended deterministically before
   kickoff (``memory/context.build_context``), so it starts from what is known
   even if it never calls a tool;
@@ -74,6 +77,7 @@ def llm_agent(
     on_step: Callable[[Any], None] | None = None,
     tools: list[Any] | None = None,
     max_iter: int | None = None,
+    with_memory_tools: bool = True,
 ) -> Agent:
     """``tools`` are extra CrewAI tools beyond memory — the gated machine tools
     (``machine_tools.py``) when the plan gives the agent any. ``max_iter`` caps
@@ -100,7 +104,7 @@ def llm_agent(
             goal=spec.goal,
             backstory=spec.backstory or spec.role,
             llm=llm,
-            tools=[*memory_tools(memory_client), *(tools or [])],
+            tools=[*(memory_tools(memory_client) if with_memory_tools else []), *(tools or [])],
             allow_delegation=False,
             verbose=False,
             step_callback=step,
