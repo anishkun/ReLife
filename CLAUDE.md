@@ -46,6 +46,7 @@ relife agent list|create|show|set|attach|detach|promote|token|connect|delete   #
                                   #   (`create/set --memory collective [--collective TEAM]`: write the shared pool)
 relife mcp --agent NAME           # ReLife memory as a stdio MCP server, scoped to that agent (any MCP client)
 relife crew "<task>" [--spec F] [--plan-only] [--yes]   # CrewAI plans a team; ReLife staffs + runs it
+relife crew --resume [ID]         # run the rest of a crew that paused (every model out of quota) or was interrupted
 relife crews [ID]                 # recent crew runs / one run's per-task outcomes (data/crews/<id>/)
                                   #   (also from the web console: /agents, /crews routes + panels under `relife serve`)
 relife llm list|set|unset|reset   # crew model limits: `set MODEL --rpm 10 --rpd 250 --fallback claude-max`;
@@ -69,6 +70,7 @@ relife serve [--host --port]      # always-on agent server + web UI (needs [serv
 #   env, read by CrewAI/LiteLLM; ReLife never stores them); `claude-max` (Claude via the CLI) is always available
 # set RELIFE_MEMORY_URL=http://127.0.0.1:8787 to route ALL memory through the daemon (opt-in)
 # RELIFE_AGENT_MAX_CREWS (default 1) caps crews running at once under `relife serve`
+# RELIFE_CREW_AUTO_RESUME (default on) — the server's scheduler resumes a quota-paused crew once its reset passes
 # model limits: data/llm_limits.json (declared) + data/llm_usage.db (calls + learned back-off, shared across
 #   processes); RELIFE_LLM_DEFAULT_RPM (10; 0 = unpaced) paces undeclared remote models; RELIFE_LLM_MAX_WAIT
 #   (900s) waits for a quota reset before falling back / pausing; RELIFE_LLM_TIGHT_RPM/_RPD (15/500) mark a
@@ -182,6 +184,14 @@ agent on a tight model collective (a registered agent is never moved — the not
 tight model's member reaches memory **lean** (no memory tools — each call is a request — and the recalled block at
 `LLM_LEAN_INJECT_BUDGET`). **Every** `llm` member's finished task is saved as an `episode` in its memory by
 `build_crew`'s task callback — no model call — so a CrewAI member learns even if it never calls `memory_save`.
+**Pause/resume**: `QuotaPaused` (raised mid-task, or at a sequential task boundary by `GovernedLLM.preflight()` on
+the next member) makes `execute_crew` record `status: paused` + `resume_after` + `paused_reason`, finished tasks
+kept. `runner.resume_crew` → `prepare_resume` (paused/interrupted only; `resume_blocked` via
+`llm_usage.chain_blocked` refuses while a remaining member's chain is still spent and moves `resume_after`) →
+`remaining_spec` (unfinished tasks in order; a finished context task's output is fenced into the description) →
+`execute_crew` on the same record. Server: `POST /crews/{id}/resume`, and each scheduler tick calls
+`CrewService.resume_due` (`RELIFE_CREW_AUTO_RESUME`); `build_host(resume=True)` checks for a *live* host, not any
+registered one.
 
 A plan reusing a **registered** agent never changes it: its `inherit` widens reads for that run only
 (`build.run_scope`) — a plan is model output, and attaching is the user's act.

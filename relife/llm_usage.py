@@ -37,6 +37,7 @@ from .llm_limits import (
     ModelLimits,
     Usage,
     adapt,
+    decide,
     effective_factor,
     limits_from_dict,
     match_limits,
@@ -171,6 +172,26 @@ def reset(model: str) -> None:
             conn.execute("DELETE FROM learned WHERE model = ?", (model,))
     except Exception:  # noqa: BLE001
         log.warning("could not reset learned limits", exc_info=True)
+
+
+def chain_blocked(
+    model: str, store: LimitsStore | None = None, *, now: float | None = None
+) -> tuple[float, str] | None:
+    """``(reset_at, reason)`` when ``model`` *and* every model in its fallback
+    chain are out of quota right now (the soonest reset), else ``None``. What a
+    resume checks before it starts anything."""
+    t = time.time() if now is None else now
+    store = store or LimitsStore()
+    first = store.match(model)
+    soonest: tuple[float, str] | None = None
+    for m in [model, *first.fallback]:
+        lim = store.match(m)
+        d = decide(lim, usage(m, now=t, day=bool(lim.rpd or lim.tpd)), learned(m), t)
+        if d.action != "exhausted":
+            return None
+        if soonest is None or d.reset_at < soonest[0]:
+            soonest = (d.reset_at, d.reason)
+    return soonest
 
 
 def model_status(limits: ModelLimits, *, now: float | None = None) -> dict[str, Any]:

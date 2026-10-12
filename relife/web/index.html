@@ -1063,7 +1063,7 @@
       if (e.message !== "auth") crewList.innerHTML = `<p class="note">could not load crews</p>`;
     }
   }
-  const crewCls = (st) => st === "done" ? "done" : st === "running" || st === "planned" ? "amber" : "bad";
+  const crewCls = (st) => st === "done" ? "done" : ["running", "planned", "paused"].includes(st) ? "amber" : "bad";
   function renderCrews(items, crewai) {
     crewList.innerHTML = items.length ? "" : `<p class="note">No crews yet.</p>`;
     for (const c of items) {
@@ -1078,14 +1078,16 @@
       }
       if (live) acts.push(`<button type="button" data-act="watch">watch</button>`);
       if (running && live) acts.push(`<button type="button" class="danger" data-act="stop">stop</button>`);
+      if (["paused", "interrupted"].includes(c.status) && !live) acts.push(`<button type="button" data-act="resume" ${crewai ? "" : "disabled"} title="Run the tasks it didn't finish">resume</button>`);
       if (["done", "error", "cancelled", "interrupted"].includes(c.status)) acts.push(`<button type="button" data-act="again" ${crewai ? "" : "disabled"}>run again</button>`);
       acts.push(`<button type="button" data-act="details" aria-pressed="false">details</button>`);
       const tasks = (c.tasks || []).map(t =>
-        `<div class="run"><div class="line"><span class="st ${t.error ? "bad" : "done"}">${esc(t.name)}</span> · ${esc(t.agent)} · ${t.tool_calls} tool${t.tool_calls === 1 ? "" : "s"}${esc(money(t.cost_usd))}${t.denied.length ? ` · <span class="st bad">${t.denied.length} denied</span>` : ""}</div><div class="detail">${esc(t.output || t.error || "")}</div></div>`).join("");
+        `<div class="run"><div class="line"><span class="st ${t.error ? "bad" : "done"}">${esc(t.name)}</span> · ${esc(t.agent)} · ${t.tool_calls} tool${t.tool_calls === 1 ? "" : "s"}${esc(money(t.cost_usd))}${t.denied.length ? ` · <span class="st bad">${t.denied.length} denied</span>` : ""}${(t.model_switches || []).length ? ` · <span class="st amber">${esc(t.model_switches.join("; "))}</span>` : ""}</div><div class="detail">${esc(t.output || t.error || "")}</div></div>`).join("");
       el.innerHTML = `
         <div class="top"><span class="name">${esc(c.task.slice(0, 90))}</span><span class="cadence"><span class="st ${crewCls(c.status)}">${esc(c.status)}</span></span></div>
         <div class="meta">${esc(c.id)} · ${esc(rel(c.created_at))}${esc(money(c.cost_usd))}</div>
         ${c.error ? `<div class="meta"><span class="bad">${esc(c.error)}</span></div>` : ""}
+        ${c.status === "paused" ? `<div class="meta">${esc(c.paused_reason || "out of quota")} — resumes on its own after ${esc(clock(c.resume_after))}</div>` : ""}
         ${c.final_output ? `<div class="outcome">${esc(c.final_output)}</div>` : ""}
         <div class="acts">${acts.join("")}</div>
         <div class="runs" hidden>
@@ -1120,6 +1122,10 @@
         }
         const r = await api("POST", `/crews/${id}/run`);
         if (!r.ok) { hint.textContent = `crew: ${await fail(r)}`; }
+        else await watchSession((await r.json()).session_id);
+      } else if (act === "resume") {
+        const r = await api("POST", `/crews/${c.id}/resume`);
+        if (!r.ok) { hint.textContent = `resume: ${await fail(r)}`; }
         else await watchSession((await r.json()).session_id);
       } else if (act === "stop") {
         const r = await api("POST", `/crews/${c.id}/stop`);

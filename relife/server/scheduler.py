@@ -182,12 +182,19 @@ class Scheduler:
         self._recorders.clear()
 
     async def tick(self, now: float | None = None) -> list[str]:
-        """Fire every due schedule once. Returns the ids fired."""
+        """Fire every due schedule once, then resume any crew that paused for
+        quota whose reset has come (``RELIFE_CREW_AUTO_RESUME=0`` turns that
+        off). Returns the schedule ids fired."""
         t = time.time() if now is None else now
         fired = []
         for schedule in self.store.due(t):
             await self.fire(schedule, now=t)
             fired.append(schedule.id)
+        if self.crews is not None and config.CREW_AUTO_RESUME:
+            try:
+                await self.crews.resume_due(t)
+            except Exception:  # noqa: BLE001 — upkeep never breaks the tick
+                pass
         return fired
 
     async def fire(self, schedule: Schedule, *, now: float | None = None) -> str:

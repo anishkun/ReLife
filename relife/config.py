@@ -227,6 +227,9 @@ AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
 # Crews running at once inside `relife serve` (each member turn is a CLI
 # subprocess and spends Max budget; a crew is also one session slot).
 AGENT_MAX_CREWS = int(os.environ.get("RELIFE_AGENT_MAX_CREWS", "1"))
+# A crew that paused because every model it could use was out of quota is resumed by
+# the server's scheduler once the quota resets (0 = only by hand: relife crew --resume).
+CREW_AUTO_RESUME = os.environ.get("RELIFE_CREW_AUTO_RESUME", "1").strip().lower() not in ("0", "false", "no", "off")
 # Daily Max-usage cap across everything ReLife starts (CLI, server, crews, schedules), in the
 # CLI's usage-equivalent dollars. 0 = off: spend is still tracked (relife doctor, GET /budget).
 DAILY_BUDGET_USD = float(os.environ.get("RELIFE_DAILY_BUDGET_USD", "0") or 0)

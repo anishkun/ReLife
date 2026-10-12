@@ -2603,6 +2603,47 @@ RELIFE_LLM_TIGHT_MAX_ITER` (8, against CrewAI's 25) and `respect_context_window`
 every loop iteration is one request. The planner is shown each model's limits and told to
 give tight ones few, short tasks.
 
+### Out of quota everywhere: pause, keep what finished, resume (`runner.py`, `record.py`)
+
+When a member's preferred model *and* its whole fallback chain are spent beyond the wait
+budget, the crew **pauses** instead of failing:
+
+- **Between tasks when it can.** In a sequential crew, `build_crew`'s `task_callback`
+  knows who is next and calls that member's `GovernedLLM.preflight()` (the same `_admit`,
+  without sleeping), so `QuotaPaused` is raised at the task boundary rather than part-way
+  into the next task.
+- **Mid-task otherwise.** A call that can't be admitted raises `QuotaPaused` from inside
+  the task. That task is lost and reruns on resume.
+- **Recorded as a pause, not an error.** `execute_crew` finds the `QuotaPaused` (walking the
+  cause chain, in case CrewAI wraps it) and records `status: paused`, `resume_after` (the
+  soonest reset) and `paused_reason`. It keeps every finished task through the same "keep
+  whatever finished" path an error takes.
+
+**Resume** (`resume_crew` · `prepare_resume` · `remaining_spec`):
+
+1. Only a `paused` or `interrupted` record resumes.
+2. `remaining_spec` keeps the tasks without a successful outcome, in order. A remaining
+   task that read a *finished* task's output gets that output in its description, fenced
+   as data, because CrewAI context needs a live `Task`. Only the agents that still have
+   work stay on the crew.
+3. `resume_blocked` checks every remaining `llm` member with `llm_usage.chain_blocked`. If
+   one is still spent, the resume is refused and `resume_after` moves to the new reset, so
+   an automatic retry can't spin.
+4. The same record and workspace continue, `resumed` is counted, and the finished tasks
+   are never redone.
+
+**Ways to resume:**
+
+- `relife crew --resume [ID]` (no ID: the most recent paused or interrupted crew).
+- `POST /crews/{id}/resume`, the console's **resume** button.
+- **Automatically**: each scheduler tick calls `CrewService.resume_due(now)`, which resumes
+  paused crews whose `resume_after` has passed. It is still subject to the daily budget and
+  `AGENT_MAX_CREWS`; a resume refused for those reasons is retried next tick.
+  `RELIFE_CREW_AUTO_RESUME=0` turns it off.
+
+`build_host(resume=True)` checks for a **live** host rather than any host ever registered,
+since a resumed crew had one before.
+
 ### Memory for every member, whatever its model (`memory_policy.py`)
 
 `memory_policy.resolve(spec_agent, limits)` (pure) decides two things per member:
@@ -3241,7 +3282,8 @@ per schedule, `AGENT_SCHEDULE_RUN_TIMEOUT = 7200s` (recorder gives up; agent not
 killed), `AGENT_GRANT_MAX_USES = 3` (pre-approved actions per run before falling back
 to asking).
 
-**Crews:** `CREW_MAX_AGENTS = 5`, `CREW_MAX_TASKS = 8`, `CREW_LLMS` (`RELIFE_CREW_LLMS`,
+**Crews:** `CREW_AUTO_RESUME = on` (a crew paused for quota resumes after the reset; `RELIFE_CREW_AUTO_RESUME=0`
+leaves it to `relife crew --resume`), `CREW_MAX_AGENTS = 5`, `CREW_MAX_TASKS = 8`, `CREW_LLMS` (`RELIFE_CREW_LLMS`,
 comma-separated non-Claude models the planner may staff; keys stay in the env for
 CrewAI/LiteLLM), `CREW_CLAUDE_LLM = claude-max` (always available).
 

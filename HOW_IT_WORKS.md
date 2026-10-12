@@ -604,8 +604,7 @@ covers one plain `gh pr create` for *that* issue's repo and branch, nothing else
 `relife agent create reviewer` registers an agent. It gets its own **memory space**
 — its own corner of the same database — and that's the only place it can *write*.
 It can *read* its own memory, the shared collective (below) and yours (the `default`
-space), unless you create it
-with `--isolated`. Run it with `relife do --agent reviewer "…"`. Your memory only
+space), unless you create it with `--isolated`. Run it with `relife do --agent reviewer "…"`. Your memory only
 changes when you, or your main agent, change it.
 
 ### Handing memory from an old agent to a new one
@@ -700,7 +699,15 @@ Claude on your subscription) and goes back to the free one once its quota resets
 plan you approve shows each model's limits, and the planner gives a model with tight
 limits only small jobs. A model you haven't described is paced cautiously (10 requests a
 minute), except local Ollama models, which have no limit. `relife llm list` shows what
-each model has used today and whether it is cooling down or out of quota. `relife
+each model has used today and whether it is cooling down or out of quota.
+
+If *every* model an agent could use runs out (no fallback left, or the fallback is spent
+too), the crew **pauses** instead of failing. It keeps the tasks it finished and notes
+when the quota resets. Then `relife crew --resume` (or **resume** in the console) runs
+only the tasks that are left, handing them the earlier tasks' results. Under
+`relife serve`, the server resumes a paused crew by itself once the reset time passes;
+if the quota still isn't back, it waits for the next reset instead of trying again and
+again. `relife
 doctor` warns about crew models with no declared limits, and the console's Crews panel
 has a **Models** section where you can view and set them.
 

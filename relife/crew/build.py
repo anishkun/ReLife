@@ -274,12 +274,22 @@ def build_crew(
             ClaudeMaxLLM(), config.CREW_CLAUDE_LLM, limits_for=limits.match, should_stop=should_stop,
         )
 
+    finished = {"tasks": 0}
+
     def stop_check(_output: Any) -> None:
+        finished["tasks"] += 1
         if should_stop is not None and should_stop():
             raise RuntimeError("crew stopped by the user")
         # The daily cap (off unless RELIFE_DAILY_BUDGET_USD is set): the task
         # that just finished is kept, no further one starts.
         budget.check("the crew's next task")
+        # A sequential crew knows who is next: if that member's whole model
+        # chain is out of quota, pause here (QuotaPaused) instead of starting a
+        # task that would stall part-way.
+        if not hierarchical and finished["tasks"] < len(spec.tasks):
+            nxt = spec.tasks[finished["tasks"]].agent
+            if nxt in llms:
+                llms[nxt].preflight()
 
     # A closure again (it carries this run's stop flag): same unserializable-
     # callback warning as the step callback, same reason it is noise here.

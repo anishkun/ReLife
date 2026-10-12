@@ -228,6 +228,12 @@ class GovernedLLM(BaseLLM):
                 self._on_note(f"switching {self._current} → {model}" + (f" ({reason})" if reason else ""))
             self._current = model
 
+    def preflight(self) -> None:
+        """Before the next task starts: raise :class:`QuotaPaused` if no model
+        in the chain could take a call within the wait budget — so the crew
+        pauses *between* tasks rather than part-way into one."""
+        self._admit(0, 0.0)
+
     def _check_stop(self) -> None:
         if self._should_stop is not None and self._should_stop():
             raise GovernorStopped()

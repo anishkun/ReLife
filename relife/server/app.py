@@ -63,6 +63,7 @@ Endpoints:
   POST   /crews                               → plan a task (one model call) or record a spec
   GET    /crews/{id}                          → one crew run, with its plan
   POST   /crews/{id}/run                      → run a planned crew → {session_id}
+  POST   /crews/{id}/resume                   → run the rest of a paused/interrupted crew
   POST   /crews/{id}/stop                     → stop a running crew
   DELETE /crews/{id}                          → discard a planned crew
   GET    /budget                              → today's Max spend + the daily cap
@@ -776,6 +777,21 @@ def create_app(
         _budget_or_429("a crew")
         try:
             host = await crews.start(crew_id)
+        except CrewUnavailable as e:
+            raise HTTPException(status_code=501, detail=str(e)) from e
+        except (CrewLimitReached, SessionLimitReached) as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"session_id": host.id, "crew_id": crew_id}
+
+    @app.post("/crews/{crew_id}/resume", dependencies=mutate)
+    async def resume_crew_route(crew_id: str) -> dict[str, Any]:
+        """Run the rest of a crew that paused (out of quota) or was interrupted."""
+        _crew_or_404(crew_id)
+        _budget_or_429("a crew")
+        try:
+            host = await crews.resume(crew_id)
         except CrewUnavailable as e:
             raise HTTPException(status_code=501, detail=str(e)) from e
         except (CrewLimitReached, SessionLimitReached) as e:

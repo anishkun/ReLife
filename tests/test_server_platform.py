@@ -615,3 +615,48 @@ def test_agent_memory_mode_over_http(env):
         assert c.post("/agents", json={"name": "collective-x"}).status_code == 400
         assert c.patch("/agents/scout", json={"memory": "collective"},
                        headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_a_paused_crew_is_resumed_by_hand_or_by_the_scheduler(env):
+    import time as _t
+
+    from relife import llm_usage
+    from relife.crew.turns import TurnResult
+
+    spec = {
+        "goal": "build then review",
+        "agents": [
+            {"name": "builder", "role": "Engineer", "goal": "build", "runtime": "relife"},
+            {"name": "freebie", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "claude-max"},
+        ],
+        "tasks": [
+            {"name": "build", "agent": "builder", "description": "Add CSV export.", "expected_output": "code"},
+            {"name": "review", "agent": "freebie", "description": "Review it.", "expected_output": "verdict",
+             "context": ["build"]},
+        ],
+    }
+    turns: list[str] = []
+
+    async def turn(prompt, *, workspace, memory_client, can_use_tool, extra_mcp, on_event):
+        turns.append(prompt)
+        return TurnResult(output="built it", tool_calls=1, cost_usd=0.1)
+
+    app, tc = _crew_app(env, turn=turn)
+    # claude-max with no quota left and no fallback (a stand-in for a spent free tier).
+    llm_usage.LimitsStore().set("claude-max", {"tier": "subscription", "max_wait_s": 0})
+    llm_usage.mark_exhausted("claude-max", _t.time() + 3600)
+    with tc:
+        crew_id = tc.post("/crews", json={"spec": spec}).json()["id"]
+        assert tc.post(f"/crews/{crew_id}/run").status_code == 200
+        rec = wait_for(lambda: (c := tc.get(f"/crews/{crew_id}").json())["status"] == "paused" and c)
+        assert [t["name"] for t in rec["tasks"]] == ["build"] and rec["resume_after"]
+        r = tc.post(f"/crews/{crew_id}/resume")
+        assert r.status_code == 409 and "still out of quota" in r.json()["detail"]
+        # Not due yet: the scheduler leaves it alone.
+        assert tc.portal.call(app.state.crews.resume_due, _t.time()) == []
+        llm_usage.reset("claude-max")
+        assert tc.portal.call(app.state.crews.resume_due, _t.time() + 7200) == [crew_id]
+        rec = wait_for(lambda: (c := tc.get(f"/crews/{crew_id}").json())["status"] == "done" and c)
+        assert [t["name"] for t in rec["tasks"]] == ["build", "review"] and rec["resumed"] == 1
+        assert len(turns) == 1  # the finished build was not redone
+        assert tc.post(f"/crews/{crew_id}/resume").status_code == 409  # done: nothing to resume

@@ -835,7 +835,14 @@ name: evil` can no longer close the frontmatter and forge
   toggle. `crew/memory_policy.resolve`: plan `memory: auto` → collective for a **new** agent on a tight model
   (registered agents never moved; the note says how), **lean** access (no memory tools, 800-char recalled
   block) for tight models, and **every** `llm` member's finished task saved as an episode with no model call.
-  1009 tests on the 3.12 venv, 968 on 3.14. **Next:** PR 3 (pause/resume when every model is spent).
+  1009 tests on the 3.12 venv, 968 on 3.14. **PR 3 — pause/resume — built:** with every model in a member's
+  chain spent, the crew records `paused` (+ `resume_after`, `paused_reason`; finished tasks kept), at the next
+  task boundary when sequential (`GovernedLLM.preflight`). `relife crew --resume [ID]`, `POST
+  /crews/{id}/resume`, a console button, and the scheduler resumes due crews by itself
+  (`RELIFE_CREW_AUTO_RESUME`); a resume while still spent is refused and `resume_after` moves on; only the
+  unfinished tasks run, with finished context outputs fenced into their descriptions. 1014 tests on the
+  3.12 venv, 969 on 3.14. **Not yet:** a live smoke against a real free-tier provider (needs a key the
+  user sets); Max-subscription session limits on ReLife (Claude) members still fail a task rather than pause.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).
