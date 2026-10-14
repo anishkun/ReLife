@@ -996,3 +996,24 @@ def test_pr_grant_over_http(http):
     # Dropping both together is fine.
     r = tc.patch(f"/schedules/{rec['id']}", json={"work": None, "task": "plain", "grants": []})
     assert r.status_code == 200 and r.json()["work"] is None
+
+
+def test_each_tick_resumes_paused_crews_unless_turned_off(sched, monkeypatch):
+    from relife import config
+
+    scheduler, *_ = sched
+
+    class Crews:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        async def resume_due(self, now):
+            self.calls.append(now)
+            raise RuntimeError("a broken resume never breaks the tick")
+
+    scheduler.crews = Crews()
+    assert anyio.run(scheduler.tick, 1000.0) == []
+    assert scheduler.crews.calls == [1000.0]
+    monkeypatch.setattr(config, "CREW_AUTO_RESUME", False)
+    anyio.run(scheduler.tick, 2000.0)
+    assert scheduler.crews.calls == [1000.0]

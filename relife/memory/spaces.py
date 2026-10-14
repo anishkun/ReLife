@@ -24,6 +24,12 @@ from pathlib import Path
 from .. import config
 
 DEFAULT_SPACE = "default"
+# The collective: one space every non-isolated agent reads, written by the agents
+# whose memory mode is "collective" (a free-tier model, or one that doesn't need a
+# memory of its own). Named collectives (``collective-<name>``) are read only by
+# their members and whoever attaches them. See ``relife/agents.py``.
+COLLECTIVE_SPACE = "collective"
+COLLECTIVE_PREFIX = COLLECTIVE_SPACE + "-"
 
 # Reassignable (tests redirect it; the memory daemon binds it next to its DB).
 # The default space keeps the historical skills/workflows dirs, so no file moves.
@@ -45,6 +51,22 @@ def validate_space(name: object) -> str:
             "(at most 48 characters)"
         )
     return name
+
+
+def is_collective(space: str) -> bool:
+    """A shared pool (the global collective or a named one)."""
+    return space == COLLECTIVE_SPACE or space.startswith(COLLECTIVE_PREFIX)
+
+
+def collective_space(name: str = "") -> str:
+    """The space for collective ``name`` ("" = the global one). Accepts the bare
+    name or the full ``collective-…`` space name."""
+    name = (name or "").strip()
+    if name in ("", COLLECTIVE_SPACE):
+        return COLLECTIVE_SPACE
+    if name.startswith(COLLECTIVE_PREFIX):
+        name = name[len(COLLECTIVE_PREFIX):]
+    return validate_space(COLLECTIVE_PREFIX + validate_space(name))
 
 
 def space_dir(kind: str, space: str, default_dir: Path) -> Path:

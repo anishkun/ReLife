@@ -227,6 +227,9 @@ AGENT_MAX_SCHEDULES = int(os.environ.get("RELIFE_AGENT_MAX_SCHEDULES", "32"))
 # Crews running at once inside `relife serve` (each member turn is a CLI
 # subprocess and spends Max budget; a crew is also one session slot).
 AGENT_MAX_CREWS = int(os.environ.get("RELIFE_AGENT_MAX_CREWS", "1"))
+# A crew that paused because every model it could use was out of quota is resumed by
+# the server's scheduler once the quota resets (0 = only by hand: relife crew --resume).
+CREW_AUTO_RESUME = os.environ.get("RELIFE_CREW_AUTO_RESUME", "1").strip().lower() not in ("0", "false", "no", "off")
 # Daily Max-usage cap across everything ReLife starts (CLI, server, crews, schedules), in the
 # CLI's usage-equivalent dollars. 0 = off: spend is still tracked (relife doctor, GET /budget).
 DAILY_BUDGET_USD = float(os.environ.get("RELIFE_DAILY_BUDGET_USD", "0") or 0)
@@ -263,6 +266,33 @@ CREW_LLMS = tuple(
 )
 # The model string that means "Claude through the logged-in CLI" (no API key).
 CREW_CLAUDE_LLM = "claude-max"
+
+# Model limits (llm_limits.py policy, llm_usage.py ledger, crew/governed.py wrapper).
+# Every crew model is paced under the limits declared in LLM_LIMITS_PATH (`relife llm
+# set MODEL --rpm 10 --rpd 250`), tightened automatically after a 429. A model with no
+# declaration is paced at LLM_DEFAULT_RPM (0 = unpaced); claude-max and ollama/* are not.
+LLM_LIMITS_PATH = DATA_DIR / "llm_limits.json"
+LLM_USAGE_PATH = DATA_DIR / "llm_usage.db"
+LLM_DEFAULT_RPM = int(os.environ.get("RELIFE_LLM_DEFAULT_RPM", "10") or 0)
+# A model's quota ran out: wait up to this long for the reset before falling back /
+# pausing the crew (per-model `max_wait_s` overrides it).
+LLM_MAX_WAIT = float(os.environ.get("RELIFE_LLM_MAX_WAIT", "900"))
+# How long a daily-quota error with no retry-after marks a model exhausted.
+LLM_QUOTA_BACKOFF = float(os.environ.get("RELIFE_LLM_QUOTA_BACKOFF", "3600"))
+# Declared limits at or under these make a model "tight": its agents get frugal
+# memory (collective + lean) and fewer agent-loop iterations.
+LLM_TIGHT_RPM = int(os.environ.get("RELIFE_LLM_TIGHT_RPM", "15"))
+LLM_TIGHT_RPD = int(os.environ.get("RELIFE_LLM_TIGHT_RPD", "500"))
+LLM_TIGHT_MAX_ITER = int(os.environ.get("RELIFE_LLM_TIGHT_MAX_ITER", "8"))
+# Memory access for a crew member on another model: "lean" = no memory tools (every
+# tool call is a request), recalled context injected up front at LLM_LEAN_INJECT_BUDGET
+# chars, and the task's outcome saved by ReLife with no model call. auto = lean for a
+# tight model, full otherwise; always / never force it.
+LLM_LEAN_MEMORY = os.environ.get("RELIFE_LLM_LEAN_MEMORY", "auto").strip().lower()
+LLM_LEAN_INJECT_BUDGET = int(os.environ.get("RELIFE_LLM_LEAN_INJECT_BUDGET", "800"))
+# Saves into a collective space (shared by every agent) are capped at this importance,
+# so no single writer can make its memories dominate everyone's recall.
+COLLECTIVE_MAX_IMPORTANCE = float(os.environ.get("RELIFE_COLLECTIVE_MAX_IMPORTANCE", "0.6"))
 
 # Default place the agent builds projects, unless --workspace overrides it.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"

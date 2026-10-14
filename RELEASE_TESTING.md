@@ -7,8 +7,9 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
 
 - [ ] `python -m pytest tests -q` — Windows + Linux, Python 3.11/3.12/3.13, base install **and** all extras
 - [ ] `python -m ruff check relife tests scripts` — zero findings
-- [ ] the `full` job includes `[crewai]` (3.11–3.13), so `tests/test_crew.py` runs a real `Crew.kickoff()`,
-      and `[vector]` — the only place the sqlite-vec index is exercised (`tests/test_vector_index.py`)
+- [ ] the `full` job includes `[crewai]` (3.11–3.13), so `tests/test_crew.py` runs a real `Crew.kickoff()`
+      (and `tests/test_governed.py` one through `GovernedLLM`), and `[vector]` — the only place the
+      sqlite-vec index is exercised (`tests/test_vector_index.py`)
 - [ ] the windows-latest jobs pass: they are where file-sharing races show (`_atomic` retries, the
       multi-process registry test in `tests/test_hardening_platform.py`), rarely locally
 - [ ] package job: wheel contains `prompts/*.md`, `build/prompts/orchestrator.md`, `crew/prompts/planner.md`, `web/index.html`;
@@ -43,6 +44,9 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
 - [ ] `RELIFE_MEMORY_URL=http://127.0.0.1:8799 relife memory stats` → one-line "daemon not reachable" error, exit 1
 - [ ] garbage `data/relife.db` → one-line "memory database is unreadable", exit 1
 - [ ] garbage `data/schedules.json` → `relife doctor` warns; first save keeps `schedules.json.corrupt-<time>`
+- [ ] garbage `data/llm_limits.json` → `relife doctor`'s `model limits` check warns; the next `relife llm set`
+      keeps `llm_limits.json.corrupt-<time>`; an unreadable record is dropped (paced at the default), never
+      widened to unlimited
 - [ ] create 3 sessions and send each a turn → 3 subprocess trees (a session with no turn starts none);
       `DELETE` one, let the idle reaper put the rest to sleep, hard-kill the server with sessions open →
       `claude`/`node` process count returns to baseline every time
@@ -98,6 +102,14 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
       prompt, a read of a file outside the workspace prompts (decline it → the member reports it), and
       `relife memory search --space <member> Write` shows its calls journaled (~$0.10)
 
+- [ ] **rate-limited crew model** (3.12 venv, scratch `RELIFE_HOME`; a free-tier key, or a local
+      OpenAI-compatible endpoint that throttles and runs out of quota): with `relife llm set MODEL --rpm N
+      --rpd N --fallback claude-max`, a crew's calls to it are paced (one "waiting" note per wait), a 429
+      backs off (`relife llm list` shows it cooling), the fallback takes over when the quota runs out and
+      the run record lists the switch; with the whole chain spent the crew records `paused`, and after the
+      reset `relife crew --resume` runs only the unfinished tasks. The provider's request count matches
+      `llm_usage.db` (its SDK must not retry on its own)
+
 - [ ] **session resume** (scratch `RELIFE_HOME`, idle timeout 20 s, ~$1): turn 1 gives a code word ("don't
       save it, no tools"); after the session sleeps, turn 2 asks for it → recalled; force-kill and restart
       the server, reattach (`GET /sessions/<id>` replays both turns), turn 3 asks for the first message
@@ -114,6 +126,8 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
 - No TLS / multi-user model in `relife serve`; beyond loopback requires a token **and** a reverse proxy.
 - A crew member is one fresh `claude` process per task (fresh context by design), so each task pays a
   cold start; console sessions hold a process only while they work.
+- Model limits pace the CrewAI models only: a ReLife (Claude) member that hits a Max session limit
+  fails its task rather than pausing the crew.
 - Costs are the CLI's usage-equivalent dollars, not a bill; the daily cap is checked when work starts,
   so the call in flight can take a day's total past it.
 - The agent registry's file lock is advisory: a hand edit of `data/agents.json` while ReLife writes it

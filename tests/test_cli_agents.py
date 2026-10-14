@@ -46,7 +46,7 @@ def test_create_inherit_show_list(cli):
     assert "writes: researcher" in r.output
     r = run("agent", "create", "writer", "--inherit", "researcher")
     assert r.exit_code == 0, r.output
-    assert "reads:  writer, researcher, default" in r.output
+    assert "reads:  writer, researcher, collective, default" in r.output
     r = run("agent", "list")
     assert "researcher" in r.output and "writer" in r.output
     r = run("agent", "show", "writer")

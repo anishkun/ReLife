@@ -8,7 +8,10 @@ or on Claude through the subscription (``claude-max`` → :class:`ClaudeMaxLLM`)
 What they get from ReLife:
 
 - the external memory tools, bound to the agent's scoped client
-  (``memory_tools.py``) — saves land in its own space;
+  (``memory_tools.py``) — saves land in its own space — unless its memory is
+  *lean* (a model with tight limits: each tool call is one more request, so it
+  gets no memory tools, a smaller recalled block, and ReLife saves each task's
+  outcome for it with no model call — ``build.py``);
 - the recalled-context block for each task, prepended deterministically before
   kickoff (``memory/context.build_context``), so it starts from what is known
   even if it never calls a tool;
@@ -47,7 +50,14 @@ def default_llm(model: str) -> Any:
         return ClaudeMaxLLM()
     from crewai import LLM
 
-    return LLM(model=model)
+    # The governor (governed.py) retries a refusal itself, after counting it
+    # and backing off. A provider SDK's own retry (OpenAI/Anthropic/Azure:
+    # 2 by default) would resend unseen — on a free tier, quota spent that the
+    # ledger never counts — so it is turned off where the provider has one.
+    llm = LLM(model=model, max_retries=0)
+    if "max_retries" in (getattr(llm, "additional_params", None) or {}) and not getattr(llm, "is_litellm", False):
+        return LLM(model=model)  # no such setting here: don't forward it into the request
+    return llm
 
 
 def journal_step(client: Any, task_id: str) -> Callable[[Any], None]:
@@ -73,9 +83,16 @@ def llm_agent(
     task_id: str,
     on_step: Callable[[Any], None] | None = None,
     tools: list[Any] | None = None,
+    max_iter: int | None = None,
+    with_memory_tools: bool = True,
 ) -> Agent:
     """``tools`` are extra CrewAI tools beyond memory — the gated machine tools
-    (``machine_tools.py``) when the plan gives the agent any."""
+    (``machine_tools.py``) when the plan gives the agent any. ``max_iter`` caps
+    its agent loop (set for a model with tight limits: every iteration is a
+    request); ``None`` keeps CrewAI's default."""
+    extra: dict[str, Any] = {}
+    if max_iter is not None:
+        extra = {"max_iter": max_iter, "respect_context_window": True}
     journal = journal_step(memory_client, task_id)
 
     def step(s: Any) -> None:
@@ -94,8 +111,9 @@ def llm_agent(
             goal=spec.goal,
             backstory=spec.backstory or spec.role,
             llm=llm,
-            tools=[*memory_tools(memory_client), *(tools or [])],
+            tools=[*(memory_tools(memory_client) if with_memory_tools else []), *(tools or [])],
             allow_delegation=False,
             verbose=False,
             step_callback=step,
+            **extra,
         )

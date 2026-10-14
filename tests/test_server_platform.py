@@ -164,7 +164,7 @@ def test_agents_routes_register_hand_down_and_promote(env):
     ScopedMemoryClient(client, store.require("builder").scope()).save("exports live in export.py")
 
     r = tc.post("/agents", json={"name": "critic", "inherit": ["builder"]})
-    assert r.status_code == 201 and r.json()["reads"] == ["critic", "builder", "default"]
+    assert r.status_code == 201 and r.json()["reads"] == ["critic", "builder", "collective", "default"]
     assert tc.post("/agents", json={"name": "critic"}).status_code == 400  # exists
     assert tc.post("/agents", json={"name": "x", "inherit": ["nobody"]}).status_code == 404
     assert tc.post("/agents", json={"name": "Bad Name"}).status_code == 400
@@ -177,7 +177,7 @@ def test_agents_routes_register_hand_down_and_promote(env):
     assert tc.get("/spaces").json()["spaces"]["builder"]["memories"] == 1
 
     r = tc.post("/agents/critic/detach", json={"other": "builder"})
-    assert r.json()["reads"] == ["critic", "default"]
+    assert r.json()["reads"] == ["critic", "collective", "default"]
     r = tc.post("/agents/critic/attach", json={"other": "builder"})
     assert "builder" in r.json()["reads"]
 
@@ -216,6 +216,7 @@ def test_plan_a_crew_then_discard_it(env):
     listed = tc.get("/crews").json()
     assert [c["id"] for c in listed["crews"]] == [crew["id"]]
     assert "claude-max" in listed["llms"]
+    assert listed["auto_resume"] is False  # this app runs no scheduler, so nothing resumes on its own
     assert tc.delete(f"/crews/{crew['id']}").json() == {"discarded": True}
     assert tc.get(f"/crews/{crew['id']}").json()["status"] == "cancelled"
     assert tc.delete(f"/crews/{crew['id']}").status_code == 409
@@ -574,3 +575,89 @@ def test_a_stopped_crews_machine_tools_do_nothing_even_auto_allowed(env, tmp_pat
         assert type(await gate("Write", args, None)).__name__ == "PermissionResultDeny"
 
     anyio.run(flow)
+
+
+# --- crew model limits over HTTP ---------------------------------------------------------
+def test_llm_limits_routes(env):
+    from relife import llm_usage
+
+    _, c = make_app(env)
+    with c:
+        r = c.put("/llms/gemini/gemini-2.0-flash",
+                  json={"rpm": 10, "rpd": 250, "tier": "free", "fallback": ["claude-max"]})
+        assert r.status_code == 200, r.text
+        assert r.json()["tightness"] == "tight" and r.json()["limits"]["fallback"] == ["claude-max"]
+        assert c.put("/llms/x", json={"rpm": -3}).status_code == 400
+        models = {m["model"]: m for m in c.get("/llms").json()["models"]}
+        assert models["gemini/gemini-2.0-flash"]["limits"]["rpd"] == 250
+        assert models["claude-max"]["declared"] is False
+        llm_usage.record_error("gemini/gemini-2.0-flash", "throttle", 5)
+        assert c.post("/llms/gemini/gemini-2.0-flash/reset").json() == {"ok": True}
+        assert llm_usage.learned("gemini/gemini-2.0-flash").factor == 1.0
+        assert c.delete("/llms/gemini/gemini-2.0-flash").json() == {"ok": True}
+        assert c.delete("/llms/gemini/gemini-2.0-flash").status_code == 404
+        # A cross-site page can't change limits with the ambient cookie.
+        assert c.put("/llms/m", json={"rpm": 1}, headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_agent_memory_mode_over_http(env):
+    _, c = make_app(env)
+    with c:
+        r = c.post("/agents", json={"name": "scout", "runtime": "llm", "model": "free/m",
+                                    "memory": "collective", "collective": "research"})
+        assert r.status_code == 201, r.text
+        assert r.json()["own_space"] == "collective-research"
+        assert r.json()["memory_label"] == "collective:research"
+        moved = c.patch("/agents/scout", json={"memory": "individual"})
+        assert moved.status_code == 200 and moved.json()["own_space"] == "scout"
+        assert "collective-research" in moved.json()["reads"]
+        assert c.patch("/agents/scout", json={"isolated": False}).status_code == 400
+        assert c.patch("/agents/nobody", json={"memory": "collective"}).status_code == 404
+        assert c.post("/agents", json={"name": "collective-x"}).status_code == 400
+        assert c.patch("/agents/scout", json={"memory": "collective"},
+                       headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_a_paused_crew_is_resumed_by_hand_or_by_the_scheduler(env):
+    import time as _t
+
+    from relife import llm_usage
+    from relife.crew.turns import TurnResult
+
+    spec = {
+        "goal": "build then review",
+        "agents": [
+            {"name": "builder", "role": "Engineer", "goal": "build", "runtime": "relife"},
+            {"name": "freebie", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "claude-max"},
+        ],
+        "tasks": [
+            {"name": "build", "agent": "builder", "description": "Add CSV export.", "expected_output": "code"},
+            {"name": "review", "agent": "freebie", "description": "Review it.", "expected_output": "verdict",
+             "context": ["build"]},
+        ],
+    }
+    turns: list[str] = []
+
+    async def turn(prompt, *, workspace, memory_client, can_use_tool, extra_mcp, on_event):
+        turns.append(prompt)
+        return TurnResult(output="built it", tool_calls=1, cost_usd=0.1)
+
+    app, tc = _crew_app(env, turn=turn)
+    # claude-max with no quota left and no fallback (a stand-in for a spent free tier).
+    llm_usage.LimitsStore().set("claude-max", {"tier": "subscription", "max_wait_s": 0})
+    llm_usage.mark_exhausted("claude-max", _t.time() + 3600)
+    with tc:
+        crew_id = tc.post("/crews", json={"spec": spec}).json()["id"]
+        assert tc.post(f"/crews/{crew_id}/run").status_code == 200
+        rec = wait_for(lambda: (c := tc.get(f"/crews/{crew_id}").json())["status"] == "paused" and c)
+        assert [t["name"] for t in rec["tasks"]] == ["build"] and rec["resume_after"]
+        r = tc.post(f"/crews/{crew_id}/resume")
+        assert r.status_code == 409 and "still out of quota" in r.json()["detail"]
+        # Not due yet: the scheduler leaves it alone.
+        assert tc.portal.call(app.state.crews.resume_due, _t.time()) == []
+        llm_usage.reset("claude-max")
+        assert tc.portal.call(app.state.crews.resume_due, _t.time() + 7200) == [crew_id]
+        rec = wait_for(lambda: (c := tc.get(f"/crews/{crew_id}").json())["status"] == "done" and c)
+        assert [t["name"] for t in rec["tasks"]] == ["build", "review"] and rec["resumed"] == 1
+        assert len(turns) == 1  # the finished build was not redone
+        assert tc.post(f"/crews/{crew_id}/resume").status_code == 409  # done: nothing to resume

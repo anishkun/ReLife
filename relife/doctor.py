@@ -74,6 +74,9 @@ class Probes:
     agents_problem: str | None = None  # the registry couldn't fully read agents.json
     # --- the shared Max budget (budget.status(); None = unknown) ---
     spend: dict | None = None
+    # --- crew model limits (llm_usage.model_status per model; [] = none configured) ---
+    llms: list[dict] = field(default_factory=list)
+    llms_problem: str | None = None  # llm_limits.json couldn't be fully read
 
 
 # --- the real machine --------------------------------------------------------
@@ -84,6 +87,20 @@ def _spend_status() -> dict | None:
         return budget.status()
     except Exception:  # noqa: BLE001 — a doctor never crashes on a probe
         return None
+
+
+def _llm_status() -> tuple[list[dict], str | None]:
+    """Each configured crew model (``RELIFE_CREW_LLMS`` + exact declared names)
+    with its limits, learned state and recent usage."""
+    try:
+        from .llm_usage import LimitsStore, model_status
+
+        store = LimitsStore()
+        names = [m for m in store.declared() if not any(c in m for c in "*?[")]
+        names = list(dict.fromkeys([*config.CREW_LLMS, *names]))
+        return [model_status(store.match(m)) for m in names], store.problem
+    except Exception as e:  # noqa: BLE001
+        return [], f"{type(e).__name__}: {e}"
 
 
 def default_probes() -> Probes:
@@ -159,6 +176,7 @@ def default_probes() -> Probes:
 
     agent_records, agents_problem = agents()
 
+    llms, llms_problem = _llm_status()
     return Probes(
         which=shutil.which,
         run=run,
@@ -184,6 +202,8 @@ def default_probes() -> Probes:
         agents=agent_records,
         agents_problem=agents_problem,
         spend=_spend_status(),
+        llms=llms,
+        llms_problem=llms_problem,
     )
 
 
@@ -340,6 +360,36 @@ def _check_crews(p: Probes) -> Check:
             r'py -3.12 -m venv .venv  then  .venv\Scripts\pip install -e ".[crewai]"',
         )
     return Check("crews", "skip", "CrewAI not installed — `relife crew` unavailable", 'pip install -e ".[crewai]"')
+
+
+def _check_llm_limits(p: Probes) -> Check:
+    """Crew models on other providers: are their limits known, and is any of
+    them out of quota right now?"""
+    if p.llms_problem:
+        return Check("model limits", "warn", f"llm_limits.json: {p.llms_problem}",
+                     "fix the file, or redeclare with `relife llm set`")
+    if not p.llms:
+        return Check("model limits", "skip", "no non-Claude crew models configured (RELIFE_CREW_LLMS)")
+    spent = [m for m in p.llms if m.get("state") == "exhausted"]
+    if spent:
+        import time
+
+        names = ", ".join(
+            f"{m['model']} (until {time.strftime('%H:%M', time.localtime(m['until']))})" for m in spent
+        )
+        return Check("model limits", "warn", f"out of quota: {names}",
+                     "crews will fall back or pause; `relife llm list` shows the rest")
+    undeclared = [m["model"] for m in p.llms if not m.get("declared")]
+    remote = [m for m in undeclared if not m.startswith(("ollama/", "ollama_chat/"))]
+    if remote:
+        return Check(
+            "model limits", "warn",
+            f"no limits declared for {', '.join(remote)} — paced at a conservative default",
+            "relife llm set MODEL --rpm N --rpd N [--fallback claude-max]  (from your provider's plan)",
+        )
+    tight = sum(1 for m in p.llms if m.get("tightness") == "tight")
+    return Check("model limits", "ok",
+                 f"{len(p.llms)} crew model(s) with known limits" + (f" · {tight} tight" if tight else ""))
 
 
 def _check_agents(p: Probes) -> Check:
@@ -582,6 +632,7 @@ def run_checks(p: Probes) -> list[Check]:
     checks.append(_check_workspace_root(p))
     checks.extend(_check_extras(p))
     checks.append(_check_crews(p))
+    checks.append(_check_llm_limits(p))
     checks.append(_check_agents(p))
     checks.append(_check_memory_daemon(p))
     enabled = sum(1 for s in p.schedules if s.get("enabled", True))

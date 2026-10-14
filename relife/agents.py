@@ -15,6 +15,16 @@ own learnings reach shared memory only through an explicit :func:`promote` by
 the user. No agent may write ``default`` — that space is the main agent's, and
 changes to it come only from the main agent or a deliberate promote/import.
 
+**Memory mode.** An agent's memory is ``individual`` (its own space, above) or
+``collective``: it writes a shared pool instead — the global ``collective``
+space, or a named ``collective-<name>`` for one team. Every non-isolated agent
+*reads* the global collective, so what a collective member learns reaches the
+others without each keeping (and paying for) a memory of its own — the right
+home for an agent on a free-tier model, or one whose work doesn't need a
+private history. Saves into a collective are importance-capped
+(``ScopedMemoryClient``) and stamped with the writer, and the user can still
+promote the collective into ``default``.
+
 External agents authenticate over HTTP MCP with a per-agent token; only its
 sha256 is stored here, so the registry file is not a credential store.
 
@@ -38,9 +48,19 @@ from typing import Any
 
 from . import _atomic, config
 from ._filelock import file_lock
-from .memory.spaces import DEFAULT_SCOPE, DEFAULT_SPACE, MemoryScope, validate_space
+from .memory.spaces import (
+    COLLECTIVE_PREFIX,
+    COLLECTIVE_SPACE,
+    DEFAULT_SCOPE,
+    DEFAULT_SPACE,
+    MemoryScope,
+    collective_space,
+    is_collective,
+    validate_space,
+)
 
 RUNTIMES = ("relife", "llm", "external")
+MEMORY_MODES = ("individual", "collective")
 MAX_INHERITS = 16
 MAX_DESCRIPTION = 500
 MAX_MODEL = 200
@@ -63,6 +83,16 @@ def validate_agent_name(name: Any) -> str:
     return name
 
 
+def validate_new_agent_name(name: Any) -> str:
+    """A name for a *new* agent: also not a collective's space, or the agent's
+    private space would be everyone's pool. (Only checked on create — an older
+    record with such a name still loads.)"""
+    name = validate_agent_name(name)
+    if is_collective(name):
+        raise ValueError(f"{name!r} names a collective memory space, not an agent")
+    return name
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -79,20 +109,33 @@ class AgentProfile:
     # Spaces read live, read-only — what the agent inherited from older agents.
     inherits: list[str] = field(default_factory=list)
     # True: do not read the user's default space (e.g. an external agent whose
-    # model provider shouldn't see your personal memory).
+    # model provider shouldn't see your personal memory) — nor the collective.
     isolated: bool = False
+    # individual: writes its own space · collective: writes the shared one
+    # (``collective`` names which; "" = the global collective).
+    memory: str = "individual"
+    collective: str = ""
     parent: str | None = None
     created_at: float = field(default_factory=time.time)
     token_hash: str | None = None
 
     @property
     def own_space(self) -> str:
+        if self.memory == "collective":
+            return collective_space(self.collective)
         return self.space or self.name
+
+    @property
+    def memory_label(self) -> str:
+        """``individual`` · ``collective`` · ``collective:<name>``."""
+        if self.memory != "collective":
+            return "individual"
+        return "collective" + (f":{self.collective}" if self.collective else "")
 
     def scope(self) -> MemoryScope:
         read = [self.own_space, *self.inherits]
         if not self.isolated:
-            read.append(DEFAULT_SPACE)
+            read += [COLLECTIVE_SPACE, DEFAULT_SPACE]
         return MemoryScope(read=tuple(read), write=self.own_space, source=self.name)
 
     def public(self) -> dict[str, Any]:
@@ -100,6 +143,7 @@ class AgentProfile:
         d = asdict(self)
         d.pop("token_hash")
         d["own_space"] = self.own_space
+        d["memory_label"] = self.memory_label
         d["has_token"] = self.token_hash is not None
         return d
 
@@ -124,10 +168,24 @@ class AgentProfile:
                 raise ValueError(
                     "an agent may not write the default space; promote its memories instead"
                 )
+        memory = d.get("memory") or "individual"
+        if memory not in MEMORY_MODES:
+            raise ValueError(f"memory must be one of {', '.join(MEMORY_MODES)}")
+        collective = d.get("collective") or ""
+        if not isinstance(collective, str):
+            raise ValueError("collective must be a name")
+        if memory == "collective":
+            if space:
+                raise ValueError("a collective agent writes the collective; it has no space of its own")
+            # Stored as the bare name ("" = the global collective).
+            collective = collective_space(collective)
+            collective = "" if collective == COLLECTIVE_SPACE else collective[len(COLLECTIVE_PREFIX):]
+        elif collective:
+            raise ValueError("collective is only for memory: collective")
         inherits = d.get("inherits") or []
         if not isinstance(inherits, list) or len(inherits) > MAX_INHERITS:
             raise ValueError(f"inherits must be a list of at most {MAX_INHERITS} spaces")
-        own = space or name
+        own = collective_space(collective) if memory == "collective" else (space or name)
         clean: list[str] = []
         for s in inherits:
             validate_space(s)
@@ -154,6 +212,8 @@ class AgentProfile:
             space=space,
             inherits=clean,
             isolated=bool(d.get("isolated", False)),
+            memory=memory,
+            collective=collective,
             parent=parent,
             created_at=float(created),
             token_hash=token_hash,
@@ -294,16 +354,23 @@ def create_agent(
     fork: str | None = None,
     space: str | None = None,
     isolated: bool = False,
+    memory: str = "individual",
+    collective: str = "",
 ) -> tuple[AgentProfile, dict[str, int] | None]:
     """Register a new agent, handing it memory from older agents.
 
     ``inherit`` (agent names): read their memory live, read-only — including
     what *they* inherited, so knowledge flows down a lineage. ``fork`` (an
     agent name): start from a snapshot copy of its own memories, skills and
-    workflows, and read what it inherited. Returns the profile and, for a fork,
-    what was copied.
+    workflows, and read what it inherited. ``memory="collective"`` makes it
+    write the shared collective (``collective`` names a team's; "" = the
+    global one) instead of a space of its own — it can't fork then: a private
+    snapshot would be copied into everyone's pool. Returns the profile and, for
+    a fork, what was copied.
     """
-    name = validate_agent_name(name)
+    name = validate_new_agent_name(name)
+    if memory == "collective" and fork:
+        raise ValueError("a collective agent can't fork: it would copy a private memory into the shared pool")
     if store.get(name) is not None:
         raise ValueError(f"an agent named {name!r} already exists")
     inherits: list[str] = []
@@ -323,6 +390,8 @@ def create_agent(
             inherits=inherits,
             isolated=isolated,
             parent=fork or (inherit[0] if inherit else None),
+            memory=memory,
+            collective=collective,
         ),
         new=True,
     )
@@ -341,6 +410,22 @@ def attach(store: AgentStore, name: str, other: str) -> AgentProfile:
         return a
     a.inherits = [*a.inherits, space]
     return store.put(a)
+
+
+def set_memory(store: AgentStore, name: str, memory: str, collective: str = "") -> AgentProfile:
+    """Move an agent's memory home (individual ⇄ collective, or to another
+    collective). Future writes go to the new home; the old one is attached
+    read-only, so nothing the agent learned stops being visible to it."""
+    a = store.require(name)
+    old = a.own_space
+    a.memory = memory
+    a.collective = collective if memory == "collective" else ""
+    if memory == "collective":
+        a.space = ""
+    new = AgentProfile.from_dict(asdict(a))  # validates before anything is saved
+    if old != new.own_space and old not in new.inherits and old != DEFAULT_SPACE:
+        new.inherits = [*new.inherits, old]
+    return store.put(new)
 
 
 def detach(store: AgentStore, name: str, other: str) -> AgentProfile:
@@ -376,7 +461,8 @@ def delete_agent(
     a = store.require(name)
     store.remove(name)
     shared = any(o.own_space == a.own_space for o in store.list())
-    if keep_memory or shared:
+    # A collective is everyone's: deleting one member never archives it.
+    if keep_memory or shared or is_collective(a.own_space):
         return 0
     return client.archive_space(a.own_space)
 

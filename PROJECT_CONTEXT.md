@@ -2,7 +2,7 @@
 
 > Durable reference for future sessions. Captures *why* things are the way they are,
 > what's built and verified, the non-obvious gotchas, and what's next.
-> Last updated: 2026-10-11.
+> Last updated: 2026-10-14.
 
 ## 1. Vision
 
@@ -33,6 +33,11 @@ measurably better at recurring tasks.
 - **Gated machine tools for non-Claude crew members (built 2026-10-11, unreleased):** an
   `llm` member the plan gives `"tools": ["files", "shell"]` acts through tools that ask
   ReLife's permission gate themselves (`crew/machine.py`), reads held to the workspace.
+- **Limit-aware crew models, collective memory, crew pause/resume (built 2026-10-12, on branch
+  `feat/crew-resume` — not yet merged or pushed):** every crew model call paced under its
+  declared/learned limits with a fallback chain (`relife llm …`), agents with individual or
+  collective memory (lean access for tight models), and a crew that pauses when every model is out
+  of quota and resumes later (§8).
 - **Next:** hosting (Managed Agents).
 
 ## 2. Locked decisions (with rationale)
@@ -91,8 +96,9 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** ~920 passing — 902 on Python 3.14 (the CrewAI modules skip), 925 in the 3.12 `.venv`
-with `[crewai]` + `[vector]` + `[embeddings]` (`python -m pytest tests/`; later phases below added the daemon, server,
+**Tests:** ~1,000 passing (2026-10-14) — 969 passed + 13 skipped on Python 3.14 (the CrewAI modules
+skip), 1,016 passed + 1 skipped in the 3.12 `.venv` with `[crewai]` + `[vector]` + `[embeddings]`
+(`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP, crew, hardening,
 scaling, budget and session-persistence suites). The original set covers permission classify, store
 save/recall, skills, the recall hook injecting memory+skills+workflows, the build
@@ -131,16 +137,18 @@ session limit hit), but `session_id` is persisted for it.
 ## 5. File map (`D:\ReLife`)
 
 ```
-pyproject.toml              # deps: claude-agent-sdk, typer, rich; extras embeddings/vector/daemon/server/crewai
+pyproject.toml              # deps: claude-agent-sdk, mcp (<2), typer, rich; extras embeddings/vector/daemon/server/crewai
 PROJECT_CONTEXT.md          # this file
 README.md / CHANGELOG.md / RELEASE_TESTING.md / CLAUDE.md
 HOW_IT_WORKS.md             # plain-English guide;  MODULE_DEEP_DIVE.md — architecture + reasoning (M1–M16)
 relife/
-  cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */mcp/crew/crews
+  cli.py                    # Typer: do/chat (--agent)/work/build/serve/doctor/memory */agent */llm */mcp/crew/crews
   __main__.py               # `python -m relife` (what MCP client configs launch)
   agents.py                 # agent registry: identity → MemoryScope; inherit/fork/promote; hashed MCP tokens;
                             #   writes re-read under a thread lock + OS file lock
   budget.py                 # spend ledger (data/spend.db), CostMeter (cumulative → per turn), daily cap
+  llm_limits.py             # pure model-limits policy: decide (go/wait/exhausted), AIMD adapt, classify_error
+  llm_usage.py              # model-usage ledger (data/llm_usage.db) + declared limits (data/llm_limits.json)
   _atomic.py / _filelock.py / _proc.py  # Windows-safe replace/read retry; cross-process lock; pid_alive
   agent.py                  # build_options + run_task/run_chat (ClaudeSDKClient, streaming), to_event
   config.py                 # MODEL, EFFORT, paths (RELIFE_HOME), agent_env() (gh PATH), default_mcp_servers()
@@ -158,7 +166,7 @@ relife/
     _procedure.py           # skill/workflow bounds, one-line header values, parsed-file cache
     vector_index.py         # VectorIndex seam: BruteForceIndex + soft-optional SqliteVecIndex (self-tested,
                             #   per dimension, incremental sync with its state in the DB)
-    spaces.py               # memory spaces: names, MemoryScope(read, write, source), per-space dirs
+    spaces.py               # memory spaces: names, MemoryScope(read, write, source), per-space dirs, the collective
     tools.py                # the memory tools, defined once (ToolSpec) for every transport
     context.py              # the recalled-context block (recall hook + memory_context tool)
     mcp_server.py           # ReLife memory over MCP for any agent: stdio + the daemon's /mcp
@@ -178,8 +186,11 @@ relife/
     spec.py / planner.py    # pure: validated CrewSpec; Claude plans it (one tool-less call)
     agent.py                # ReLifeAgent(BaseAgentAdapter): a crew member = a fresh ReLife turn
     llm.py                  # ClaudeMaxLLM(BaseLLM): Claude via the CLI for CrewAI (no API key)
+    governed.py             # GovernedLLM: every crew model call paced under its limits; fallback; QuotaPaused
+    memory_policy.py        # pure: a member's memory mode (auto → collective on a tight model) + lean/full access
     native.py / memory_tools.py  # CrewAI agents on other models + ReLife memory as CrewAI tools
-    build.py / runner.py / record.py  # profiles+handoff → Crew → kickoff → data/crews/<id>/
+    machine.py / machine_tools.py  # opt-in gated file/shell tools for other models (each call asks the policy)
+    build.py / runner.py / record.py  # profiles+handoff → Crew → kickoff → data/crews/<id>/; pause/resume
   build/                    # `relife build`: orchestrated, resumable large builds
     ledger.py               # BuildLedger — durable plan+progress (data/builds/<id>/)
     server.py               # relife_build MCP server (plan_set/milestone_update/status)
@@ -189,16 +200,17 @@ relife/
   server/
     session.py              # AgentSession (lazy client + resume, cost meter, per-turn grants) / ApprovalBroker /
                             #   SessionStore (data/sessions/) / SessionManager (ceiling, reaper that sleeps, restore)
-    app.py                  # create_app (sessions, SSE, approvals, schedules, agents, crews, /budget) + serve()
+    app.py                  # create_app (sessions, SSE, approvals, schedules, agents, crews, /llms, /budget) + serve()
     crews.py                # CrewHost (a crew run hosted like a session), LoopBroker, CrewService
     security.py             # pure auth/CSRF/bind/DNS-rebinding/workspace-confinement policy
-    schedules.py            # Schedule record (grants, work), spec parsing, next_run(), JSON ScheduleStore
+    schedules.py            # Schedule record (grants, work, crew), spec parsing, next_run(), JSON ScheduleStore
     scheduler.py            # lifespan tick loop: fire due schedules (incl. work schedules) + record outcomes
     runs.py                 # RunRecord / summarize_events / per-schedule RunStore (data/runs/)
 data/                       # gitignored runtime: relife.db, skills/, workflows/, spaces/, agents.json(.lock),
-                            #   builds/, crews/, runs/, schedules.json, spend.db, sessions/
+                            #   builds/, crews/, runs/, schedules.json, spend.db, sessions/, llm_limits.json,
+                            #   llm_usage.db
 scripts/bench_recall.py     # non-CI recall scaling benchmark (10k+ memories)
-tests/                      # ~920 tests (deterministic + 4 semantic, embeddings forced off)
+tests/                      # ~1,000 tests (deterministic + 4 semantic, embeddings forced off)
 .venv/                      # gitignored Python 3.12 env for `[crewai]` (CrewAI needs < 3.14)
 ```
 
@@ -212,7 +224,7 @@ pip install -e .                  # extras: ".[embeddings]", ".[vector]", ".[dae
 relife doctor                     # what's missing, with the fix for each
 relife do "scaffold a Python CLI that prints the weather for a city"
 relife chat
-# --workspace PATH chooses the dir the agent works in (default ./workspace)
+# --workspace PATH chooses the dir the agent works in (default workspace/ under RELIFE_HOME)
 
 # crews (CrewAI needs Python <= 3.13):
 py -3.12 -m venv .venv
@@ -814,6 +826,33 @@ name: evil` can no longer close the frontmatter and forge
   record (pre-existing, since crews shipped). Fixed: `build_crew(llm_outcomes=)` charges each `llm`
   task the change in its member's LLM running total (CrewAI's per-task `callback`) and keeps its output
   if a later task fails; two regression tests.
+- **Limit-aware models, individual vs collective memory, pause/resume (2026-10-12; all three built,
+  plus a fix found by real crews against a throttling local endpoint — provider SDK retry off, quieter
+  waits, the resume button — on branch `feat/crew-resume`, not yet merged or pushed).**
+  Plan: `C:\Users\HP\.claude\plans\frolicking-dazzling-frog.md`, three PRs. **PR 1 — model limits
+  and pacing — built:** `llm_limits.py` (pure: declared `ModelLimits` matched exact → glob → built-in →
+  conservative default; `decide` over a 60 s and a rolling 24 h window with headroom and an AIMD factor;
+  `adapt`; `classify_error` telling a throttle from a daily quota, with retry hints), `llm_usage.py`
+  (SQLite ledger shared across processes + `LimitsStore`), `crew/governed.py` (`GovernedLLM` around every
+  CrewAI LLM: pace, back off, walk the fallback chain, `QuotaPaused` as a `HookAborted` so CrewAI never
+  re-runs the task). Tight models get `max_iter=8`; the planner and the plan display show each model's
+  limits; `relife llm list|set|unset|reset`, `GET/PUT/DELETE /llms`, a Models section in the Crews panel,
+  a doctor check. Spike confirmed by test: a native-function-calling model drives a real `kickoff()`
+  through the wrapper. 997 tests on the 3.12 venv, 959 on 3.14. **PR 2 — individual vs collective memory —
+  built:** `AgentProfile.memory` (`individual`|`collective`) + `.collective` (a team pool
+  `collective-<name>`); every non-isolated agent reads the global `collective`; collective saves capped at
+  importance 0.6; `relife agent set NAME --memory …` (old home attached), `PATCH /agents/{name}`, console
+  toggle. `crew/memory_policy.resolve`: plan `memory: auto` → collective for a **new** agent on a tight model
+  (registered agents never moved; the note says how), **lean** access (no memory tools, 800-char recalled
+  block) for tight models, and **every** `llm` member's finished task saved as an episode with no model call.
+  1009 tests on the 3.12 venv, 968 on 3.14. **PR 3 — pause/resume — built:** with every model in a member's
+  chain spent, the crew records `paused` (+ `resume_after`, `paused_reason`; finished tasks kept), at the next
+  task boundary when sequential (`GovernedLLM.preflight`). `relife crew --resume [ID]`, `POST
+  /crews/{id}/resume`, a console button, and the scheduler resumes due crews by itself
+  (`RELIFE_CREW_AUTO_RESUME`); a resume while still spent is refused and `resume_after` moves on; only the
+  unfinished tasks run, with finished context outputs fenced into their descriptions. 1014 tests on the
+  3.12 venv, 969 on 3.14. **Not yet:** a live smoke against a real free-tier provider (needs a key the
+  user sets); Max-subscription session limits on ReLife (Claude) members still fail a task rather than pause.
 - **Phase 3 (next):** async `MemoryClient` variants are no longer needed (pass 11 moved every
   async caller off the loop via `off_loop`); the live smokes are done (above); Anthropic **Managed Agents** is the natural host (hosted memory
   stores, MCP vaults, GitHub mounting, scheduled deployments).

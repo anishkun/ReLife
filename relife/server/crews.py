@@ -41,12 +41,13 @@ import asyncio
 import concurrent.futures
 import importlib.util
 import threading
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import PermissionResultDeny
 
-from .. import config
+from .. import budget, config
 from ..agents import AgentStore
 from ..crew.record import CrewRunRecord, CrewRunStore
 from ..crew.spec import CrewSpec
@@ -214,6 +215,12 @@ class CrewHost(EventStream):
             await self._publish({"type": "text", "text": record.final_output})
         if record.status == "done":
             await self._publish({"type": "result", "cost_usd": record.cost_usd})
+        elif record.status == "paused":
+            when = time.strftime("%H:%M", time.localtime(record.resume_after or time.time()))
+            await self._publish({
+                "type": "error",
+                "message": f"paused — {record.paused_reason}; it resumes after {when}",
+            })
         else:
             await self._publish({"type": "error", "message": record.error or record.status})
         if self._on_finish is not None:
@@ -396,31 +403,53 @@ class CrewService:
         h = self.host(crew_id)
         return h.id if h is not None else None
 
+    def _live(self, crew_id: str) -> bool:
+        h = self.host(crew_id)
+        return (h is not None and h.busy) or crew_id in self._pending
+
     def build_host(
         self,
         record: CrewRunRecord,
         *,
         prompt: str | None = None,
         on_finish: Callable[[CrewRunRecord], None] | None = None,
+        resume: bool = False,
     ) -> CrewHost:
         """A host for a ``planned`` record, not yet started — so a caller (the
-        scheduler's recorder) can subscribe before its first event."""
+        scheduler's recorder) can subscribe before its first event. ``resume``:
+        a paused/interrupted record instead, hosting only what's left to run
+        (raises ``ValueError`` while its models are still out of quota)."""
         if not crewai_available():
             raise CrewUnavailable(CREWAI_HINT)
-        # The live host first: the record only says "running" once the worker
-        # thread has saved it, so a quick second request would still read
-        # "planned" and start the same crew twice.
-        if record.id in self._hosts or record.id in self._pending:
-            raise ValueError(f"crew {record.id} has already been started")
-        if record.status != "planned":
-            raise ValueError(f"crew {record.id} is {record.status}; only a planned crew can run")
+        if resume:
+            # A resumed crew had a host before; only a *live* one blocks it.
+            if self._live(record.id):
+                raise ValueError(f"crew {record.id} is already running")
+            from ..crew.runner import prepare_resume
+
+            spec = prepare_resume(record, records=self.records)
+        else:
+            # The live host first: the record only says "running" once the worker
+            # thread has saved it, so a quick second request would still read
+            # "planned" and start the same crew twice.
+            if record.id in self._hosts or record.id in self._pending:
+                raise ValueError(f"crew {record.id} has already been started")
+            if record.status != "planned":
+                raise ValueError(f"crew {record.id} is {record.status}; only a planned crew can run")
+            spec = CrewSpec.from_dict(record.spec)
         if self.max_running and self.running() >= self.max_running:
             raise CrewLimitReached(
                 f"at most {self.max_running} crew(s) at a time (raise RELIFE_AGENT_MAX_CREWS)"
             )
+        if resume:
+            record.resumed += 1
+            record.resume_after = None
+            record.paused_reason = ""
+            record.error = None
+            prompt = prompt or f"[Crew {record.id} — resumed] {record.task}"
         return CrewHost(
             record,
-            CrewSpec.from_dict(record.spec),
+            spec,
             records=self.records,
             agents_path=self.agents_path,
             client=self.client,
@@ -432,10 +461,10 @@ class CrewService:
             on_finish=on_finish,
         )
 
-    async def launch(self, host: CrewHost) -> CrewHost:
+    async def launch(self, host: CrewHost, *, resume: bool = False) -> CrewHost:
         """Start a built host under the session manager (ceiling, reaper, shutdown)."""
         crew_id = host.record.id
-        if crew_id in self._hosts or crew_id in self._pending:
+        if self._live(crew_id) if resume else (crew_id in self._hosts or crew_id in self._pending):
             raise ValueError(f"crew {crew_id} has already been started")
         self._pending.add(crew_id)  # synchronously, before the first await
         try:
@@ -450,6 +479,37 @@ class CrewService:
         if record is None:
             raise LookupError("unknown crew")
         return await self.launch(self.build_host(record))
+
+    async def resume(self, crew_id: str) -> CrewHost:
+        """Run the rest of a paused (or interrupted) crew. ``ValueError`` when it
+        can't resume yet — still out of quota, already running, nothing left."""
+        record = self.records.get(crew_id)
+        if record is None:
+            raise LookupError("unknown crew")
+        # prepare_resume reads the usage ledger (SQLite): off the loop.
+        host = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self.build_host(record, resume=True)
+        )
+        return await self.launch(host, resume=True)
+
+    async def resume_due(self, now: float | None = None) -> list[str]:
+        """Resume every paused crew whose quota should have reset (the scheduler
+        calls this each tick). One that is still out of quota has its
+        ``resume_after`` moved to the new reset; one that can't start now (crew
+        ceiling, budget) is tried again next tick. Returns the ids resumed."""
+        t = time.time() if now is None else now
+        resumed: list[str] = []
+        for rec in self.records.list(50):
+            if rec.status != "paused" or not rec.resume_after or rec.resume_after > t:
+                continue
+            try:
+                budget.check("a paused crew")
+                await self.resume(rec.id)
+            except (ValueError, LookupError, CrewLimitReached, CrewUnavailable, SessionLimitReached,
+                    budget.BudgetExceeded):
+                continue
+            resumed.append(rec.id)
+        return resumed
 
 
 __all__ = [
