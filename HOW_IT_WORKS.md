@@ -124,10 +124,13 @@ relife memory spaces|export|import      # each agent's memory; move it between m
 relife agent create|list|show|promote|… # register agents and hand memory between them (§6d)
 relife mcp --agent NAME                 # give another AI app ReLife's memory (§6d)
 relife crew "<task>"   # CrewAI plans a team; ReLife staffs and runs it (§6d)
+relife crew --resume   # finish a crew that paused because its models ran out of quota
 relife crews [ID]      # what past crews did
+relife llm list|set    # crew models' rate limits and what they've used (§6d)
 ```
 
-All the commands that run the agent take `--workspace PATH` (default `./workspace`)
+All the commands that run the agent take `--workspace PATH` (default: the `workspace/`
+folder in ReLife's home, next to `data/`)
 — **the only folder the agent is allowed to freely write into.** Think of the
 workspace as the agent's desk: it can do whatever it wants on its own desk, but needs
 your nod to touch anything off it. `do` and `chat` also take `--agent NAME`, to run
@@ -266,9 +269,9 @@ exception is a schedule's **pre-approvals** — see §6b.
 One small module holding everything tunable: the model + effort level, all the
 filesystem paths (`data/`, `workspace/`, prompts — `RELIFE_HOME` moves them),
 `agent_env()` (prepends the GitHub CLI dir to PATH if `gh` isn't found), and
-`default_mcp_servers()` (the browser + memory servers attached to every run). Also sets `setting_sources=None`
-indirectly — ReLife refuses to inherit the surrounding repo's Claude Code config,
-so it behaves identically wherever it's run.
+`default_mcp_servers()` (the browser + memory servers attached to every run). (The
+`setting_sources=None` that stops ReLife inheriting the surrounding repo's Claude Code
+config, so it behaves identically wherever it's run, is set in `agent.build_options`.)
 
 ### `hooks.py` — automatic memory recall
 A **hook** is a callback the SDK fires at lifecycle moments. ReLife registers three:
@@ -468,8 +471,9 @@ if the original conversation is gone.
 - **`agents.py` — the `builder` definition**: describes the subagent the
   orchestrator delegates to — its instructions ("implement exactly ONE milestone,
   verify it, report back concisely, don't paste full files"), and the tools it's
-  allowed (read/write/edit/shell/browser, but **not** the ledger tools — those
-  belong to the orchestrator).
+  allowed (read/write/edit/shell plus web fetch/search — built-in tools only, so not
+  the browser or memory tools, and **not** the ledger tools, which belong to the
+  orchestrator).
 - **`orchestrator.py` — `run_build()`**: ties it all together. Creates or loads
   the ledger, attaches the `relife_build` server + the `builder` subagent + the
   orchestrator persona, streams the run, and persists the `session_id` after each
@@ -680,8 +684,9 @@ and it can't run the housekeeping or "dream" passes.
 the agent was asked and what it produced into that agent's memory itself, with no
 extra model call. An agent on another model therefore learns even if it never thinks to
 save anything. When a crew creates a *new* agent on a model with tight limits, that
-agent gets the collective memory and a *lean* connection to it: no memory tools (each
-one would cost a request), just a short summary of what's relevant handed to it up front.
+agent gets the collective memory; and any member on such a model gets a *lean*
+connection to its memory: no memory tools (each one would cost a request), just a short
+summary of what's relevant handed to it up front.
 The plan shows each agent's memory before you approve it. An agent you already have
 keeps its memory where it is; the plan only suggests moving it.
 
@@ -754,9 +759,11 @@ D:\ReLife\
 │   ├─ crews/<id>/          one folder per `relife crew` run (plan + outcome)
 │   ├─ sessions/            console conversations that are asleep (wake on next use)
 │   ├─ spend.db             the tally of what everything ReLife started has used today
+│   ├─ llm_limits.json      the rate limits you declared for crew models (`relife llm set`)
+│   ├─ llm_usage.db         what each crew model has been asked for lately (pacing)
 │   └─ relife.db.daemon     marker left by a running `relife memory serve` (optional)
 ├─ .venv/                   Python 3.12 environment for crews (gitignored)
-├─ tests/                   ~920 deterministic tests (no live AI — safe & fast)
+├─ tests/                   ~1,000 deterministic tests (no live AI — safe & fast)
 ├─ CLAUDE.md                instructions FOR the agent when editing this repo
 ├─ PROJECT_CONTEXT.md       the authoritative design/status doc (terse)
 ├─ MODULE_DEEP_DIVE.md      the architecture, module by module, with the reasoning
@@ -777,7 +784,7 @@ D:\ReLife\
   through your subscription; only the *other* models you choose use their own keys.
   `relife doctor` shows how much ReLife has used today, and `RELIFE_DAILY_BUDGET_USD`
   turns that into a cap.
-- **The tests never call the live model.** All ~920 tests are deterministic — they
+- **The tests never call the live model.** All ~1,000 tests are deterministic — they
   test the *policy and plumbing* (permission decisions, memory recall scoring,
   the cognitive activation/decay math, workflow learning, ledger persistence, the
   REM critic's *application* logic via a stubbed AI, the whole server — auth,
@@ -808,9 +815,11 @@ D:\ReLife\
 - **Closing the tab doesn't end the conversation.** A console session sleeps when idle
   and wakes where it left off — even after the server restarts. "New session" is the
   button that really ends one.
-- **Agents on other models don't get hands.** In a crew, anything that touches your
-  machine (files, shell, git, browser) is done by a ReLife agent under ReLife's
-  permission rules; models running inside CrewAI only think, recall and remember.
+- **Agents on other models get hands only if the plan gives them.** By default a
+  model running inside CrewAI only thinks, recalls and remembers; real engineering work
+  (git, the browser) is done by a ReLife agent. A plan can give such an agent file or
+  shell tools, and then every single call checks ReLife's permission rules first —
+  stricter ones, in fact: reading a file outside the crew's folder asks.
 
 ---
 

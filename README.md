@@ -62,6 +62,11 @@ CrewAI run with stand-in models) and with live crew smokes (`RELEASE_TESTING.md`
   small team, CrewAI runs it, and ReLife staffs it with full ReLife agents (Claude + tools +
   memory) and, if you configure them, CrewAI agents on other models (Ollama, OpenAI, Gemini…) with
   ReLife memory attached. New team members inherit what experienced agents learned.
+- **Crews on free-tier models** — every crew model call is paced under that model's limits
+  (`relife llm set MODEL --rpm N --rpd N --fallback claude-max`), backs off when the provider
+  refuses, falls back to another model when one runs out of quota, and when every model is spent the
+  crew **pauses** and resumes later (`relife crew --resume`, or on its own under `relife serve`).
+  Agents can share a **collective** memory instead of keeping their own — useful for small models.
 - **Agents and crews in the web console** — `relife serve` adds Agents and Crews panels: plan,
   review and run a crew with every member's work streaming in and its outward actions as approval
   cards; crews can run on a schedule.
@@ -144,11 +149,13 @@ relife mcp --agent cursor                     # the stdio MCP server that config
 relife agent token cursor                     # token for the daemon's HTTP /mcp endpoint
 
 relife crew "<task>"       # CrewAI plans a team, shows it, runs it on confirm (--plan-only, --yes, --spec)
+relife crew --resume [ID]  # finish a crew that paused (models out of quota) or was interrupted
 relife crews [ID]          # recent crew runs, or one run's per-task outcomes
+relife llm list            # crew models' limits and usage; `relife llm set MODEL --rpm 10 --rpd 250`
 ```
 
-`do`/`chat`/`build` accept `--workspace PATH` (default: `./workspace`) — the directory
-the agent works in.
+`do`/`chat`/`build` accept `--workspace PATH` (default: `workspace/` in the ReLife home) — the
+directory the agent works in.
 
 See **`HOW_IT_WORKS.md`** for a friendly, top-to-bottom walkthrough of the whole system, and
 **`MODULE_DEEP_DIVE.md`** for the architecture module by module, with the reasoning behind it.
@@ -156,8 +163,9 @@ See **`HOW_IT_WORKS.md`** for a friendly, top-to-bottom walkthrough of the whole
 ## Agents, memory handoff and crews
 
 Every agent has a **memory space**. The main agent (plain `relife do`) uses `default` — your
-memory. A registered agent *writes* only its own space and *reads* its own, the spaces it
-inherited, and `default` (unless `--isolated`). The tools never take a space argument: scope
+memory. A registered agent *writes* only its own space (or, with `--memory collective`, the
+shared pool) and *reads* its own, the spaces it inherited, the shared `collective`, and `default`
+(unless `--isolated`). The tools never take a space argument: scope
 comes from who the agent is, so no model output can widen it. Consolidation dedupes and learns
 workflows per space, never across.
 
@@ -180,8 +188,10 @@ both. A CrewAI app outside ReLife uses `MCPServerStdio(command=…, args=["-m", 
 
 **Crews.** `relife crew "<task>"` plans the team (one tool-less Claude call), shows it, and runs it
 in `<workspace>/crews/<id>/` after you confirm. ReLife agents work under the normal permission
-policy (outward actions ask). Agents on other models get ReLife memory but **no** shell/file tools —
-list the models the planner may use in `RELIFE_CREW_LLMS` (e.g. `ollama/llama3.1,gpt-4.1`; their
+policy (outward actions ask). Agents on other models get ReLife memory, and shell/file tools only
+when the plan gives them (`"tools": ["files"]`, `["shell"]`) — every such call asks the same
+permission policy first, and reads outside the crew's workspace ask too, since what that agent reads
+goes to its model's provider. List the models the planner may use in `RELIFE_CREW_LLMS` (e.g. `ollama/llama3.1,gpt-4.1`; their
 keys, if any, are read by CrewAI/LiteLLM from your environment — ReLife never stores them);
 `claude-max` (Claude through your subscription) is always available. Each run's plan and per-task
 outcome is kept in `data/crews/<id>/record.json` (`relife crews ID`). CrewAI's own memory,
@@ -197,10 +207,11 @@ denied if nobody answers in time. A crew can be put on a schedule from its card.
 
 ```
 relife/
-  cli.py        CLI entry (Typer): do / chat / build / serve / doctor / consolidate / dream / memory * /
-                agent * / mcp / crew / crews
+  cli.py        CLI entry (Typer): do / chat / work / build / serve / doctor / consolidate / dream /
+                memory * / agent * / mcp / crew / crews / llm *
   agents.py     agent registry: identity, memory scope, inherit / fork / promote, MCP tokens
   budget.py     the spend ledger and the optional daily cap
+  llm_limits.py / llm_usage.py  crew model limits (pure policy) and their shared usage ledger
   agent.py      builds ClaudeAgentOptions, runs the SDK loop, the shared event taxonomy
   config.py     model, paths, permission mode, MCP servers, every tunable and env knob
   permissions.py allow/ask policy gating every tool call (shell, files, connectors)
@@ -219,5 +230,5 @@ relife/
                 run outcomes, crews hosted like sessions
 data/           runtime db, agents, schedules, run and crew records, sleeping sessions, spend ledger
                 (gitignored)
-tests/          ~920 tests (no live model calls; CI runs them on Windows + Linux, py3.11-3.13)
+tests/          ~1,000 tests (no live model calls; CI runs them on Windows + Linux, py3.11-3.13)
 ```
