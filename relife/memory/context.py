@@ -43,8 +43,11 @@ def _own_space(client: Any) -> str:
     return getattr(scope, "write", DEFAULT_SPACE)
 
 
-def build_context(client: Any, query: str) -> str:
-    """The recalled-context block for ``query`` ("" when nothing is relevant)."""
+def build_context(client: Any, query: str, budget: int | None = None) -> str:
+    """The recalled-context block for ``query`` ("" when nothing is relevant),
+    at most ``budget`` characters (default ``RECALL_INJECT_BUDGET``; a crew
+    member on a tight model gets a smaller one)."""
+    budget = config.RECALL_INJECT_BUDGET if budget is None else budget
     own = _own_space(client)
     # A record without a space (a duck-typed client) counts as the caller's own.
     # Gather candidate blocks in priority order: memory, then skills, then a
@@ -72,7 +75,7 @@ def build_context(client: Any, query: str) -> str:
     for label, key, rendered in candidates:
         if _is_dup(key, kept_tokens):
             continue
-        if used + len(rendered) > config.RECALL_INJECT_BUDGET:
+        if used + len(rendered) > budget:
             continue
         grouped[label].append(rendered)
         kept_tokens.append(_tokens(key))

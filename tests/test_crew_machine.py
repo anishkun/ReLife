@@ -216,8 +216,8 @@ def test_toolsets_are_opt_in_and_validated():
 
 def test_the_plan_shows_which_members_have_gated_tools():
     lines = "\n".join(describe_plan(normalize_spec(_spec(tools=["files"]))))
-    assert "CrewAI agent on claude-max (gated files tools)" in lines
-    assert "(no tools)" in "\n".join(describe_plan(normalize_spec(_spec())))
+    assert "CrewAI agent on claude-max (gated files tools; no rate limits · subscription)" in lines
+    assert "(no tools;" in "\n".join(describe_plan(normalize_spec(_spec())))
 
 
 def test_old_records_without_tools_still_load():

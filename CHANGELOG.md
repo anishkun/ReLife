@@ -18,7 +18,8 @@
 - **Crews (CrewAI).** `relife crew "<task>"` plans a small team (Claude via the CLI — no API key),
   shows it, and runs it with CrewAI after you confirm: full ReLife agents as crew members
   (`ReLifeAgent`, a `BaseAgentAdapter`) and CrewAI agents on other models (`RELIFE_CREW_LLMS`, or
-  `claude-max`) with ReLife memory attached and no machine-touching tools. New agents inherit from
+  `claude-max`) with ReLife memory attached (machine-touching tools only when the plan opts in —
+  see the gated machine tools below). New agents inherit from
   experienced ones; outcomes are recorded in `data/crews/<id>/` (`relife crews [ID]`). Optional
   `[crewai]` extra — CrewAI needs Python ≤ 3.13; `relife doctor` explains.
 - **Agents and crews in the web console.** `relife serve` gains `/agents`, `/spaces` and `/crews`
@@ -44,6 +45,28 @@
   their transcript and conversation (`resume`), across server restarts too. A session's process now
   starts with its first turn, not when the page opens. Checked live: a session resumed its
   conversation after sleeping and after the server was force-killed and restarted.
+- **Model limits for crew models.** Every CrewAI LLM in a crew (members and a hierarchical
+  manager) is wrapped in `GovernedLLM`, which paces each call under the model's limits — declared
+  with `relife llm set MODEL --rpm N --rpd N [--fallback M]` (`data/llm_limits.json`), else a
+  conservative `RELIFE_LLM_DEFAULT_RPM` for an undeclared remote model — over a 60 s and a rolling
+  24 h window, backs off when the provider refuses (a 429 halves the rate; a daily-quota error marks
+  the model exhausted), and switches to the model's fallback chain, back again once it resets. Calls
+  and what was learned live in a ledger shared across processes (`data/llm_usage.db`). Models with
+  tight declared limits get a short agent loop. `relife llm list|set|unset|reset`, `/llms` routes,
+  a Models section in the console's Crews panel, and a `model limits` check in `relife doctor`.
+- **Individual or collective memory.** An agent's memory is `individual` (its own space) or
+  `collective` — the shared `collective` pool every non-isolated agent reads, or a team's
+  `collective-<name>` (`relife agent create|set --memory collective [--collective TEAM]`,
+  `PATCH /agents/{name}`, a console toggle). Saves into a collective are importance-capped
+  (`RELIFE_COLLECTIVE_MAX_IMPORTANCE`, 0.6); a collective agent can't fork; deleting a member never
+  archives the pool. In a crew plan, `memory: auto` makes a new agent on a tight model collective,
+  and a member on a tight model reaches memory *lean* (no memory tools, a smaller recalled block).
+  Every CrewAI member's finished task is now saved as an episode in its memory, with no model call.
+- **A crew pauses when every model is out of quota, and resumes later.** With a member's model and
+  its whole fallback chain spent beyond the wait budget, the crew is recorded `paused` (with when to
+  come back) instead of failing; finished tasks are kept. `relife crew --resume [ID]`,
+  `POST /crews/{id}/resume` and a console button run only the unfinished tasks; the server's
+  scheduler resumes a paused crew by itself once the quota resets (`RELIFE_CREW_AUTO_RESUME`).
 
 ### Changed
 - Docs brought up to date with the hardening, scaling and durability passes: `HOW_IT_WORKS.md`
@@ -89,6 +112,10 @@
   space's own recent events, so a busy agent no longer hides a quiet one's patterns.
 
 ### Fixed
+- A crew model's provider SDK no longer retries a refused request on its own (the OpenAI SDK resent
+  each 429 twice): those requests counted against a free tier's quota but never reached the usage
+  ledger. CrewAI LLMs are built with `max_retries=0` where the provider has that setting; the
+  governor is the only one that retries.
 - **A crew's record now counts its CrewAI members' cost.** Only ReLife members' turns were added up,
   so a `claude-max` member's spending (correctly in the daily budget ledger) showed as $0.00 in
   `relife crews` and the run summary. Each `llm` task is now charged the change in its member's

@@ -204,7 +204,7 @@ def test_crew_kickoff_end_to_end(env, tmp_path):
     spec = normalize_spec(SPEC)
     notes = ensure_profiles(spec, store, client)
     assert notes[0] == "new agent builder" and "reads builder" in notes[1]
-    assert store.require("critic").scope().read == ("critic", "builder", "default")
+    assert store.require("critic").scope().read == ("critic", "builder", "collective", "default")
 
     stub, runner, outcomes = StubModel(), FakeRunner(), {}
     crew = build_crew(
@@ -474,3 +474,195 @@ def test_a_crewai_members_finished_task_survives_a_later_failure(env, tmp_path):
     assert rec.status == "error" and "disk full" in rec.error
     assert [t.name for t in rec.tasks] == ["first", "second"]
     assert rec.outcome("second").runtime == "llm" and rec.cost_usd == pytest.approx(0.04)
+
+
+# --- model limits: a member on a spent model falls back -------------------------------------
+def test_a_member_whose_model_is_spent_falls_back_and_the_record_says_so(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    llm_usage.LimitsStore().set("free/model", {"rpd": 1, "fallback": ["claude-max"]})
+    llm_usage.record_call("free/model")  # today's one request is already used
+    spec_raw = {
+        "goal": "critique",
+        "agents": [{"name": "critic", "role": "Reviewer", "goal": "review", "runtime": "llm",
+                    "llm": "free/model"}],
+        "tasks": [{"name": "review", "agent": "critic", "description": "Critique the idea.",
+                   "expected_output": "notes"}],
+    }
+    built: list[str] = []
+
+    def factory(model):
+        built.append(model)
+        return ClaudeMaxLLM(ask_model=StubModel())
+
+    lines: list[str] = []
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=spec_raw, yes=True, echo=lines.append,
+        llm_factory=factory, store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "done", rec.error
+    assert built == ["free/model", "claude-max"]
+    out = rec.outcome("review")
+    assert out.output == "looks good, ship it"
+    assert [s.split(" (")[0] for s in out.model_switches] == ["free/model → claude-max"]
+    assert any("switching free/model → claude-max" in line for line in lines)
+    assert any("1/day" in line and "falls back to claude-max" in line for line in lines)  # the plan said so
+
+
+# --- memory for every member, whatever its model -------------------------------------------
+TIGHT_SPEC = {
+    "goal": "tidy notes",
+    "agents": [
+        {"name": "freebie", "role": "Formatter", "goal": "format", "runtime": "llm", "llm": "free/model"},
+        {"name": "critic", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "claude-max"},
+    ],
+    "tasks": [
+        {"name": "format", "agent": "freebie", "description": "Format the release notes as a table.",
+         "expected_output": "a table"},
+        {"name": "review", "agent": "critic", "description": "Review the formatted notes.",
+         "expected_output": "a verdict", "context": ["format"]},
+    ],
+}
+
+
+def test_a_tight_model_gets_collective_lean_memory_and_every_member_remembers(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    llm_usage.LimitsStore().set("free/model", {"rpm": 10, "rpd": 250, "tier": "free"})
+    spec = normalize_spec(TIGHT_SPEC)
+    notes = ensure_profiles(spec, store, client)
+    assert store.require("freebie").own_space == "collective"
+    assert any("freebie" in n and "collective memory (free/model has tight limits)" in n for n in notes)
+    assert store.require("critic").own_space == "critic"  # claude-max: ample → individual
+    crew = build_crew(spec, store=store, client=client, workspace=tmp_path, run_id="t1",
+                      llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()))
+    members = {a.role: a for a in crew.agents}
+    assert not {t.name for t in members["Formatter"].tools} & {"memory_save", "memory_recall"}  # lean
+    assert "memory_save" in {t.name for t in members["Reviewer"].tools}  # full
+    assert members["Formatter"].max_iter == 8 and members["Reviewer"].max_iter != 8
+    crew.kickoff()
+    # Both remember their task without a memory tool call — in their own homes.
+    pool = client.recall("release notes table", spaces=["collective"])
+    assert pool and pool[0].kind == "episode" and pool[0].source == "freebie"
+    assert pool[0].importance <= 0.6
+    own = client.recall("formatted notes review", spaces=["critic"])
+    assert own and own[0].text.startswith("[crew task] Review the formatted notes.")
+
+
+def test_a_plan_never_moves_a_registered_agents_memory(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    ag.create_agent(store, client, "freebie", runtime="llm", model="free/model")
+    llm_usage.LimitsStore().set("free/model", {"rpm": 5})
+    spec = normalize_spec(TIGHT_SPEC, existing_agents={"freebie"})
+    notes = ensure_profiles(spec, store, client)
+    assert store.require("freebie").own_space == "freebie"
+    note = next(n for n in notes if n.startswith("reusing freebie"))
+    assert "individual memory" in note and "relife agent set freebie --memory collective" in note
+
+
+def test_the_plan_shows_each_members_memory(env):
+    from relife import llm_usage
+    from relife.crew.runner import describe_plan
+
+    llm_usage.LimitsStore().set("free/model", {"rpd": 100})
+    lines = "\n".join(describe_plan(normalize_spec(TIGHT_SPEC)))
+    assert "free/model (no tools; 100/day · default" not in lines  # declared, so not "default"
+    assert "memory collective · lean" in lines and "memory individual · full" in lines
+
+
+# --- out of quota everywhere: pause, keep what finished, resume later ------------------------
+PAUSE_SPEC = {
+    "goal": "build then review",
+    "agents": [
+        {"name": "builder", "role": "Engineer", "goal": "build", "runtime": "relife"},
+        {"name": "freebie", "role": "Reviewer", "goal": "review", "runtime": "llm", "llm": "free/model"},
+    ],
+    "tasks": [
+        {"name": "build", "agent": "builder", "description": "Add CSV export.", "expected_output": "code"},
+        {"name": "review", "agent": "freebie", "description": "Review the export.",
+         "expected_output": "a verdict", "context": ["build"]},
+    ],
+}
+
+
+def _spent(model="free/model", hours=3):
+    import time as _t
+
+    from relife import llm_usage
+
+    llm_usage.LimitsStore().set(model, {"rpm": 10, "max_wait_s": 0})
+    llm_usage.mark_exhausted(model, _t.time() + hours * 3600)
+
+
+def test_a_crew_pauses_between_tasks_when_the_next_model_is_spent(env, tmp_path):
+    store, client, _ = env
+    _spent()
+    lines: list[str] = []
+    model = StubModel()
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=PAUSE_SPEC, yes=True, echo=lines.append,
+        runner=FakeRunner(), llm_factory=lambda m: ClaudeMaxLLM(ask_model=model),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "paused", rec.error
+    assert rec.error is None and "free/model has no quota left" in rec.paused_reason
+    assert rec.resume_after and rec.resume_after > rec.created_at
+    assert [t.name for t in rec.tasks] == ["build"]  # the finished task is kept
+    assert model.calls == []  # the review never reached the spent model
+    assert any(f"relife crew --resume {rec.id}" in line for line in lines)
+    again = CrewRunStore(tmp_path / "crews").get(rec.id)
+    assert again.status == "paused" and again.resume_after == rec.resume_after
+
+
+def test_a_paused_crew_refuses_to_resume_until_the_reset_then_runs_the_rest(env, tmp_path):
+    from relife import llm_usage
+
+    store, client, _ = env
+    records = CrewRunStore(tmp_path / "crews")
+    _spent()
+    runner = FakeRunner()
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=PAUSE_SPEC, yes=True, echo=lambda s: None,
+        runner=runner, llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=records,
+    )
+    assert rec.status == "paused"
+    with pytest.raises(ValueError, match="still out of quota"):
+        crew_runner.resume_crew(rec, echo=lambda s: None, records=records, store=store, client=client,
+                                runner=runner, llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()))
+    assert rec.status == "paused"
+    llm_usage.reset("free/model")  # the quota reset
+    model = StubModel()
+    done = crew_runner.resume_crew(rec, echo=lambda s: None, records=records, store=store, client=client,
+                                   runner=runner, llm_factory=lambda m: ClaudeMaxLLM(ask_model=model))
+    assert done.status == "done", done.error
+    assert done.resumed == 1 and done.resume_after is None
+    assert [t.name for t in done.tasks] == ["build", "review"]
+    assert len(runner.prompts) == 1  # the builder's task was not run twice
+    # The review read the build's recorded output, fenced as data.
+    assert any("Output of the earlier task 'build'" in p and "built the CSV export" in p for _, p in model.calls)
+    # ...but the review's memory episode says what the task was, not the carried output.
+    episodes = [m.text for m in client.all_memories() if m.text.startswith("[crew task] ")]
+    assert any(e.startswith("[crew task] Review") for e in episodes), episodes
+    assert not any("Output of the earlier task" in e for e in episodes)
+    assert records.get(rec.id).status == "done"
+    with pytest.raises(ValueError, match="only a paused or interrupted crew"):
+        crew_runner.prepare_resume(done, records=records)
+
+
+def test_a_crew_whose_first_model_is_spent_pauses_before_any_work(env, tmp_path):
+    store, client, _ = env
+    _spent()
+    spec = {"goal": "review", "agents": [PAUSE_SPEC["agents"][1]],
+            "tasks": [dict(PAUSE_SPEC["tasks"][1], context=[])]}
+    rec = crew_runner.run_crew(
+        None, workspace=tmp_path, spec_raw=spec, yes=True, echo=lambda s: None,
+        llm_factory=lambda m: ClaudeMaxLLM(ask_model=StubModel()),
+        store=store, client=client, records=CrewRunStore(tmp_path / "crews"),
+    )
+    assert rec.status == "paused" and rec.tasks == []
+    assert crew_runner.remaining_spec(rec).tasks[0].name == "review"

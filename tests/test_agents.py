@@ -71,7 +71,7 @@ def test_profile_normalizes_inherits():
 def test_scope_reads_own_inherited_and_default():
     p = ag.AgentProfile(name="coder", inherits=["alpha"])
     sc = p.scope()
-    assert (sc.write, sc.read, sc.source) == ("coder", ("coder", "alpha", "default"), "coder")
+    assert (sc.write, sc.read, sc.source) == ("coder", ("coder", "alpha", "collective", "default"), "coder")
     iso = ag.AgentProfile(name="ext", isolated=True, inherits=["alpha"]).scope()
     assert "default" not in iso.read
 
@@ -113,7 +113,7 @@ def test_inherit_is_live_read_only_and_transitive(env):
     ag.create_agent(store, client, "alpha")
     ag.create_agent(store, client, "beta", inherit=["alpha"])
     ag.create_agent(store, client, "gamma", inherit=["beta"])
-    assert store.require("gamma").scope().read == ("gamma", "beta", "alpha", "default")
+    assert store.require("gamma").scope().read == ("gamma", "beta", "alpha", "collective", "default")
 
     a = scoped(store, client, "alpha")
     a.save("the API rate limit is 100 requests per minute")
@@ -266,3 +266,87 @@ def test_mcp_config_shapes():
     assert "http" not in cfg  # no token, no HTTP snippet
     cfg = ag.mcp_config("ext", python="/py", home="/h", http_url="http://127.0.0.1:8787/mcp", token="rla_x")
     assert cfg["http"]["mcpServers"]["relife-memory"]["headers"] == {"Authorization": "Bearer rla_x"}
+
+
+# --- collective memory --------------------------------------------------------------
+def test_a_collective_agent_writes_the_shared_pool_everyone_reads(env):
+    store, client, _ = env
+    ag.create_agent(store, client, "scout", memory="collective")
+    ag.create_agent(store, client, "coder")
+    ag.create_agent(store, client, "loner", isolated=True)
+    scout = store.require("scout")
+    assert scout.own_space == "collective" and scout.memory_label == "collective"
+    scoped(store, client, "scout").save("the staging DB lives on port 5433")
+    hits = scoped(store, client, "coder").recall("staging DB port")
+    assert [m.space for m in hits] == ["collective"] and hits[0].source == "scout"
+    assert scoped(store, client, "loner").recall("staging DB port") == []  # isolated reads no pool
+
+
+def test_a_named_collective_is_read_only_by_its_members(env):
+    store, client, _ = env
+    ag.create_agent(store, client, "a1", memory="collective", collective="research")
+    ag.create_agent(store, client, "a2", memory="collective", collective="collective-research")
+    ag.create_agent(store, client, "outsider")
+    assert store.require("a1").own_space == store.require("a2").own_space == "collective-research"
+    assert store.require("a2").collective == "research"
+    scoped(store, client, "a1").save("quarterly churn figures are in churn.csv")
+    assert scoped(store, client, "a2").recall("churn figures csv")
+    assert scoped(store, client, "outsider").recall("churn figures csv") == []
+    ag.attach(store, "outsider", "collective-research")
+    assert scoped(store, client, "outsider").recall("churn figures csv")
+
+
+def test_collective_saves_are_importance_capped(env, monkeypatch):
+    from relife import config
+
+    store, client, _ = env
+    monkeypatch.setattr(config, "COLLECTIVE_MAX_IMPORTANCE", 0.6)
+    ag.create_agent(store, client, "scout", memory="collective")
+    ag.create_agent(store, client, "coder")
+    pool, own = scoped(store, client, "scout"), scoped(store, client, "coder")
+    hi = client.get(pool.save("always use the prod replica for reports", importance=1.0))
+    pref = client.get(pool.save("user prefers tabs over spaces", kind="preference"))  # default 0.7
+    low = client.get(pool.save("the build takes 4 minutes", importance=0.2))
+    assert (hi.importance, pref.importance, low.importance) == (0.6, 0.6, 0.2)
+    assert client.get(own.save("my own note", importance=1.0)).importance == 1.0
+
+
+def test_collective_rules(env):
+    store, client, _ = env
+    with pytest.raises(ValueError, match="collective memory space"):
+        ag.create_agent(store, client, "collective")
+    with pytest.raises(ValueError, match="collective memory space"):
+        ag.create_agent(store, client, "collective-ops")
+    ag.create_agent(store, client, "parent")
+    with pytest.raises(ValueError, match="can't fork"):
+        ag.create_agent(store, client, "kid", memory="collective", fork="parent")
+    with pytest.raises(ValueError):
+        ag.AgentProfile.from_dict({"name": "x", "memory": "collective", "space": "mine"})
+    with pytest.raises(ValueError):
+        ag.AgentProfile.from_dict({"name": "x", "memory": "hive"})
+    with pytest.raises(ValueError):
+        ag.AgentProfile.from_dict({"name": "x", "collective": "ops"})  # individual has none
+    # An old record named like a collective still loads (only new names are refused).
+    assert ag.AgentProfile.from_dict({"name": "collective-x"}).own_space == "collective-x"
+
+
+def test_moving_an_agents_memory_keeps_the_old_home_readable(env):
+    store, client, _ = env
+    ag.create_agent(store, client, "coder")
+    scoped(store, client, "coder").save("the API key rotation runs on fridays")
+    moved = ag.set_memory(store, "coder", "collective", "ops")
+    assert moved.own_space == "collective-ops" and "coder" in moved.inherits
+    agent = scoped(store, client, "coder")
+    assert agent.recall("API key rotation fridays")  # still sees what it learned
+    agent.save("ops runbook is in docs/ops.md")
+    assert client.recall("ops runbook", spaces=["collective-ops"])
+    back = ag.set_memory(store, "coder", "individual")
+    assert back.own_space == "coder" and "collective-ops" in back.inherits
+
+
+def test_deleting_a_collective_member_never_archives_the_pool(env):
+    store, client, _ = env
+    ag.create_agent(store, client, "scout", memory="collective")
+    scoped(store, client, "scout").save("shared fact about deploys")
+    assert ag.delete_agent(store, client, "scout") == 0
+    assert client.recall("shared fact about deploys", spaces=["collective"])

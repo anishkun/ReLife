@@ -6,8 +6,11 @@ terminal scrollback must not be the only copy. One :class:`CrewRunRecord` per
 run at ``data/crews/<id>/record.json``: the task, the validated plan, every
 task's outcome (agent, output, tool count, cost, approvals denied), the final
 output, and status (``planned`` → ``running`` → ``done`` | ``error`` |
-``interrupted``). Atomic writes (tmp + ``os.replace``), ids shaped like
-``RunRecord``'s and checked before they name a file.
+``interrupted`` | ``paused``). ``paused`` means every model a member could use
+was out of quota (``crew/governed.QuotaPaused``): the finished tasks are kept,
+``resume_after`` says when the quota resets, and ``relife crew --resume`` (or
+the server, on its own) runs the rest. Atomic writes (tmp + ``os.replace``),
+ids shaped like ``RunRecord``'s and checked before they name a file.
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ class TaskOutcome:
     cost_usd: float | None = None
     error: str | None = None
     denied: list[dict[str, Any]] = field(default_factory=list)
+    # A CrewAI member's model fallbacks during the task ("gemini/x → claude-max (…)").
+    model_switches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +58,10 @@ class CrewRunRecord:
     # The process running it (set when it starts): a record still "running"
     # whose process is gone was cut off by a crash or shutdown.
     pid: int | None = None
+    # paused: when the quota that stopped it resets, and why it stopped.
+    resume_after: float | None = None
+    paused_reason: str = ""
+    resumed: int = 0  # how many times it was resumed
 
     @staticmethod
     def new_id(now: float | None = None) -> str:

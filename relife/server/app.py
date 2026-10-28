@@ -55,6 +55,7 @@ Endpoints:
   GET    /agents                              → registered agents
   POST   /agents                              → register one (inherit / fork)
   GET    /agents/{name}                       → one agent
+  PATCH  /agents/{name}                       → move its memory home (individual ⇄ collective)
   DELETE /agents/{name}                       → unregister (archives its memory)
   POST   /agents/{name}/attach|detach         → read another agent's memory, or stop
   POST   /agents/{name}/promote               → copy its memories into yours (default)
@@ -62,9 +63,14 @@ Endpoints:
   POST   /crews                               → plan a task (one model call) or record a spec
   GET    /crews/{id}                          → one crew run, with its plan
   POST   /crews/{id}/run                      → run a planned crew → {session_id}
+  POST   /crews/{id}/resume                   → run the rest of a paused/interrupted crew
   POST   /crews/{id}/stop                     → stop a running crew
   DELETE /crews/{id}                          → discard a planned crew
   GET    /budget                              → today's Max spend + the daily cap
+  GET    /llms                                → crew models: limits, learned back-off, usage
+  PUT    /llms/{model}                        → declare a model's limits (rpm/rpd/…/fallback)
+  DELETE /llms/{model}                        → remove a declaration
+  POST   /llms/{model}/reset                  → forget what its 429s taught
 """
 
 from __future__ import annotations
@@ -580,6 +586,8 @@ def create_app(
                 inherit=inherit,
                 fork=body.get("fork") or None,
                 isolated=bool(body.get("isolated", False)),
+                memory=str(body.get("memory") or "individual"),
+                collective=str(body.get("collective") or ""),
             )
 
         try:
@@ -595,6 +603,21 @@ def create_app(
         try:
             a = _agent_store().require(name)
         except LookupError as e:
+            raise _bad(e) from e
+        return _agent_view(a, await off_loop(crews.client.spaces))
+
+    @app.patch("/agents/{name}", dependencies=mutate)
+    async def patch_agent(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Move an agent's memory home: ``{"memory": "individual"|"collective",
+        "collective": "<team>"}`` (its old home stays readable to it)."""
+        if set(body) - {"memory", "collective"}:
+            raise HTTPException(status_code=400, detail="only memory and collective can be changed here")
+        try:
+            a = await off_loop(
+                agents_mod.set_memory, _agent_store(), name,
+                str(body.get("memory") or "individual"), str(body.get("collective") or ""),
+            )
+        except (ValueError, LookupError) as e:
             raise _bad(e) from e
         return _agent_view(a, await off_loop(crews.client.spaces))
 
@@ -650,6 +673,45 @@ def create_app(
         """Today's spend across everything ReLife started, and the cap (if set)."""
         return await off_loop(budget.status)
 
+    # --- crew model limits (llm_limits / llm_usage) ---------------------------------
+    def _llms_view() -> dict[str, Any]:
+        from ..llm_usage import LimitsStore, model_status
+
+        store = LimitsStore()
+        names = list(dict.fromkeys([*store.declared(), *config.CREW_LLMS, config.CREW_CLAUDE_LLM]))
+        return {"models": [model_status(store.match(m)) for m in names], "problem": store.problem}
+
+    @app.get("/llms", dependencies=auth)
+    async def llms_route() -> dict[str, Any]:
+        """Each crew model's declared/learned limits and its recent usage."""
+        return await off_loop(_llms_view)
+
+    @app.put("/llms/{model:path}", dependencies=mutate)
+    async def llm_put(model: str, request: Request) -> dict[str, Any]:
+        from ..llm_usage import LimitsStore, model_status
+
+        body = await request.json()
+        try:
+            lim = await off_loop(lambda: LimitsStore().set(model, body))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return await off_loop(lambda: model_status(lim))
+
+    @app.delete("/llms/{model:path}", dependencies=mutate)
+    async def llm_delete(model: str) -> dict[str, Any]:
+        from ..llm_usage import LimitsStore
+
+        if not await off_loop(lambda: LimitsStore().remove(model)):
+            raise HTTPException(status_code=404, detail=f"no limits declared for {model!r}")
+        return {"ok": True}
+
+    @app.post("/llms/{model:path}/reset", dependencies=mutate)
+    async def llm_reset(model: str) -> dict[str, Any]:
+        from .. import llm_usage
+
+        await off_loop(lambda: llm_usage.reset(model))
+        return {"ok": True}
+
     def _crew_view(rec: Any, *, full: bool = False) -> dict[str, Any]:
         from ..crew.runner import describe_plan
 
@@ -660,9 +722,11 @@ def create_app(
             d["plan"] = []
         d["session_id"] = crews.session_id(rec.id)
         host = crews.host(rec.id)
-        if host is not None and host.busy and d["status"] == "planned":
-            # Started, but the worker thread hasn't saved "running" yet: the
-            # host is the truth (otherwise the UI offers "run" on a live crew).
+        if host is not None and host.busy and d["status"] in ("planned", "paused", "interrupted"):
+            # Started, but the worker thread hasn't saved "running" yet — or it
+            # has saved "paused" and the host is still winding down: the host is
+            # the truth (otherwise the UI offers "run"/"resume" on a live crew,
+            # and a resume then is refused as already running).
             d["status"] = "running"
         if not full:
             for t in d["tasks"]:
@@ -684,6 +748,8 @@ def create_app(
             "crewai": crewai_available(),
             "hint": None if crewai_available() else CREWAI_HINT,
             "llms": [config.CREW_CLAUDE_LLM, *config.CREW_LLMS],
+            # Does this server resume a quota-paused crew by itself (the scheduler's tick)?
+            "auto_resume": bool(tick and config.CREW_AUTO_RESUME),
         }
 
     @app.post("/crews", dependencies=mutate, status_code=201)
@@ -715,6 +781,21 @@ def create_app(
         _budget_or_429("a crew")
         try:
             host = await crews.start(crew_id)
+        except CrewUnavailable as e:
+            raise HTTPException(status_code=501, detail=str(e)) from e
+        except (CrewLimitReached, SessionLimitReached) as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"session_id": host.id, "crew_id": crew_id}
+
+    @app.post("/crews/{crew_id}/resume", dependencies=mutate)
+    async def resume_crew_route(crew_id: str) -> dict[str, Any]:
+        """Run the rest of a crew that paused (out of quota) or was interrupted."""
+        _crew_or_404(crew_id)
+        _budget_or_429("a crew")
+        try:
+            host = await crews.resume(crew_id)
         except CrewUnavailable as e:
             raise HTTPException(status_code=501, detail=str(e)) from e
         except (CrewLimitReached, SessionLimitReached) as e:

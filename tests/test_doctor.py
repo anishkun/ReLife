@@ -294,6 +294,22 @@ def test_crews_check_explains_python_314():
     assert by_name(run_checks(healthy()))["crews"].status == "ok"
 
 
+def test_model_limits_check():
+    assert by_name(run_checks(healthy()))["model limits"].status == "skip"
+    known = {"model": "gemini/flash", "declared": True, "state": "ok", "tightness": "tight", "until": None}
+    c = by_name(run_checks(healthy(llms=[known])))["model limits"]
+    assert c.status == "ok" and "1 tight" in c.detail
+    guessed = {"model": "gpt-4.1", "declared": False, "state": "ok", "tightness": "ample", "until": None}
+    local = {"model": "ollama/llama3.1", "declared": False, "state": "ok", "tightness": "ample", "until": None}
+    c = by_name(run_checks(healthy(llms=[known, guessed, local])))["model limits"]
+    assert c.status == "warn" and "gpt-4.1" in c.detail and "ollama" not in c.detail
+    assert "relife llm set" in c.fix
+    spent = dict(known, state="exhausted", until=1_700_000_000.0)
+    c = by_name(run_checks(healthy(llms=[spent])))["model limits"]
+    assert c.status == "warn" and "out of quota: gemini/flash" in c.detail
+    assert by_name(run_checks(healthy(llms_problem="unreadable")))["model limits"].status == "warn"
+
+
 def test_agents_check():
     assert by_name(run_checks(healthy()))["agents"].status == "skip"
     agents = [

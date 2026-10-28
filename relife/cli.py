@@ -751,10 +751,29 @@ def agent_list() -> None:
         typer.secho(f"{a.runtime:<9}", fg=typer.colors.CYAN, nl=False)
         reads = ", ".join(a.scope().read[1:]) or "nothing else"
         typer.echo(
-            f"{n:>4} memories in {a.own_space}  · reads {reads}"
+            f"{n:>4} memories in {a.own_space} ({a.memory_label})  · reads {reads}"
             + (f"  · {a.model}" if a.model else "")
             + ("  · token" if a.token_hash else "")
         )
+
+
+@agent_app.command("set")
+def agent_set(
+    name: str = typer.Argument(..., help="Agent name."),
+    memory: str = typer.Option(..., "--memory", help="individual | collective"),
+    collective: str = typer.Option("", "--collective", help="With --memory collective: which team's pool."),
+) -> None:
+    """Move an agent's memory home (its old one stays readable to it)."""
+    from .agents import set_memory
+
+    store, _ = _agents()
+    try:
+        a = set_memory(store, name, memory, collective)
+    except (ValueError, LookupError) as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2) from e
+    typer.secho(f"{a.name}: {a.memory_label} memory — writes {a.own_space}", fg=typer.colors.GREEN)
+    typer.echo(f"  reads:  {', '.join(a.scope().read)}")
 
 
 @agent_app.command("create")
@@ -779,6 +798,14 @@ def agent_create(
         False, "--isolated", help="Don't let it read your main (default) memory — e.g. an external "
         "agent whose model provider shouldn't see it."
     ),
+    memory: str = typer.Option(
+        "individual", "--memory",
+        help="individual = a memory of its own · collective = write the shared pool every agent reads "
+        "(for an agent on a free-tier model, or one that needs no private history).",
+    ),
+    collective: str = typer.Option(
+        "", "--collective", help="With --memory collective: a team's own pool (collective-NAME) instead of the global one."
+    ),
 ) -> None:
     """Register an agent and hand it memory from older agents."""
     from .agents import create_agent
@@ -789,6 +816,7 @@ def agent_create(
             store, client, name,
             runtime=runtime, model=model, description=description,
             inherit=list(inherit or []), fork=fork, space=space, isolated=isolated,
+            memory=memory, collective=collective,
         )
     except (ValueError, LookupError) as e:
         typer.secho(f"error: {e}", fg=typer.colors.RED)
@@ -986,9 +1014,16 @@ def _crewai_or_exit() -> None:
 
 @app.command("crew")
 def crew_cmd(
-    task: Optional[str] = typer.Argument(None, help="What the crew should get done, in plain language."),
+    task: Optional[str] = typer.Argument(
+        None, help="What the crew should get done, in plain language (with --resume: the crew id)."
+    ),
     spec: Optional[Path] = typer.Option(
         None, "--spec", help="Run your own crew plan (JSON or YAML) instead of having one planned."
+    ),
+    resume: bool = typer.Option(
+        False, "--resume",
+        help="Run the rest of a crew that paused (its models were out of quota) or was interrupted — "
+        "the given id, or the most recent one.",
     ),
     plan_only: bool = typer.Option(False, "--plan-only", help="Plan and show the crew, but don't run it."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Run without asking to confirm the plan."),
@@ -1004,29 +1039,46 @@ def crew_cmd(
     from .crew.runner import run_crew
     from .crew.spec import load_spec_file
 
-    if not task and spec is None:
-        typer.secho('give a task, or --spec FILE', fg=typer.colors.RED)
-        raise typer.Exit(2)
-    if not (spec is not None and plan_only):  # a given spec, only shown, spends nothing
+    if resume:
+        from .crew.record import CrewRunStore
+        from .crew.runner import RESUMABLE, resume_crew
+
+        runs = CrewRunStore()
+        rec = runs.get(task) if task else next((r for r in runs.list(50) if r.status in RESUMABLE), None)
+        if rec is None:
+            typer.secho(f"no crew run {task!r}" if task else "no paused or interrupted crew to resume",
+                        fg=typer.colors.RED)
+            raise typer.Exit(1)
         _budget_gate("a crew")
-    ws = _resolve_workspace(workspace)
-    try:
-        raw = load_spec_file(spec) if spec is not None else None
-        record = run_crew(
-            task,
-            workspace=ws,
-            spec_raw=raw,
-            plan_only=plan_only,
-            yes=yes,
-            echo=typer.echo,
-            confirm=lambda q: typer.confirm(q, default=False),
-        )
-    except (ValueError, OSError) as e:
-        typer.secho(f"error: {e}", fg=typer.colors.RED)
-        raise typer.Exit(2) from e
+        try:
+            record = resume_crew(rec, echo=typer.echo, records=runs)
+        except ValueError as e:
+            typer.secho(str(e), fg=typer.colors.YELLOW)
+            raise typer.Exit(1) from e
+    else:
+        if not task and spec is None:
+            typer.secho('give a task, or --spec FILE', fg=typer.colors.RED)
+            raise typer.Exit(2)
+        if not (spec is not None and plan_only):  # a given spec, only shown, spends nothing
+            _budget_gate("a crew")
+        ws = _resolve_workspace(workspace)
+        try:
+            raw = load_spec_file(spec) if spec is not None else None
+            record = run_crew(
+                task,
+                workspace=ws,
+                spec_raw=raw,
+                plan_only=plan_only,
+                yes=yes,
+                echo=typer.echo,
+                confirm=lambda q: typer.confirm(q, default=False),
+            )
+        except (ValueError, OSError) as e:
+            typer.secho(f"error: {e}", fg=typer.colors.RED)
+            raise typer.Exit(2) from e
     if record.status in ("planned", "cancelled"):
         return
-    color = typer.colors.GREEN if record.status == "done" else typer.colors.RED
+    color = {"done": typer.colors.GREEN, "paused": typer.colors.YELLOW}.get(record.status, typer.colors.RED)
     typer.secho(
         f"\ncrew {record.id}: {record.status} · {len(record.tasks)} task(s) · "
         f"usage-equiv ${record.cost_usd:.2f}" + (f" · {record.error}" if record.error else ""),
@@ -1073,6 +1125,11 @@ def crews_cmd(
     from .crew.spec import CrewSpec
 
     typer.secho(f"crew {r.id} — {r.status} · usage-equiv ${r.cost_usd:.2f}", bold=True)
+    if r.status == "paused":
+        typer.secho(
+            f"paused: {r.paused_reason}\n  resume after {_when(r.resume_after)}: relife crew --resume {r.id}",
+            fg=typer.colors.YELLOW,
+        )
     typer.echo(f"task: {r.task}\nworkspace: {r.workspace}")
     for line in describe_plan(CrewSpec.from_dict(r.spec)):
         typer.echo(line)
@@ -1080,9 +1137,110 @@ def crews_cmd(
         typer.secho(f"\n## {t.name} ({t.agent}, {t.runtime})", bold=True)
         if t.error:
             typer.secho(f"error: {t.error}", fg=typer.colors.RED)
+        if t.model_switches:
+            typer.secho("models: " + "; ".join(t.model_switches), fg=typer.colors.YELLOW)
         typer.echo(t.output or "(no output)")
     if r.error:
         typer.secho(f"\nerror: {r.error}", fg=typer.colors.RED)
+
+
+llm_app = typer.Typer(
+    help="Model limits: how fast each crew model may be called (pacing, fallback, learned back-off)."
+)
+app.add_typer(llm_app, name="llm")
+
+
+def _when(ts: float | None) -> str:
+    import time as _time
+
+    return _time.strftime("%H:%M", _time.localtime(ts)) if ts else ""
+
+
+@llm_app.command("list")
+def llm_list() -> None:
+    """Declared + learned limits and the last day's usage of every known model."""
+    from .llm_limits import describe
+    from .llm_usage import LimitsStore, model_status
+
+    store = LimitsStore()
+    if store.problem:
+        typer.secho(f"llm_limits.json: {store.problem}", fg=typer.colors.YELLOW)
+    models = list(dict.fromkeys([*store.declared(), *config.CREW_LLMS, config.CREW_CLAUDE_LLM]))
+    for m in models:
+        lim = store.match(m)
+        st = model_status(lim)
+        typer.secho(f"  {m:<32}", bold=True, nl=False)
+        typer.echo(describe(lim) + (f" → {', '.join(lim.fallback)}" if lim.fallback else ""))
+        state = {"ok": "", "cooling": f"  · cooling down until {_when(st['until'])}",
+                 "exhausted": f"  · out of quota until {_when(st['until'])}"}[st["state"]]
+        slowed = f"  · paced at {st['factor']:.0%} after 429s" if st["factor"] < 1 else ""
+        typer.secho(
+            f"  {'':<32}{st['calls_last_minute']} calls last minute · {st['calls_last_day']} today"
+            f" · {st['tightness']}{slowed}{state}",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+    if not store.declared():
+        typer.secho(
+            "\nno limits declared — undeclared remote models are paced at "
+            f"{config.LLM_DEFAULT_RPM or 'no'} rpm.\n"
+            "  relife llm set MODEL --rpm 10 --rpd 250 --fallback claude-max",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+
+
+@llm_app.command("set")
+def llm_set(
+    model: str = typer.Argument(
+        ..., help="Model string as a crew names it (gemini/gemini-2.0-flash), or a glob (openrouter/*:free)."
+    ),
+    rpm: Optional[int] = typer.Option(None, "--rpm", help="Requests per minute."),
+    rpd: Optional[int] = typer.Option(None, "--rpd", help="Requests per day."),
+    tpm: Optional[int] = typer.Option(None, "--tpm", help="Tokens per minute."),
+    tpd: Optional[int] = typer.Option(None, "--tpd", help="Tokens per day."),
+    tier: str = typer.Option("unknown", "--tier", help="free | paid | local | subscription | unknown."),
+    fallback: Optional[list[str]] = typer.Option(
+        None, "--fallback", help="Model to switch to when this one's quota is spent (repeatable, in order)."
+    ),
+    max_wait: Optional[float] = typer.Option(
+        None, "--max-wait", help="Seconds to wait for a reset before falling back / pausing."
+    ),
+    headroom: float = typer.Option(0.8, "--headroom", help="Pace per-minute limits at this fraction (0.1-1)."),
+) -> None:
+    """Declare (replace) a model's limits."""
+    from .llm_limits import describe
+    from .llm_usage import LimitsStore
+
+    values = {"rpm": rpm, "rpd": rpd, "tpm": tpm, "tpd": tpd, "tier": tier,
+              "fallback": fallback or [], "max_wait_s": max_wait, "headroom": headroom}
+    try:
+        lim = LimitsStore().set(model, values)
+    except ValueError as e:
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(2) from e
+    typer.secho(
+        f"{lim.model}: {describe(lim)}" + (f" → {', '.join(lim.fallback)}" if lim.fallback else ""),
+        fg=typer.colors.GREEN,
+    )
+
+
+@llm_app.command("unset")
+def llm_unset(model: str = typer.Argument(...)) -> None:
+    """Remove a model's declared limits (it falls back to the defaults)."""
+    from .llm_usage import LimitsStore
+
+    if not LimitsStore().remove(model):
+        typer.secho(f"no limits declared for {model!r}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(f"{model}: limits removed", fg=typer.colors.GREEN)
+
+
+@llm_app.command("reset")
+def llm_reset(model: str = typer.Argument(...)) -> None:
+    """Forget what was learned from a model's 429s (back-off, cooldown, out-of-quota)."""
+    from . import llm_usage
+
+    llm_usage.reset(model)
+    typer.secho(f"{model}: learned limits cleared", fg=typer.colors.GREEN)
 
 
 @app.command("mcp")

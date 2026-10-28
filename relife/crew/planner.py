@@ -53,10 +53,21 @@ def system_prompt() -> str:
     )
 
 
-def planner_prompt(task: str, roster: list[dict[str, Any]], llms: tuple[str, ...]) -> str:
-    """The user turn: available models, existing agents, and the fenced task."""
+def planner_prompt(
+    task: str, roster: list[dict[str, Any]], llms: tuple[str, ...], limits: Any = None
+) -> str:
+    """The user turn: available models (with their limits — a free tier changes
+    how much work a model should be given), existing agents, and the fenced task.
+    ``limits`` is a ``LimitsStore`` (default: the user's file)."""
+    from ..llm_limits import describe, tightness
+    from ..llm_usage import LimitsStore
+
+    limits = limits or LimitsStore()
     models = [f"- `{config.CREW_CLAUDE_LLM}` — Claude via the user's subscription (no tools)"]
-    models += [f"- `{m}`" for m in llms]
+    for m in llms:
+        lim = limits.match(m)
+        tight = " — **tight limits**" if tightness(lim) == "tight" else ""
+        models.append(f"- `{m}` ({describe(lim)}){tight}")
     if roster:
         agents = "\n".join(
             f"- `{a['name']}` ({a['runtime']}{', ' + a['model'] if a.get('model') else ''}): "
@@ -78,6 +89,7 @@ async def plan_crew(
     roster: list[dict[str, Any]],
     ask_model: AskModel | None = None,
     llms: tuple[str, ...] | None = None,
+    limits: Any = None,
 ) -> tuple[CrewSpec, list[str], float]:
     """Plan a crew for ``task``. Returns ``(spec, notes, cost_usd)``; ``notes``
     says if a retry or the single-agent fallback was needed."""
@@ -88,7 +100,7 @@ async def plan_crew(
     llms = config.CREW_LLMS if llms is None else llms
     existing = {a["name"] for a in roster}
     system = system_prompt()
-    prompt = planner_prompt(task, roster, llms)
+    prompt = planner_prompt(task, roster, llms, limits)
     notes: list[str] = []
     cost = 0.0
     for attempt in range(2):

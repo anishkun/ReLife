@@ -17,12 +17,13 @@
 > pre-approved actions). M13–M15 are the *platform* layer (many agents with their own
 > memory, memory for any LLM over MCP, CrewAI crews staffed with ReLife agents). M16
 > is the synthesis — read it last, and re-read it whenever you make an architectural
-> change. Line references were taken at the platform pass (commit `a53ef91`) and may
-> have drifted by a few lines since; the hardening, scaling and durability passes that
-> followed (PRs #9 and #10) are folded into the modules they changed — M5, M6, M8, M9,
-> M10, M11, M13, M15 and M16; the gated machine tools for other models are in M15. The
-> test suite is **~920–950 deterministic tests** — 922 on
-> Python 3.14, 948 in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
+> change. Line references were re-checked against the code on 2026-10-14 (after commit
+> `6669a18`) and will drift as the code changes; the hardening, scaling and durability
+> passes (PRs #9 and #10) are folded into the modules they changed — M5, M6, M8, M9,
+> M10, M11, M13, M15 and M16; the gated machine tools, model limits and crew
+> pause/resume are in M15. The test suite is **~980–1,020 deterministic tests** (4 of
+> them `semantic`) — on 2026-10-14, 969 passed + 13 skipped on Python 3.14, and 1,016
+> passed + 1 skipped in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
 
@@ -99,7 +100,7 @@ Everything else follows from that bet. If the moat is accumulated experience, th
 ReLife runs on the **Claude Code Max subscription** — the logged-in `claude` CLI —
 **not** a metered `ANTHROPIC_API_KEY`. The key is *intentionally unset*; the SDK
 drives the CLI that is already authenticated against Max. (`relife doctor` even
-**warns if the key is set**, `doctor.py:233` — a key in the env would silently bill
+**warns if the key is set**, `doctor.py:266` — a key in the env would silently bill
 metered usage instead.)
 
 This is not a minor deployment detail. It is the single biggest force on the
@@ -155,13 +156,17 @@ schedule at 09:00 with nobody watching.
 ```
 relife/
   cli.py            entry point: do / chat / work / build / serve / doctor / consolidate / dream /
-                    memory * / agent * / mcp / crew / crews  (+ __main__.py: `python -m relife`)
+                    memory * / agent * / mcp / crew / crews / llm *  (+ __main__.py: `python -m relife`)
   agent.py          build_options() + the streaming SDK loop + to_event() + ask_model_oneshot
   permissions.py    classify() pure policy + grants + TTY callback + UI approval callback
   hooks.py          UserPromptSubmit/PostToolUse/Stop lifecycle hooks (per-client factory)
   agents.py         the agent registry: identity → memory scope; inherit/fork/promote; MCP tokens
   workitems.py      `relife work`: GitHub issue plumbing around the agent (deterministic)
   doctor.py         `relife doctor`: pure run_checks() over injected Probes
+  budget.py         spend ledger (data/spend.db) + the optional daily cap
+  llm_limits.py     pure: per-model limits, decide() go/wait/exhausted, provider-error reading
+  llm_usage.py      model-call ledger (data/llm_usage.db) + declared limits (LimitsStore)
+  _atomic.py / _filelock.py / _proc.py   Windows-safe replace, OS file lock, pid_alive
   config.py         every path, model id, env knob and tunable in one place
   prompts/          system.md (persona), rem.md
   web/index.html    the self-contained browser console (vanilla JS + EventSource)
@@ -184,6 +189,8 @@ relife/
     server.py       in-process SDK MCP server for Claude (built from tools.py)
     mcp_server.py   standalone MCP server for any agent: stdio + streamable HTTP
     _text.py        shared stopword tokenizer
+    _sqlite.py      per-thread cached SQLite connections (WAL)
+    _procedure.py   skill/workflow bounds (header_value, size caps) + mtime-keyed parse cache
   crew/             `relife crew` ([crewai] extra; Python ≤ 3.13)
     spec.py         pure: CrewSpec + normalize_spec (the plan's validator)
     planner.py      one tool-less Claude call → JSON plan (retry, then fallback)
@@ -192,6 +199,10 @@ relife/
     llm.py          ClaudeMaxLLM(BaseLLM): Claude via the CLI for CrewAI agents
     native.py       CrewAI agents on other models, with ReLife memory attached
     memory_tools.py ReLife memory tools as CrewAI BaseTools (same specs)
+    memory_policy.py pure: a member's memory mode (individual/collective) + access (full/lean)
+    machine.py      pure: gated file/shell tools for other models (each call asks the policy)
+    machine_tools.py those tools as CrewAI BaseTools
+    governed.py     GovernedLLM: every crew model call paced under its limits, with fallback
     build.py        profiles (handoff) + Crew assembly
     runner.py       run_crew(): plan → record → confirm → kickoff → outcomes
     record.py       CrewRunRecord + CrewRunStore (data/crews/<id>/)
@@ -209,6 +220,7 @@ relife/
     schedules.py    Schedule record + cadence math + JSON ScheduleStore
     scheduler.py    the tick loop: fire due schedules, record outcomes
     runs.py         RunRecord + summarize_events() + RunStore
+    crews.py        CrewHost (a crew run hosted like a session) + CrewService
 ```
 
 Notice the **rhyme**: every layer has a *pure policy/math module* (`cognitive.py`,
@@ -235,11 +247,11 @@ cli.py (parse command, resolve workspace)
                → _maybe_consolidate()  (the "sleep" beat, after the run)
 ```
 
-Look at `cli.py:do` (`cli.py:65`): it resolves the workspace, builds the
+Look at `cli.py:do` (`cli.py:78`): it resolves the workspace, builds the
 `can_use_tool` callback bound to that workspace, gets the default MCP servers, gets
 the memory hooks, and hands all three to `run_task`. `chat` and `build` do the same
-with their own variations — and so does the server's `AgentSession.start()`
-(`server/session.py:135`), which is the same three pieces with a *different
+with their own variations — and so does the server's `AgentSession._options()`
+(`server/session.py:257`), which is the same three pieces with a *different
 permission callback*. **The CLI's whole job is to assemble three pluggable pieces
 and start the loop.**
 
@@ -273,7 +285,7 @@ Two non-obvious but important choices live here:
   connectors, which the CLI attaches from the account, not from settings — M11.)
 - `env=config.agent_env()` (`agent.py:99`) — prepend the GitHub CLI dir to PATH for
   the agent subprocess, but *only* when `gh` isn't already resolvable (see
-  `config.agent_env`, `config.py:281`). This exists because `gh` was winget-installed
+  `config.agent_env`, `config.py:325`). This exists because `gh` was winget-installed
   mid-session and wasn't on PATH for the already-running shell.
 
 ### Why this is a *seam* (the injection design)
@@ -312,7 +324,7 @@ permission callback. A permission decision is an *interactive round-trip* mid-ru
 ("can I use this tool?" → "yes/no"), which only the **streaming transport**
 (`ClaudeSDKClient` + `receive_response()`) supports.
 
-So `run_task` (`agent.py:335`) uses `ClaudeSDKClient` explicitly, and its docstring
+So `run_task` (`agent.py:337`) uses `ClaudeSDKClient` explicitly, and its docstring
 says exactly why. This even applies to the deny-everything case:
 `ask_model_oneshot` (`agent.py:111`) — used by the REM pass for a pure text-in/
 text-out judgment — attaches `_deny_all_tools` (`agent.py:106`) as its
@@ -322,14 +334,14 @@ which forces streaming.
 
 ### `to_event()` — one taxonomy, two renderers
 
-`to_event(msg)` (`agent.py:143`) is a **pure** function mapping one streamed SDK
+`to_event(msg)` (`agent.py:145`) is a **pure** function mapping one streamed SDK
 message to zero-or-more JSON-serializable events: `text`, `thinking`, `tool_use`,
 `tool_result`, `result`. It is the *single source* of the streaming taxonomy. The
-terminal `_render` (`agent.py:183`) consumes it, and so does the server's SSE stream
-(`server/session.py:264`) — so what the browser sees and what the terminal prints
+terminal `_render` (`agent.py:185`) consumes it, and so does the server's SSE stream
+(`server/session.py:381`) — so what the browser sees and what the terminal prints
 can't drift.
 
-The trap it encodes (`agent.py:151`): **tool results arrive on a `UserMessage`, not
+The trap it encodes (`agent.py:153`): **tool results arrive on a `UserMessage`, not
 the assistant one.** The CLI reports each result as a `user`-type frame carrying
 `ToolResultBlock`s. Walking only `AssistantMessage` — the obvious thing — made the
 UI stream every tool *call* and never a single *result*. Text on a `UserMessage` is
@@ -338,12 +350,12 @@ on submit — which M10's run recorder relies on).
 
 ### `maybe_consolidate` — one decision, two callers
 
-`maybe_consolidate()` (`agent.py:210`) is the "sleep beat": it asks the memory
+`maybe_consolidate()` (`agent.py:212`) is the "sleep beat": it asks the memory
 client to *decide and run* the throttle in one call (`client.maybe_consolidate()`).
-The CLI flavour `_maybe_consolidate()` (`agent.py:259`) runs it inline and prints a
-note; the server flavour `maybe_consolidate_off_loop()` (`agent.py:245`) runs it on
+The CLI flavour `_maybe_consolidate()` (`agent.py:261`) runs it inline and prints a
+note; the server flavour `maybe_consolidate_off_loop()` (`agent.py:247`) runs it on
 a worker thread because inline it froze every session's stream (M9). A
-process-wide **non-blocking** `threading.Lock` (`agent.py:207`) means two sessions
+process-wide **non-blocking** `threading.Lock` (`agent.py:209`) means two sessions
 finishing together don't sweep the same store twice — the loser just gets `None`
 and the throttle fires again next turn. Why the decision lives on the memory side
 rather than here is an M8 lesson.
@@ -351,11 +363,13 @@ rather than here is an M8 lesson.
 ### `ask_model_oneshot` — the SDK-touching escape hatch
 
 `ask_model_oneshot(system_prompt, prompt)` (`agent.py:111`) runs the model with **no
-tools, no MCP, no hooks** and returns `(text, cost_usd)`. It exists for one caller:
-the REM "dream" pass, which needs the model as a *pure advisor* with zero ability to
-take action. Tools are hard-denied, so the call can never touch the filesystem or do
-anything but emit text. The cost is read off the `ResultMessage` so REM can report
-spend.
+tools, no MCP, no hooks** and returns `(text, cost_usd)`. It has three callers, all
+of which need the model as a *pure advisor* with zero ability to take action: the REM
+"dream" pass (`rem._default_ask_model`), the crew planner (`crew/planner.plan_crew`)
+and `ClaudeMaxLLM`, Claude for CrewAI (M15). Tools are hard-denied, so the call can
+never touch the filesystem or do anything but emit text. The cost is read off the
+`ResultMessage`, so callers can report spend, and recorded in the spend ledger
+(`budget.record`, M11) — a fresh client per call, so its total is that call's cost.
 
 > M2 mastery check: cli wires 3 pieces → `build_options` assembles them → streaming
 > client runs the loop; the injection seam buys testability + persona swap + the
@@ -396,13 +410,16 @@ inputs it always returns the same decision. That's what makes the security polic
 unit-testable in isolation, without ever spinning up an agent. Two wrappers turn the
 pure decision into the SDK's async `can_use_tool`:
 
-- `make_permission_callback()` (`permissions.py:896`) — the **TTY** path: prompts
+- `make_permission_callback()` (`permissions.py:917`) — the **TTY** path: prompts
   y/n for ask cases.
-- `make_approval_callback()` (`permissions.py:945`) — the **UI** path: pushes ask
+- `make_approval_callback()` (`permissions.py:968`) — the **UI** path: pushes ask
   cases to a broker that shows a card in the browser and awaits the click (M9).
 
 Both call `classify()` verbatim. **There is exactly one policy source**; the
-wrappers differ only in *who gets asked*.
+wrappers differ only in *who gets asked*. (Both take a `policy=` that defaults to
+`classify` and may only be *stricter*: `classify_confined`, for the machine tools of
+a crew member on another model, is `classify()` plus "a read outside the workspace
+asks" — M15.)
 
 The classification order (`permissions.py:589`):
 
@@ -539,13 +556,13 @@ nobody thought of fall to "ask."
 An unattended run has nobody at the approval card, so "summarize my inbox and email
 me the digest" could never finish. A schedule may therefore carry **grants** —
 narrow, user-set pre-approvals — and they are the only place the policy is widened
-on purpose, so they are pure and fail-closed (`permissions.py:667–895`):
+on purpose, so they are pure and fail-closed (`permissions.py:664–914`):
 
 - **Kinds:** `email` (Gmail send/reply/forward/draft) and `calendar` (create-event),
   each bound to ≤ `GRANT_MAX_ADDRESSES` (5) listed addresses; and `pull_request`
-  (M12). `normalize_grants` (`:711`) validates a grant in full or drops it — a
+  (M12). `normalize_grants` (`:732`) validates a grant in full or drops it — a
   hand-edited grant is never *widened* by a lenient parse.
-- **`grant_allows(grants, tool, input)`** (`:858`) is consulted **only after
+- **`grant_allows(grants, tool, input)`** (`:879`) is consulted **only after
   `classify()` said ask**, and covers only connector calls (plus the one bound
   `gh pr create` shape). Destructive operations (`_GRANT_NEVER`: delete, modify,
   share…) are excluded even when the operation also matches the grant's shape.
@@ -572,7 +589,10 @@ not on an enumerated list:
 
 - `_CONNECTOR_WRITE` (`send|create|delete|modify|reply|forward|draft|label|…`) → ask.
 - `_CONNECTOR_READ` (`search|list|get|read|fetch|find|…` plus `authenticate`) → allow.
-- Neither → ask. **Both → the write check wins** (it's tested first).
+- Neither → ask. **Both → the write check wins** (it's tested first). The one
+  exception is checked before it: reading drafts (`get_draft`, `list_drafts`, …
+  `_CONNECTOR_READ_DRAFT`) is a read, although `draft` is also a write verb
+  (`create_draft`).
 
 The `authenticate`/`complete_authentication` allowance matters: linking a Google
 account is a read-only handshake that opens a browser, and asking for it would just
@@ -581,21 +601,24 @@ add friction to something that can't send anything.
 ### The approval prompt shows *what*, not just *that*
 
 An "approve?" line with a blank tool name is worthless for an email. So both
-wrappers render `agent._tool_brief(tool_input, limit=400)` (`agent.py:266`): the
+wrappers render `agent._tool_brief(tool_input, limit=400)` (`agent.py:268`): the
 obvious key for built-ins (`command`, `file_path`, `url`…), and for a connector call
-— which has none of those — the **leading scalar fields** (`to=… subject=…`). The user
-approves a concrete recipient and subject, not a mystery.
+— which has none of those — up to four fields, **recipient fields first** (`to`, `cc`,
+`attendees`…, lists and `{email: …}` objects flattened), then the rest in order
+(`to=… subject=…`). Recipients go first because Gmail's `create_draft` lists `to`
+after subject and body, and a brief built from leading fields showed the subject but
+never the recipient. The user approves a concrete recipient and subject, not a mystery.
 
 ### Non-interactive runs deny, never block
 
 `make_permission_callback` defaults `interactive` to whether stdin is a TTY. In a
-non-interactive run, ask-cases are **denied**, not blocked (`permissions.py:927`).
+non-interactive run, ask-cases are **denied**, not blocked (`permissions.py:950`).
 This means an unattended run *never hangs waiting for input* and *never takes an
-unapproved outward action* — it just declines and moves on. (A ReLife crew member,
-M15, runs with this TTY callback too: approvals surface in the terminal that started
-the crew.) There's even a defense
+unapproved outward action* — it just declines and moves on. (Under `relife crew`, a
+ReLife crew member — M15 — runs with this TTY callback too: approvals surface in the
+terminal that started the crew. Under the server, they are browser cards.) There's even a defense
 for a pseudo-TTY where `isatty()` lies: if reading the prompt raises, it **fails
-closed → deny** (`permissions.py:933`). The UI path has the same shape with a timer:
+closed → deny** (`permissions.py:956`). The UI path has the same shape with a timer:
 no click within `AGENT_APPROVAL_TIMEOUT` → deny (M9). The scheduler inherits it for
 free: nobody watching ⇒ timeout ⇒ deny (M10). **One rule, three surfaces.**
 
@@ -675,10 +698,10 @@ Two subtle decisions:
   meaningless.
 - **Importance double-counts on purpose.** Importance influences recall through *two*
   paths: it lifts `activation()` (slowing forgetting) **and** it's a standalone term
-  via `W_IMP`. This is intentional and documented at `config.py:86`: importance
+  via `W_IMP`. This is intentional and documented at `config.py:88`: importance
   should *both* slow forgetting *and* act as a direct relevance signal.
 
-The per-kind prior (`KIND_RECALL_BOOST`, `config.py:98`) gives durable kinds
+The per-kind prior (`KIND_RECALL_BOOST`, `config.py:100`) gives durable kinds
 (`preference` +0.05, `pattern` +0.02) a gentle edge at equal evidence — mirroring how
 stable knowledge stays more accessible than one-off episodes.
 
@@ -724,27 +747,27 @@ tier is what `relife memory forget` and REM's `prune` use (M6, M11) — **every
 
 `store.py` is the persistence + retrieval layer: SQLite-backed facts, preferences,
 episodes, and patterns whose relevance behaves like M4 describes. The store is an
-**injectable class** `MemoryStore(db_path)` (`store.py:119`); module-level
+**injectable class** `MemoryStore(db_path)` (`store.py:142`); module-level
 `save`/`recall`/… are back-compat shims over a lazily-built default instance bound to
-`_DB_PATH` (`store.py:40`). `_DB_PATH` stays a reassignable global so tests can point
+`_DB_PATH` (`store.py:42`). `_DB_PATH` stays a reassignable global so tests can point
 the default at an isolated database — and the default is rebuilt whenever it changes
-(`_store()`, `store.py:696`). That reassignable global is also, as M8 shows, exactly
+(`_store()`, `store.py:755`). That reassignable global is also, as M8 shows, exactly
 how the daemon binds everything to one DB.
 
 ### Schema and migrations
 
-One table, `memories` (`_create_schema`, `store.py:174`), with the cognitive columns:
+One table, `memories` (`_create_schema`, `store.py:192`), with the cognitive columns:
 `importance`, `last_used_at`, `use_count`, `status`, `embedding` (a BLOB of packed
 floats) — and, since schema **v3**, `space` (which agent's memory this is; default
 `'default'`) and `source` (provenance: who wrote it, or `import:<space>`), indexed
 `memories_space(space, status)`. Schema version is tracked via **`PRAGMA
-user_version`** (`store.py:159`) with ordered migrations:
+user_version`** (`init_db`, `store.py:174`) with ordered migrations:
 
 - `version == 0` covers three cases at once (fresh DB, a v1 store, or a v2 store that
   never had the pragma set): create the table if absent, idempotently add the v2
-  columns (`_migrate_to_v2`, `store.py:193`), backfill `last_used_at` from
+  columns (`_migrate_to_v2`, `store.py:211`), backfill `last_used_at` from
   `created_at`, and stamp **v2** — not the current version.
-- `_apply_migrations()` (`store.py:215`) then runs every later step in order (v3 adds
+- `_apply_migrations()` (`store.py:233`) then runs every later step in order (v3 adds
   `space`/`source` and the index), each idempotent behind a column-exists check.
 
 That "stamp v2, then migrate" detail is a bug that was caught, not a style choice:
@@ -757,17 +780,17 @@ pre-spaces store upgrades in place and reads as space `default`.
 ### Two-stage recall (the core algorithm)
 
 This is the single most important mechanism in the memory layer. `recall()`
-(`store.py:495`) does **not** score the whole table. It works in two stages:
+(`store.py:526`) does **not** score the whole table. It works in two stages:
 
-**Stage 1 — candidate generation (`_candidates`, `store.py:399`).** Pull a *bounded*
+**Stage 1 — candidate generation (`_candidates`, `store.py:430`).** Pull a *bounded*
 set of candidates (capped at `CANDIDATE_TOPN` = 50) using indexes:
 
 - **Keyword candidates** via the **FTS5** full-text index, ordered by `bm25`
-  relevance (`store.py:421`). Scales to large stores because it's an index lookup,
+  relevance (`store.py:449`). Scales to large stores because it's an index lookup,
   not a scan.
 - **Semantic candidates** via the pluggable **vector index**, but only rows whose
   cosine clears `SEM_CANDIDATE_THRESHOLD` (0.65) and aren't already in the keyword
-  set (`store.py:436–445`).
+  set (`store.py:467–483`).
 - If FTS5 is unavailable, a **fallback keyword scan** over the whole table —
   correct, just slower; fine for small stores.
 - Every path takes `spaces`: the FTS query, the fallback scan, the document-frequency
@@ -777,7 +800,7 @@ set of candidates (capped at `CANDIDATE_TOPN` = 50) using indexes:
   means `default`) lives one layer up, in the service (M13).
 
 **Stage 2 — fuse-rank only the candidates.** For each candidate compute the full
-`fused_score`, drop anything under `RECALL_FLOOR` (0.12, `store.py:557`), sort, and
+`fused_score`, drop anything under `RECALL_FLOOR` (0.12, `store.py:593`), sort, and
 return the top `k`.
 
 ### The property that makes recall safe: Stage 1 *is* the relevance gate
@@ -785,7 +808,7 @@ return the top `k`.
 Internalize this, because it's the linchpin connecting M5 to M6.
 
 A candidate enters Stage 1 **only** if it has keyword overlap **or** strong semantic
-similarity to the query (the explicit gate at `store.py:535`). Activation and
+similarity to the query (the explicit gate at `store.py:571`). Activation and
 importance are **not consulted in Stage 1 at all.** They only act in Stage 2, where
 they tie-break *among rows that already passed the relevance gate.*
 
@@ -809,18 +832,18 @@ starved of irrelevant fuel.
 
 ### Reinforce-on-write (and on recall — but not on *looking*)
 
-`save()` (`store.py:276`) does **not** blindly insert. If the exact text already
+`save()` (`store.py:294`) does **not** blindly insert. If the exact text already
 exists *in the same space*, it **reinforces** the existing row (refreshes recency, bumps `use_count`,
 keeps the higher importance, reactivates it) and returns its id. With embeddings on,
 it also catches **near-duplicate paraphrases** via `_semantic_duplicate` above
-`SAVE_DEDUP_SIM` (0.93) and reinforces those instead of cloning (`store.py:328`).
+`SAVE_DEDUP_SIM` (0.93) and reinforces those instead of cloning (`store.py:355`).
 Saving the same knowledge twice makes it *stronger*, not *duplicated* — exactly like
 recalling it. `recall(..., reinforce=True)` applies the same logic: surfacing is a
 use.
 
 The flag matters. The *hook* recalls with `reinforce=True` (a use by the agent). The
 **inspection CLI** (`relife memory search`, M11) recalls with `reinforce=False`
-(`cli.py:389`) — so a human *looking* at what the agent would be shown does not
+(`cli.py:406`) — so a human *looking* at what the agent would be shown does not
 distort what the agent will be shown. **Observation must not be a use.**
 
 The same rule, one level up: **a reader may only strengthen its own memory.**
@@ -863,12 +886,12 @@ loaded once per connection now that connections live long).
 Three capabilities are **soft-optional** — present them if available, degrade
 gracefully if not, never a hard dependency:
 
-- **FTS5** (`_init_fts`, `store.py:237`) is *feature-detected* by trying to create
+- **FTS5** (`_init_fts`, `store.py:255`) is *feature-detected* by trying to create
   the virtual table; if the SQLite build lacks it, `_fts_ok` stays False and recall
   falls back to a keyword scan. *Gotcha:* for an external-content FTS5 table,
   `COUNT(*)` reads the **content table**, not the index — so it can't tell you the
   index is empty. The rebuild decision keys off whether the table is being created
-  for the first time (a `sqlite_master` check, `store.py:241`), not a count.
+  for the first time (a `sqlite_master` check, `store.py:257`), not a count.
 - **Embeddings** (`embeddings.py`) use **`fastembed`** (ONNX, CPU, offline, *no API
   key* — because Max, not API). `available()`/`embed()`/`cosine()` all degrade to
   `None`/keyword+activation if the package is absent or disabled. **Tests force
@@ -888,8 +911,8 @@ with two backends:
 - **`SqliteVecIndex`** — an ANN `vec0` virtual table via the optional `sqlite-vec`
   extension (`vector_index.py:89`). For large stores.
 
-The defining safety mechanism is `get_index()` (`vector_index.py:201`): it returns
-the ANN backend **only after a runtime self-test (`_self_test`, `vector_index.py:173`)
+The defining safety mechanism is `get_index()` (`vector_index.py:253`): it returns
+the ANN backend **only after a runtime self-test (`_self_test`, `vector_index.py:222`)
 proves a correct round-trip on *this machine*.** This catches the case that "import
 succeeded" doesn't — an extension that **loads but misbehaves** (wrong build, broken
 distance metric). If the self-test fails, it silently falls back to brute force. So a
@@ -919,9 +942,10 @@ sqlite-vec installed — failed). Three things were wrong, all invisible locally
 
 Two layers of indirection sit between consumers and the store:
 
-- **`MemoryService`** (`service.py:78`) — the in-process *facade* for long-term
-  memory (`save`/`recall`/`forget`/`archive(id)`/`get(id)`/`consolidate`/
-  `maybe_consolidate`/`dream`/stats), **procedural memory** (`skill_*`,
+- **`MemoryService`** (`service.py:92`) — the in-process *facade* for long-term
+  memory (`save`/`recall`/`forget`/`archive(id)`/`get(id)`/`all_memories`/`count`/
+  `consolidate`/`maybe_consolidate`/`dream` — `relife memory stats` is computed by
+  the CLI from `all_memories` and the counts), **procedural memory** (`skill_*`,
   `workflow_*`), **and the tool-event log** (`log_event`/`events_for_task`/
   `event_count`). It resolves the default store on each call so it honors
   `_DB_PATH` reassignment; the skill/workflow/event methods delegate to the module
@@ -931,12 +955,12 @@ Two layers of indirection sit between consumers and the store:
   (they *mine* the defaults, so the daemon binds them — M8).
 - **`MemoryClient`** (`client.py:56`) — the *consumer-facing* protocol. The MCP tools,
   all three hooks, the CLI and the server all go through `default_client()`
-  (`client.py:310`), which picks the transport **by environment**: `RELIFE_MEMORY_URL`
+  (`client.py:325`), which picks the transport **by environment**: `RELIFE_MEMORY_URL`
   set → `HttpMemoryClient`; unset → `LocalMemoryClient` (`client.py:88`).
 - Every method takes keyword-only `space`/`spaces`/`source`, and the service added
   space administration (`spaces`, `copy_space`, `archive_space`, `export_space`,
   `import_pack`). Agents never see those parameters: they get a
-  **`ScopedMemoryClient`** (`client.py:175`) wrapped around whichever transport is in
+  **`ScopedMemoryClient`** (`client.py:177`) wrapped around whichever transport is in
   play — the subject of M13.
 
 In the first edition these were "no-op indirections paid now so the migration is a
@@ -950,7 +974,7 @@ they're diffable and the consolidation pass can write them mechanically):
 
 - **Skills** (`skills.py`) — a *single* reusable procedure ("how I scaffold a Python
   CLI"). Frontmatter `name` + `when_to_use`, then steps. Recall is keyword overlap
-  over name+when+body with the **name weighted 2×** (`skills.py:115`).
+  over name+when+body with the **name weighted 2×** (`skills.py:126`).
 - **Workflows** (`workflows.py`) — a *multi-step* ordered chain ("scaffold → test →
   repo → push"), same file format plus a `trigger` field. Same weighted keyword
   recall.
@@ -1053,7 +1077,7 @@ Before the prompt reaches the model (`hooks.py:96`), it:
    `hooks.py:43`) so that pairing covers **this turn only**. The event log is keyed
    by session, and a chat / server session runs many turns; without the watermark
    every later episode replayed the whole session's tools.
-2. **Gathers candidates** from three sources (`memory/context.py:52`): top-5 memories
+2. **Gathers candidates** from three sources (`memory/context.py:53`): top-5 memories
    (`recall(..., reinforce=True)`), top-2 skills, top-1 workflow. Each carries
    `(section_label, key_text, rendered)`. This block is built by
    `memory/context.build_context(client, query)` — shared with the `memory_context`
@@ -1156,7 +1180,7 @@ and the whole design rests on why they're separate.
 - `rem.py` = **REM/dreaming**: expensive, **opt-in**, only when you choose, the **only
   pass where the LLM reflects** qualitatively on memory.
 
-#### `consolidate.run_consolidation()` (the sleep) — `consolidate.py:362`
+#### `consolidate.run_consolidation()` (the sleep) — `consolidate.py:498`
 
 Runs automatically when enough events accrued (`should_auto_run`:
 `events.max_id() − last ≥ CONSOLIDATE_EVERY`, gated by `AUTO_CONSOLIDATE` — by event
@@ -1164,33 +1188,33 @@ Runs automatically when enough events accrued (`should_auto_run`:
 `last_event_count` reads as an id, since nothing was ever deleted then), invoked via `agent.maybe_consolidate()` after each run. Four
 deterministic steps:
 
-1. **Decay & forget (`_decay_and_archive`, `consolidate.py:83`).** Tier 1: archive
+1. **Decay & forget (`_decay_and_archive`, `consolidate.py:88`).** Tier 1: archive
    active memories that `should_archive`. Tier 2: hard-delete rows that are *already
    archived* and `should_hard_delete`. Nothing goes active→deleted in one pass — only
    already-archived rows are deletion candidates.
-2. **Dedupe (`_dedupe`, `consolidate.py:113`).** Merge near-duplicates: keyword Jaccard
+2. **Dedupe (`_dedupe`, `consolidate.py:135`).** Merge near-duplicates: keyword Jaccard
    ≥ 0.9, **or** (embeddings on) semantic cosine ≥ `DEDUP_SIM` (0.90), which catches
    paraphrases sharing few tokens. The survivor is *reinforced*; the duplicate
    *deleted* — merging concentrates strength rather than losing it. It used to compare
    every pair in a space and re-embed every memory on every pass (19 s at 3,000
    memories); it is now indexed and incremental — see *Dedupe at scale* below.
-3. **Detect patterns (`_detect_patterns`, `consolidate.py:299`).** Two detectors:
+3. **Detect patterns (`_detect_patterns`, `consolidate.py:435`).** Two detectors:
    recurring **episodes** → `pattern` memory; recurring **action n-grams** from the
    event log → `pattern` memory **+ a synthesized workflow**.
 4. **Synthesize workflows** — turning the journal into replayable plans.
 
 **The n-gram cleverness (the part to really understand).**
 - N-grams run over **action labels, not raw tool names** (`_tool_ngrams`,
-  `consolidate.py:276` + `_action_label`, `consolidate.py:215`). For shell tools the
+  `consolidate.py:412` + `_action_label`, `consolidate.py:351`). For shell tools the
   *action* is derived from the command, so three different `Bash` calls become
   `git-clone`, `test`, `git-push` — distinct nodes — instead of collapsing into one
   meaningless `Bash → Bash → Bash` that would hide the real workflow and leave only
   trivial editor motions visible.
-- A **meaningfulness gate** (`_is_meaningful_seq`, `consolidate.py:262`) only promotes
+- A **meaningfulness gate** (`_is_meaningful_seq`, `consolidate.py:398`) only promotes
   a sequence that contains at least one *distinctive* action (git/test/build/docker, an
   MCP tool, browsing…). Pure `Write → Edit` editor motions are a real regularity but
   *not a workflow*, so they're skipped, not turned into noise.
-- **Maximal sequences win** (`_contains`, `consolidate.py:269`): process longest-first
+- **Maximal sequences win** (`_contains`, `consolidate.py:405`): process longest-first
   and drop any sequence already contained in an accepted longer one. So you get
   `clone→test→push` once, not also its sub-sequences as separate workflows.
 
@@ -1233,7 +1257,7 @@ or teach the user's default memory a habit that only a crew reviewer has.
 
 **Where the throttle lives — and why it must not move.** `should_auto_run()` reads
 the event count against a watermark. The count and the pass are decided **together
-on the memory side** (`MemoryService.maybe_consolidate`, `service.py:331`), and
+on the memory side** (`MemoryService.maybe_consolidate`, `service.py:347`), and
 `agent.maybe_consolidate()` just calls that. The tempting refactor — gate
 client-side, then call `consolidate()` — silently breaks under a daemon: the gate
 would read the *caller's* (empty) local event log while the work runs server-side,
@@ -1255,9 +1279,12 @@ LLM judge our memory" safe:
    proxy). Falls back to most-recent if nothing's new. Capped at `REM_BATCH_MAX` (40).
 2. **A reference frame (`_reference_set`, `rem.py:111`).** Established knowledge
    (preferences, patterns, pinned high-importance memories, capped `REM_REFERENCE_MAX`
-   = 30) for the critic to check contradictions *against* — it may act on the buffer,
-   not the reference set (except naming a reference as the "keep" side of a
-   contradiction).
+   = 30) for the critic to check contradictions *against*. The prompt tells it to act
+   only on the buffer, naming a reference memory only as the "archive" side of a
+   contradiction; `_apply` itself accepts a verdict for any id in either set
+   (`known` = buffer + reference — ids outside both are ignored), so what bounds it
+   is the confidence gate and the prune cap below, which counts reference archives
+   too.
 3. **Advisor, not actor (`_apply`, `rem.py:179`).** The model returns *verdicts as
    JSON*; the application is **deterministic and runs here, not in the model.** Allowed
    actions: `keep` / `prune` / `reweight` only — it **cannot edit memory text.**
@@ -1337,7 +1364,7 @@ resume**.
    Surfaces as `mcp__relife_build__*` → already auto-allowed by the trusted
    `mcp__relife` prefix (no permission change).
 3. **The `builder` subagent (`agents.py`)** — an `AgentDefinition` the orchestrator
-   delegates each milestone to **via the Task tool**. Its prompt (`build/agents.py:53`)
+   delegates each milestone to **via the Task tool**. Its prompt (`build/agents.py:18`)
    constrains it hard: implement *exactly one* milestone, match existing conventions,
    **verify it** (build + tests), stay scoped, defer outward actions to the
    orchestrator, and **report back a concise summary only — not a transcript.**
@@ -1352,17 +1379,20 @@ orchestrator's context grows with the *number of milestones* (cheap), not with t
 *total implementation work* (expensive). That's what lets a build scale past a single
 context window.
 
-The builder's tool list (`build/agents.py:54`) is read/search/edit/shell + browser + memory,
-but **not** the build-ledger tools — those belong to the orchestrator alone.
+The builder's tool list (`_BUILDER_TOOLS`, `build/agents.py:37`) is read/search/edit/
+shell plus `WebFetch`/`WebSearch`, `TodoWrite` and the notebook tools — built-in tools
+only. It names no `mcp__…` tool, so the builder is not given the browser or the memory
+tools (the comment above the list says "browser + memory"; the list doesn't include
+them), and **not** the build-ledger tools — those belong to the orchestrator alone.
 
-### `run_build()` — wiring and resume (`orchestrator.py:43`)
+### `run_build()` — wiring and resume (`orchestrator.py:44`)
 
 A fresh build: create a ledger, give the orchestrator the initial prompt ("decompose
 into milestones with `build_plan_set`, then delegate each to a `builder`",
-`orchestrator.py:24`). A resume: load the ledger (by id, or the latest for the
+`orchestrator.py:25`). A resume: load the ledger (by id, or the latest for the
 workspace), and give the resume prompt ("here's the ledger; call `build_status`,
 spot-check that 'done' milestones really exist, continue from the first unfinished
-one", `orchestrator.py:33`).
+one", `orchestrator.py:34`).
 
 Three robustness decisions worth understanding:
 
@@ -1371,9 +1401,9 @@ Three robustness decisions worth understanding:
   workspace, or the agent couldn't see its prior work and would build in the wrong
   place.
 - **The `session_id` is persisted to continue the same conversation**
-  (`orchestrator.py:116–118`): each `ResultMessage` with a session id is written to
+  (`orchestrator.py:120–122`): each `ResultMessage` with a session id is written to
   the ledger, so the next `--resume` continues the same CLI session.
-- **Expired-session fallback** (`orchestrator.py:99–109`). A persisted `session_id`
+- **Expired-session fallback** (`orchestrator.py:96–111`). A persisted `session_id`
   can be *gone* — it expires across a Max session-limit reset, and the `claude`
   subprocess then fails to start. So resume tries the saved session, and on
   `ClaudeSDKError` it **drops the stale handle and starts a FRESH session**,
@@ -1381,10 +1411,10 @@ Three robustness decisions worth understanding:
   lost even though the conversation handle died. This directly reflects the Max
   constraint from M1.
 
-### The CLI subtlety (`cli.py:171`)
+### The CLI subtlety (`cli.py:186`)
 
-`--resume` is a **boolean flag** (`cli.py:181`), and the positional `spec` argument
-(`cli.py:173`) *doubles* as the optional build id on resume. This is deliberate: if
+`--resume` is a **boolean flag** (`cli.py:196`), and the positional `spec` argument
+(`cli.py:188`) *doubles* as the optional build id on resume. This is deliberate: if
 `--resume` took a value, it would swallow the following option (e.g. `--workspace`).
 As a boolean, you write `relife build --resume <id> -w <path>` unambiguously, and
 `--resume` alone resumes the most recent build for the workspace.
@@ -1425,7 +1455,7 @@ lifetime. The split is the payoff of M5's seams — and the interesting part is 
 - **`daemon.py`** — `create_app(db_path, token, skills_dir, workflows_dir,
   spaces_dir, agents_path, mcp_hosts)` returns the FastAPI app; `serve()` runs
   uvicorn. Routes mirror the `MemoryClient` protocol one-to-one
-  (`daemon.py:158–321`): `/save`, `/recall`, `/forget`, `/archive`, `/memories`,
+  (`daemon.py:170–345`, after `/health`): `/save`, `/recall`, `/forget`, `/archive`, `/memories`,
   `/memories/{id}`, `/count`, `/spaces`, `/spaces/copy`, `/spaces/archive`,
   `/spaces/{space}/export`, `/spaces/import`, `/consolidate`, `/consolidate/maybe`,
   `/dream`, `/skills/*`, `/workflows/*`, `/events/*` — plus `/mcp`, the same memory
@@ -1438,9 +1468,9 @@ lifetime. The split is the payoff of M5's seams — and the interesting part is 
 ### The binding trick (the thing to really understand)
 
 The obvious design is "inject a `MemoryStore` into the service." The daemon
-deliberately does **not** do that. `_bind_db()` (`daemon.py:51`) instead **reassigns
+deliberately does **not** do that. `_bind_db()` (`daemon.py:54`) instead **reassigns
 the module-level globals** `store._DB_PATH` and `events._DB_PATH` to the daemon's DB,
-and `_bind_dirs()` (`daemon.py:68`) does the same for `skills._SKILLS_DIR`,
+and `_bind_dirs()` (`daemon.py:71`) does the same for `skills._SKILLS_DIR`,
 `workflows._WORKFLOWS_DIR` and `spaces._SPACES_DIR` (where non-default spaces keep
 their procedures). Then it constructs a plain default `MemoryService()`.
 
@@ -1470,7 +1500,7 @@ than queues when a sweep is already running (the throttle fires it again later).
 in WAL with a connection per thread makes the overlap safe. The bearer-token check is
 constant-time (`secrets.compare_digest`). The other exception is `/dream`: REM can run for minutes, so on the
 *client* side it's the one `async` protocol method and is dispatched via
-`anyio.to_thread` with `timeout=None` (`http_client.py:182`) so it doesn't block the
+`anyio.to_thread` with `timeout=None` (`http_client.py:185`) so it doesn't block the
 caller's loop; the `ask_model` callable **can't cross the wire**, so the daemon uses
 its own default (`agent.ask_model_oneshot`) — meaning the daemon's machine needs the
 logged-in `claude` CLI too.
@@ -1487,11 +1517,11 @@ failure modes match, not just success modes.
 ### The sidecar: advisory, never a lock
 
 `serve()` writes `data/relife.db.daemon` (pid + url) next to the DB and removes it on
-shutdown (`daemon.py:326, 268`). A process that then goes in-process **without**
+shutdown (`daemon.py:350, 388`). A process that then goes in-process **without**
 `RELIFE_MEMORY_URL` sees the sidecar and **warns** (`client._warn_if_daemon_running`,
-`client.py:296`) — it does not refuse. A crash or SIGKILL can orphan the sidecar, and a
+`client.py:311`) — it does not refuse. A crash or SIGKILL can orphan the sidecar, and a
 stale marker must never brick the default path. `relife doctor` surfaces the same
-condition as a `warn` with the fix (`doctor.py:359`).
+condition as a `warn` with the fix (`doctor.py:442`).
 
 ### What it cost, and what it proved
 
@@ -1509,8 +1539,8 @@ condition as a `warn` with the fix (`doctor.py:359`).
 
 > M8 mastery check: opt-in by env var; `wire.py` is the shared, dependency-free
 > contract; the daemon binds module globals instead of injecting a store because
-> upkeep mines the defaults (and calling itself over HTTP would deadlock); handlers
-> serialize on the loop; 400⇄`ValueError` keeps both transports failing identically;
+> upkeep mines the defaults (and calling itself over HTTP would deadlock); quick
+> handlers serialize on the loop, bulk ones run one at a time on a worker thread; 400⇄`ValueError` keeps both transports failing identically;
 > the sidecar warns, never refuses.
 
 ---
@@ -1539,20 +1569,20 @@ A session owns one `ClaudeSDKClient`, **kept open across turns** — the same th
 `make_approval_callback` instead of the TTY callback. Since the durability pass the
 client is **lazy**: `start()` only starts the worker, and `_ensure_client` connects on
 the first turn (see *Sessions sleep instead of dying* below).
-A worker task (`_run`, `session.py:254`) drains an inbound queue → `client.query` →
+A worker task (`_run`, `session.py:368`) drains an inbound queue → `client.query` →
 `receive_response()` → `to_event` → publish. Each event gets a monotonically
 increasing sequence id and lands in a **ring buffer** (`_RING_MAX` = 500) *and* in
 every subscriber's queue.
 
-Three details that carry weight:
+Four details that carry weight:
 
-- **One turn can't kill the session** (`session.py:268`): any exception in a turn is
+- **One turn can't kill the session** (`session.py:390`): any exception in a turn is
   published as an `error` event and the worker continues to the next turn.
-- **Publishing is activity** (`session.py:219`): every emitted event `touch()`es the
+- **Publishing is activity** (`session.py:183`): every emitted event `touch()`es the
   session, so a turn streaming longer than the idle timeout with no browser attached
   is never reaped out from under itself.
 - **The user's turn is echoed** as a `user` event *when the worker dequeues it*
-  (`session.py:260`) — not when HTTP accepted it. M10's run recorder keys on exactly
+  (`session.py:373`) — not when HTTP accepted it. M10's run recorder keys on exactly
   that echo.
 - **A turn's cost is its own.** The CLI fills a result's `total_cost_usd` from its
   process-wide session total (read from the bundled CLI: the same value it reports as
@@ -1591,14 +1621,14 @@ reattached session replayed both turns and quoted the first message verbatim —
 memories and zero tool events in that home, so only the resumed conversation could
 answer. The ledger held exactly three per-turn costs.
 
-### `ApprovalBroker` — a permission prompt as a future (`session.py:53`)
+### `ApprovalBroker` — a permission prompt as a future (`session.py:72`)
 
 When `classify()` says "ask", the callback calls `broker.request(...)`. The broker
 publishes an `approval_request` event (tool, reason, and a 400-char `_tool_brief` so
 the card shows *what* is about to leave the machine), then **awaits an
 `asyncio.Future`** with `asyncio.wait_for(fut, timeout)`. A *different* request
 handler — `POST /sessions/{id}/approvals/{approval_id}` — calls `broker.resolve()`,
-which sets the future. Timeout → `False` → deny (`session.py:89–91`), the same
+which sets the future. Timeout → `False` → deny (`session.py:110–113`), the same
 default as the non-interactive TTY.
 
 This works cleanly *because* everything is on one event loop: the suspended worker
@@ -1607,13 +1637,13 @@ as the daemon; the difference is that here a suspended coroutine is a *blocked a
 run*, which is precisely what you want — the agent physically cannot proceed past
 an outward action until a human clicks.
 
-### The SSE stream and reconnect (`app.py:314`)
+### The SSE stream and reconnect (`app.py:394`)
 
 `GET /sessions/{id}/events` is a `StreamingResponse` (no `sse-starlette`
 dependency). It:
 
 1. reads `Last-Event-ID` (header, preferred) or `?last_id` (query),
-2. calls `session.subscribe(last_id)` (`session.py:200`), which snapshots the ring
+2. calls `session.subscribe(last_id)` (`session.py:164`), which snapshots the ring
    *and* registers the queue **with no `await` between them** — so on a single loop
    no event can slip between backlog and live stream,
 3. yields the backlog, then live events, sending `: ping` every heartbeat and
@@ -1621,7 +1651,7 @@ dependency). It:
 
 A subscriber that stops reading (a wedged tab, a paused debugger) hits
 `_SUB_QUEUE_MAX`; the publisher **drops that subscriber's oldest event** rather than
-growing memory (`session.py:230`). The ring + `Last-Event-ID` replay is how the
+growing memory (`session.py:194`). The ring + `Last-Event-ID` replay is how the
 client catches back up. Nothing here is unbounded.
 
 ### The UI's reattach (why `GET /sessions/{id}` exists)
@@ -1630,9 +1660,9 @@ The obvious UI — `POST /sessions` on page load — was wrong in a way that onl
 up in use: every reload spawned a **second `ClaudeSDKClient` subprocess**, orphaned
 the first until the idle reaper, lost the transcript, and after
 `AGENT_MAX_SESSIONS` reloads returned 429 with no way out. So the page remembers its
-session id in `localStorage` (`web/index.html:325`), **probes** `GET /sessions/{id}`
-(`app.py:270`) on load, and if alive reattaches by streaming `?last_id=0` — replay the
-whole ring (`web/index.html:455`). A fresh page has no `Last-Event-ID` (that's
+session id in `localStorage` (`web/index.html:435`), **probes** `GET /sessions/{id}`
+(`app.py:344`) on load, and if alive reattaches by streaming `?last_id=0` — replay the
+whole ring (`web/index.html:586`). A fresh page has no `Last-Event-ID` (that's
 per-`EventSource`), which is why the query form exists; the route prefers the header
 so an *automatic* reconnect still resumes rather than replays. A "new session" button
 `DELETE`s the current one so a slot can be freed from the browser. Since sessions
@@ -1661,19 +1691,19 @@ a plain function with no I/O — the `cognitive.py` discipline applied to securi
   *before* checking so `..` and symlinks are caught (M3's `_under`, one level up).
 - **`AttemptLimiter`** (`:132`) — fixed-window per-address counter for token guessing.
 
-`app.py` only wires these to routes (`app.py:181–199`).
+`app.py` only wires these to routes (`app.py:229–269`).
 
 ### Why auth accepts a cookie (and why you must not "simplify" it away)
 
 A browser **`EventSource` cannot set request headers.** With header-only bearer auth,
 the SSE stream — the one route that carries the *entire transcript and every approval
 prompt* — was the one route the UI could never authenticate. So `POST /auth`
-(`app.py:227`) exchanges the token for an **HttpOnly, `SameSite=Strict`** cookie, and
+(`app.py:301`) exchanges the token for an **HttpOnly, `SameSite=Strict`** cookie, and
 every route accepts *either* carrier. Bearer stays for programmatic clients.
 
 Cookie auth is *ambient* — the browser attaches it to any request to that origin —
 which is why mutating routes additionally require same-origin (`mutate =
-[same_origin, token]`, `app.py:199`). Drop the cookie and the UI can't see its own
+[same_origin, token]`, `app.py:269`). Drop the cookie and the UI can't see its own
 agent; drop the Origin check and a cross-site page could drive it. Both halves are
 load-bearing. Failed `/auth` attempts are rate-limited per client address.
 
@@ -1683,8 +1713,8 @@ load-bearing. Failed `/auth` attempts are rate-limited per client address.
 `POST /sessions` accepted a raw path, the *HTTP caller* would be choosing the
 auto-allow blast radius — `{"workspace": "C:\\"}` and the whole disk is writable
 without a prompt. `resolve_workspace` confines every server-created session to
-`AGENT_WORKSPACE_ROOT` (default `./workspace`) and rejects escapes with a 400
-(`app.py:257`). The CLI's `--workspace` is deliberately *not* confined: that's the
+`AGENT_WORKSPACE_ROOT` (default `<RELIFE_HOME>/workspace`) and rejects escapes with a 400
+(`app.py:336`). The CLI's `--workspace` is deliberately *not* confined: that's the
 local user speaking directly, not a request body.
 
 ### Everything is bounded, because the process never exits
@@ -1693,7 +1723,7 @@ Each session is a **subprocess**. A long-lived process with unbounded anything i
 resource-exhaustion lever even on loopback. So: `AGENT_MAX_SESSIONS` (429, counting
 sessions in memory — sleeping ones are files), an idle reaper under the app lifespan
 that skips sessions with a live SSE subscriber and puts the rest to sleep, `AGENT_MAX_QUEUED_TURNS` (429 — `submit` uses `put_nowait` rather than
-blocking a request handler per pending turn, `session.py:165`), `AGENT_MAX_MESSAGE_CHARS`
+blocking a request handler per pending turn, `session.py:326`), `AGENT_MAX_MESSAGE_CHARS`
 (413), `AGENT_MAX_SUBSCRIBERS` (429), and drop-oldest on lagging queues. Shutdown
 `aclose()`s every session so **no subprocess is orphaned**.
 
@@ -1703,7 +1733,7 @@ After each turn the worker runs the sleep beat. Inline it was a disaster only a
 long-lived process reveals: the pass does SQLite scans, dedupe and (with embeddings)
 ONNX inference — seconds on a big store — and on the *one* loop that hosts every
 session's SSE stream and every pending approval, **everything froze for the
-duration.** `maybe_consolidate_off_loop()` (`agent.py:245`) runs it on a worker
+duration.** `maybe_consolidate_off_loop()` (`agent.py:247`) runs it on a worker
 thread. It's safe there because each thread uses its own SQLite connection
 (`memory/_sqlite.connect`) and `httpx.Client` is thread-safe; the non-blocking process lock (M2) stops two
 sessions sweeping at once. A pass that changed something is published as a `note`
@@ -1711,7 +1741,7 @@ event so the console shows the brain ticking.
 
 ### Testing with zero model calls
 
-`create_app(session_factory=...)` (`app.py:105`) accepts an injected factory. Tests
+`create_app(session_factory=...)` (`app.py:140`) accepts an injected factory. Tests
 pass a fake `AgentSession` that emits scripted events, so the **whole HTTP + SSE +
 approval flow** — auth, cookie, CSRF, 429s, reattach, approval resolve/timeout — runs
 without a model, the same discipline as `rem.ask_model`. Nothing in `create_app`
@@ -1721,9 +1751,10 @@ lifespan.
 ### Still local-first, fail-closed
 
 There is **no TLS and no multi-user model**. `serve()` refuses a non-loopback bind
-without a token; with a token it still prints that a reverse proxy belongs in front.
-Exposing it beyond `127.0.0.1` is a deliberate future step, not a supported
-configuration — the `doctor` check for it (`doctor.py:455`) says so in as many words.
+without a token (`guard_bind`, whose refusal adds that a reverse proxy belongs in front
+before exposing it). Exposing it beyond `127.0.0.1` is a deliberate future step, not a
+supported configuration — the `doctor` check for it says so in as many words ("bound
+beyond loopback with no TLS — only behind a reverse proxy", `doctor.py:555`).
 
 > M9 mastery check: one `ClaudeSDKClient` per session, kept open; approvals are
 > futures resolved by another request on the same loop, timing out to deny; SSE +
@@ -1749,34 +1780,35 @@ of thing.
 
 ### Schedules are a pure model (`schedules.py`)
 
-A `Schedule` (`schedules.py:191`) is a durable record: name, task text, a `spec`, a
+A `Schedule` (`schedules.py:216`) is a durable record: name, task text, a `spec`, a
 confined workspace, `enabled`, `next_run_at`, and a bounded inline run history.
 Two spec forms, kept in the user-facing shape:
 
-- `{"every": "30m"}` — interval. `parse_every` (`:45`) accepts `s|m|h|d`;
-  `normalize_spec` (`:82`) **floors** it at `AGENT_SCHEDULE_MIN_INTERVAL` (300s)
+- `{"every": "30m"}` — interval. `parse_every` (`:44`) accepts `s|m|h|d`;
+  `normalize_spec` (`:81`) **floors** it at `AGENT_SCHEDULE_MIN_INTERVAL` (300s)
   because every firing spends Max budget, so a one-minute schedule is a mistake to
   refuse, not a wish to honour.
 - `{"at": "09:00", "days": ["mon","fri"]}` — daily at a **local** wall-clock time.
-  `next_run` (`:124`) works in naive local time and converts with `timestamp()`, so
+  `next_run` (`:123`) works in naive local time and converts with `timestamp()`, so
   09:00 stays 09:00 across a DST change instead of drifting by the offset.
 
 Everything time-related takes an **explicit `now`**, so the cadence math is testable
-at any instant. `ScheduleStore` (`:325`) is a JSON file at `data/schedules.json`
+at any instant. `ScheduleStore` (`:380`) is a JSON file at `data/schedules.json`
 with atomic tmp+`os.replace` writes (the ledger idiom) — and it writes **nothing**
 until the first change, so `create_app()` stays side-effect-free.
 
 ### The scheduler fires *turns* (`scheduler.py`)
 
 `Scheduler.run()` is one background task under the app lifespan (like the reaper),
-ticking every `AGENT_SCHEDULER_TICK` (30s). `tick(now)` (`:162`) fires each due
-schedule (`enabled and next_run_at <= now`). A firing is `_submit` (`:214`):
+ticking every `AGENT_SCHEDULER_TICK` (30s). `tick(now)` (`scheduler.py:184`) fires each
+due schedule (`enabled and next_run_at <= now`). A firing (`fire`, `:200` → `_submit` →
+`_start`, `:256`):
 
 1. Each schedule owns a **session** in its confined workspace — created via the same
    `resolve_workspace` as `POST /sessions`, reused while alive, recreated after the
    reaper closes it. The UI's **watch** button attaches the console to that session
    through M9's reattach path.
-2. The turn text is `scheduled_prompt()` (`:47`): a preamble saying the run is
+2. The turn text is `scheduled_prompt()` (`:55`): a preamble saying the run is
    automatic and possibly unattended, that a needed approval may be denied by
    timeout, and to **report that rather than retry**, then the task. The UI renders
    it compactly as `⏱ scheduled · name`.
@@ -1797,7 +1829,7 @@ safety rule, three surfaces (M3).
 
 The one exception to "nobody watching ⇒ deny" is a schedule's **grants** (policy in
 M3). They are attached to the *turn*, not the session: `AgentSession.submit(text,
-grants=)` (`session.py:165`) queues the grants with that turn's text, so typing into
+grants=)` (`session.py:326`) queues the grants with that turn's text, so typing into
 the same session via *watch* gets none. `make_approval_callback(..., preauthorize=)`
 consults `grant_allows` after `classify()` says ask and before the broker. Uses are
 capped per turn by `AGENT_GRANT_MAX_USES` (3) — a loop, or a prompt-injected "mail me
@@ -1808,9 +1840,10 @@ may do and in what shape. Schedules accept `grants` on POST/PATCH; an invalid gr
 on disk is dropped on load, never widened.
 
 **Cadence policy, all deterministic:**
-- After *any* attempt the schedule advances from **now** (`fire`, `:171`) — a slot
-  missed while the server was down fires **once** on the next tick, never N×.
-- A schedule whose session is still `busy` (`AgentSession.busy`, `session.py:248`: a
+- After *any* attempt the schedule advances from **now** (`fire` → `Schedule.record_run`,
+  `schedules.py:286`) — a slot missed while the server was down fires **once** on the
+  next tick, never N×.
+- A schedule whose session is still `busy` (`AgentSession.busy`, `session.py:362`: a
   turn in flight *or queued*) is **skipped** for that slot rather than stacking turns —
   an hourly task that takes ninety minutes must not pile up.
 - A run that can't start (session ceiling, full queue, bad workspace) is recorded as
@@ -1822,17 +1855,18 @@ a model.
 
 ### Run outcomes: the ring buffer must not be the only copy (`runs.py`)
 
-`submitted` only means the turn was queued. The session it ran in is reaped an hour
-later, and with it the ring buffer. So for each firing the scheduler **subscribes to
-the session *before* submitting** (`scheduler.py:265` — so the turn's first event can't
-be missed) and spawns a recorder task (`_record`, `:291`) that collects **exactly that
-turn's** events:
+`submitted` only means the turn was queued. The session it ran in goes to sleep after
+`AGENT_SESSION_IDLE_TIMEOUT` (15 min) idle and keeps only its last 300 events (M9), and a
+work schedule replaces its session at the next firing — so the session must not be the
+only copy. For each firing the scheduler **subscribes to the session *before*
+submitting** (`scheduler.py:302` — so the turn's first event can't be missed) and spawns
+a recorder task (`_record`, `:364`) that collects **exactly that turn's** events:
 
 - it starts at the `user` echo **whose text equals the scheduled prompt** — a turn the
   user typed into the same session (via *watch*) is not ours;
 - it ends at `result` → `done`, or `error` → `error`, or `AGENT_SCHEDULE_RUN_TIMEOUT`
   (2h) → `timeout` (the recorder stops waiting; the agent is not killed), or server
-  shutdown → `interrupted` (`aclose`, `:150`).
+  shutdown → `interrupted` (`aclose`, `:172`).
 
 Then `_finish` writes a `RunRecord` to `data/runs/<schedule>/<run_id>.json`
 (bounded per schedule by `AGENT_RUN_HISTORY`, removed with the schedule) and
@@ -1843,7 +1877,7 @@ A run id is a URL path parameter that names a file, so `RunStore.get` refuses
 anything that isn't the exact `YYYYMMDD-HHMMSS-mmm` shape `new_id` produces
 (`runs.py:172`) before it touches the filesystem.
 
-`summarize_events()` (`runs.py:31`) is pure over the `to_event` taxonomy:
+`summarize_events()` (`runs.py:34`) is pure over the `to_event` taxonomy:
 
 - `summary` = the agent's **closing text** — everything after its last tool call (the
   preamble asks it to end with a summary); if it never used a tool, all of its text.
@@ -1855,7 +1889,7 @@ The recorder is a live subscriber, so the idle reaper never closes a session
 mid-recording; it unsubscribes when the turn ends. If every stream slot is already
 held by watchers (`TooManySubscribers`), the turn still goes out — someone is
 clearly looking — but the history entry says `submitted (unrecorded: …)` rather than
-a `submitted` nothing would ever upgrade (`scheduler.py:268`).
+a `submitted` nothing would ever upgrade (`scheduler.py:305`).
 
 ### Why this shape and not a job queue
 
@@ -1905,9 +1939,9 @@ Two consequences shaped the code:
   are lists of plain addresses, content fields are camelCase (`htmlBody`,
   `forwardText`), attendees are `{email, …}`. That check found the two grant bypasses
   in M3 (`draftId`, `replyAll`); `tests/test_grants.py` pins the real names and shapes.
-- **`doctor` has to check them** (`_check_connectors`, `doctor.py:394`): it runs
+- **`doctor` has to check them** (`_check_connectors`, `doctor.py:475`): it runs
   `claude mcp list`, parses the `claude.ai <Service>` lines (`parse_mcp_list`,
-  `:384`), and distinguishes *not enabled on the account* (fix: claude.ai → Settings
+  `:465`), and distinguishes *not enabled on the account* (fix: claude.ai → Settings
   → Connectors) from *enabled but Google not linked* (fix: link it from a session).
   Without this, the first symptom is a mid-run tool error behind the SDK.
 
@@ -1921,18 +1955,18 @@ schedules only fire while `relife serve` is running; a run that needed an approv
 just records a denial; a non-loopback bind without a token is refused at start.
 
 The structure is the repo's policy-module discipline once more: `run_checks(p)`
-(`doctor.py:538`) is **pure over an injected `Probes` bundle** (`:44` — `which`, `run`,
+(`doctor.py:619`) is **pure over an injected `Probes` bundle** (`:44` — `which`, `run`,
 `env`, `import_ok`, `fts5_ok`, `http_get`, `schedules`, …; every field a value or a
 callable), so the whole matrix is unit-tested with scripted environments;
-`default_probes()` (`:78`) is the one place that touches the real machine. Each
+`default_probes()` (`:106`) is the one place that touches the real machine. Each
 `Check` carries a `status` (`ok|warn|fail|skip`), a `detail`, and a **`fix`** — the
 command or setting that resolves it — and the process exits 1 on any `fail`.
 
-Two checks worth knowing exist:
+A few checks worth knowing exist:
 
-- **`api key`** (`:233`) warns if `ANTHROPIC_API_KEY` is set — the M1 constraint made
+- **`api key`** (`:265`) warns if `ANTHROPIC_API_KEY` is set — the M1 constraint made
   executable.
-- **`agent server` + `schedules`** (`:455`, `:502`): bind/token sanity first (`serve()`
+- **`agent server` + `schedules`** (`:536`, `:583`): bind/token sanity first (`serve()`
   would refuse), then reachability; *not running* is normal for CLI use but a `warn`
   when enabled schedules exist ("they will not fire"); and the schedules check reads
   each enabled schedule's last run and reports **"last run failed: …"** and **"needed
@@ -1946,6 +1980,10 @@ Two checks worth knowing exist:
 
 - **`budget`**: today's usage-equivalent spend, by kind, and the cap if one is set —
   `warn` once it is reached, with the setting that lifts it.
+- **`model limits`** (`_check_llm_limits`, `:365`): for the non-Claude crew models
+  (`RELIFE_CREW_LLMS`), `warn` when one is out of quota right now (until when) or a
+  remote one has no declared limits (paced at the conservative default), with the
+  `relife llm set` line to fix it; `skip` when none is configured (M15).
 
 ### The shared Max budget (`budget.py`)
 
@@ -1971,13 +2009,13 @@ schedules, crews and several console sessions running there was no single answer
 
 A learning system you can't inspect is one you can't trust, and one you can't
 correct is one that reinforces its own mistakes (M16 names this as the biggest
-risk). The `memory` sub-app (`cli.py:345`) closes that gap:
+risk). The `memory` sub-app (`cli.py:362`) closes that gap:
 
 - **`search "<q>"`** — what the agent *would be shown*, ranked the same way —
-  **without reinforcing** (`reinforce=False`, `cli.py:389`). Looking never distorts.
+  **without reinforcing** (`reinforce=False`, `cli.py:406`). Looking never distorts.
 - **`list [--kind] [--archived] [--sort recent|strong|oldest]`**, **`show <id>`** —
   full record: text, tags, importance, activation, use history.
-- **`forget <id>… | --query "<q>" [--yes]`** (`cli.py:464`) — **archive** (the
+- **`forget <id>… | --query "<q>" [--yes]`** (`cli.py:481`) — **archive** (the
   reversible M4 tier, never delete), confirming unless `--yes`. Id-addressed
   `archive(id)`/`get(id)` were added to the service and the daemon routes
   (`/archive`, `/memories/{id}`) for exactly this: query-based `forget` archives
@@ -2049,11 +2087,11 @@ mail, uploads, writes outside the checkout, `gh` writes — asks. `RELEASE_TESTI
 
 A schedule with `work` set — `{}` for any open issue assigned to the user, or
 `{"repo": "o/n"}` / `{"label": "relife"}` to narrow it (`normalize_work`,
-`schedules.py:148`) — takes the next issue each firing:
+`schedules.py:147`) — takes the next issue each firing:
 
-- `Scheduler._prepare_work` (`scheduler.py:182`) runs the plumbing **on a worker
+- `Scheduler._prepare_work` (`scheduler.py:214`) runs the plumbing **on a worker
   thread** (`gh` and `git` are blocking subprocesses and the loop is shared — M9):
-  list → `pick_issue` (`scheduler.py:63`: newest first, not in `schedule.worked`,
+  list → `pick_issue` (`scheduler.py:82`: newest first, not in `schedule.worked`,
   label match) → fetch → `ensure_checkout` under the schedule's confined workspace.
 - **No new issue ⇒ `skipped: no new assigned issues` before any session exists.** An
   empty poll spends no Max budget.
@@ -2072,20 +2110,20 @@ the PR listed under "needed you" — unless the schedule carries the grant below
 `pull_request` is the only grant that touches the shell, so it is built to match
 exactly one thing:
 
-1. **Only on a work schedule.** `check_grants_fit` (`schedules.py:175`) refuses it
+1. **Only on a work schedule.** `check_grants_fit` (`schedules.py:174`) refuses it
    elsewhere rather than keeping a grant that can never apply.
 2. **Stored unbound.** `{"kind": "pull_request"}` — `normalize_grants` drops any repo
    or branch a caller sends, and an unbound grant matches nothing.
-3. **Bound per turn.** `bind_grants` (`scheduler.py:104`) binds it to *this* issue's
+3. **Bound per turn.** `bind_grants` (`scheduler.py:123`) binds it to *this* issue's
    repo and branch for this turn only, and drops it when there is no issue.
-4. **One tokenized shape.** `_pr_create_matches` (`permissions.py:808`) tokenizes
+4. **One tokenized shape.** `_pr_create_matches` (`permissions.py:829`) tokenizes
    with `shlex` (comments off) and allows a single `gh pr create` whose
    `--repo`/`--head` equal the bound pair, with only title/body/base/draft/fill flags,
    each at most once, and no positional; the raw command may contain no `$` or
    backtick (bash *and* PowerShell expansion) and no operator token (`; | & > < ( )`).
    So no chain, redirect, `--body-file`, reviewer ping or `--web` rides along.
 
-The scheduled preamble spells that shape out (`_grants_note`, `scheduler.py:76`) —
+The scheduled preamble spells that shape out (`_grants_note`, `scheduler.py:95`) —
 including "plain-text title and body, no backticks" — because a well-meant Markdown
 code span in the PR body would otherwise fail the match and fall back to asking. The
 pass added 36 tests, mostly bypass attempts: chains, newlines, `$(…)`, `$env:`,
@@ -2115,9 +2153,9 @@ nothing). Spaces, a registry and one enforcing client answer all three.
 
 ### Spaces: a column, not a database
 
-A **space** is a name (`validate_space`, `spaces.py:35`:
+A **space** is a name (`validate_space`, `spaces.py:41`:
 `[a-z0-9][a-z0-9_-]{0,47}`) carried on every memory and event (schema v3, M5) and
-mapped to a directory for skills and workflows (`space_dir`, `:50`). `default` is the
+mapped to a directory for skills and workflows (`space_dir`, `:72`). `default` is the
 user's main agent — everything from before spaces is there, and its procedures stayed
 in `data/skills|workflows`. One SQLite file, one FTS index, one consolidation pass —
 filtered by space at every layer.
@@ -2140,7 +2178,7 @@ cross-database merge.
 
 ### `MemoryScope` — what an agent may read and write
 
-`MemoryScope(read, write, source)` (`spaces.py:58`) is a frozen value: `read` is the
+`MemoryScope(read, write, source)` (`spaces.py:80`) is a frozen value: `read` is the
 ordered tuple of spaces recall searches, `write` is the one space saves land in,
 `source` is the provenance stamp. `__post_init__` validates every name and puts `write`
 first in `read` (deduplicated), so an agent always reads its own memory, and a second
@@ -2148,22 +2186,23 @@ writable space can't be expressed.
 
 ### The registry — identity → scope (`agents.py`)
 
-An `AgentProfile` (`agents.py:63`) has a `name` (its id), a `runtime` (`relife` = a
+An `AgentProfile` (`agents.py:101`) has a `name` (its id), a `runtime` (`relife` = a
 ReLife/Claude agent; `llm` = a CrewAI agent on a model string; `external` = anything
 that connects over MCP), `model`, `description`, its own `space` (defaults to its
-name), `inherits`, `isolated`, `parent`, `created_at` and a `token_hash`.
-`profile.scope()` (`:84`) is pure:
+name), `inherits`, `isolated`, `memory`/`collective` (below), `parent`, `created_at`
+and a `token_hash`. `profile.scope()` (`:135`) is pure:
 
 - **write** = its own space — never `default` (the name `default` is rejected for an
   agent, and a record whose space is `default` doesn't load);
-- **read** = own + `inherits` + `default`, unless `isolated` (own + inherits only —
-  for an agent on a third-party provider that shouldn't be shown the user's personal
-  memory).
+- **read** = own + `inherits` + the global `collective` + `default`, unless `isolated`
+  (own + inherits only — for an agent on a third-party provider that shouldn't be
+  shown the user's personal memory).
 
-`AgentStore` (`:155`) is `data/agents.json` with the `ScheduleStore` discipline (M10):
-lazy load, atomic tmp + `os.replace` writes, every record validated through
+`AgentStore` (`:223`) is `data/agents.json` with the `ScheduleStore` discipline (M10):
+read when the store is built, nothing written until the first change, atomic tmp +
+`os.replace` writes, every record validated through
 `from_dict` on load *and* on `put`, unreadable records dropped with the original file
-kept aside — never "repaired" into something wider. `scope_for(name)` (`:246`) raises
+kept aside — never "repaired" into something wider. `scope_for(name)` (`:334`) raises
 `LookupError` for an unknown name: **an unknown agent never falls back to the default
 scope.**
 
@@ -2188,12 +2227,12 @@ read-vs-write axes:
 |---|---|---|---|
 | **inherit** (`create_agent(inherit=…)`, `attach`) | read access to the parent's space | live | nothing — read-only |
 | **fork** (`create_agent(fork=…)`) | a copy of the parent's memories, skills, workflows | snapshot | the new agent's own space |
-| **promote** (`promote`, `:325`) | a copy of the agent's memories (+ skills/workflows, unless `--id` picks rows) | snapshot | `default` (or `--to`) |
+| **promote** (`promote`, `:439`) | a copy of the agent's memories (+ skills/workflows, unless `--id` picks rows) | snapshot | `default` (or `--to`) |
 | **pack** (`export_space` / `import_pack`) | a `relife-memory-pack` v1 JSON file | snapshot | the space it's imported into |
 
 The details that matter:
 
-- **Inheritance is transitive by flattening** (`create_agent`, `:257`): inheriting from
+- **Inheritance is transitive by flattening** (`create_agent`, `:345`): inheriting from
   `veteran` adds `veteran`'s own space *and* everything `veteran` inherits, so a lineage
   reads down its whole ancestry. A fork keeps its parent's inherits too.
 - **`copy_space` keeps strength and provenance** — importance, use count, embedding,
@@ -2209,10 +2248,43 @@ The details that matter:
   was dropped because a save can only land in *one* place, so a second "writable"
   space would be a write that silently goes somewhere else. Agents that should share
   writes are given the **same `--space`**.
-- **`delete_agent`** (`:341`) archives the agent's space (reversibly), unless another
-  agent still writes to it or `--keep-memory` is given.
+- **`delete_agent`** (`:455`) archives the agent's space (reversibly), unless another
+  agent still writes to it, it is a collective, or `--keep-memory` is given.
 
-### `ScopedMemoryClient` — the one enforcement point (`client.py:175`)
+### Individual or collective memory
+
+An agent's memory is `individual` (above: a space of its own) or `collective`. A
+collective agent writes a **shared pool** instead: the global `collective` space, or a
+named `collective-<name>` for one team (`AgentProfile.memory` / `.collective`;
+`own_space` resolves them, `spaces.collective_space`). Every non-isolated agent's scope
+reads the global collective after its own space and inherits and before `default`. A
+named collective is read only by its members and by agents that `attach` it.
+
+**Why.** Memory isn't free for every agent. A CrewAI member reaches it through tool calls,
+and on a free tier each tool call is a request it can't spare. Some agents (a one-off
+reviewer, a formatter) also have no use for a private history. Pooling their learnings
+keeps them useful to everyone, without the cost of each one consulting a memory of its
+own.
+
+**What keeps a pool from becoming the poisonable heap that spaces were built to avoid:**
+
+- **Importance is capped.** `ScopedMemoryClient.save` caps saves into any `collective*`
+  space at `COLLECTIVE_MAX_IMPORTANCE` (0.6), explicit or kind-default. No single writer,
+  least of all a small model, can make its memories dominate everyone's recall, and the
+  cap is enforced at the one scoped seam rather than trusted to a caller.
+- **Provenance is kept.** `source` names the writer, and recall labels it `via collective`.
+- **`default` stays out of reach.** Nothing writes it except the main agent and promote.
+- **The pool is never collateral.** Deleting a member never archives a collective (it is
+  everyone's), and a collective agent can't `fork` (that would copy a private snapshot
+  into the pool).
+- **Names are reserved.** `validate_new_agent_name` refuses `collective`/`collective-*` as
+  *new* agent names; an older record so named still loads, because dropping it would be
+  worse.
+
+`set_memory` moves an agent between homes. Future writes go to the new one, and the old
+one joins `inherits`, so nothing the agent learned stops being visible to it.
+
+### `ScopedMemoryClient` — the one enforcement point (`client.py:177`)
 
 Everything above is policy; this class is where it's enforced, and it's enforced by
 *shape*:
@@ -2244,7 +2316,7 @@ and for the tests that monkeypatch it). That is all `--agent` (M2), a crew membe
 
 > M13 mastery check: a space is a column plus a directory, so sharing is a query, not a
 > merge; store `None` = unfiltered, service `None` = default, `[]` = nothing; a scope
-> writes one space and reads own + inherited + default (unless isolated); inherit is
+> writes one space and reads own + inherited + collective + default (unless isolated); inherit is
 > live, read-only and transitive, while fork/promote/packs are snapshots that keep
 > provenance; promote is the only way into the user's memory; attachments are
 > read-only because a save lands in one place; `ScopedMemoryClient` enforces by having
@@ -2299,14 +2371,14 @@ agent ⇒ default space, read-write" fallback. stdout *is* the protocol stream, 
 here may print to it. `python -m relife` works (`relife/__main__.py`), which is what MCP
 client configs launch; `relife agent connect NAME` (and `create --runtime external`)
 prints a paste-ready config that pins `RELIFE_HOME`, so a client started from another
-directory still reaches the same memory (`mcp_config`, `agents.py:371`).
+directory still reaches the same memory (`mcp_config`, `agents.py:486`).
 
 **The Windows deadlock (worth remembering).** A real-stdio smoke, driven by the `mcp`
 SDK's own client, found that with embeddings on, `initialize` and `tools/list`
 answered but the **first `tools/call` hung forever**. The stdio transport's reader
 thread sits in a blocking read on the stdin pipe, and constructing fastembed /
 onnxruntime on a worker thread while that read was pending deadlocked. With
-`RELIFE_EMBEDDINGS=off` the same call answered in 0.1s. `_warm_up` (`:88`) embeds a
+`RELIFE_EMBEDDINGS=off` the same call answered in 0.1s. `_warm_up` (`mcp_server.py:88`) embeds a
 dummy string and touches the store **on the main thread before the loop starts**,
 which also makes the first call fast. A test pins the ordering, but the suite runs
 with embeddings off, so only the release smoke (`RELEASE_TESTING.md` §3) catches a
@@ -2315,7 +2387,7 @@ regression.
 ### Streamable HTTP: `/mcp` on the memory daemon
 
 For a client that would rather not spawn a process, the memory daemon (M8) mounts the
-same server at `/mcp` — stateless, JSON responses — behind `McpHttpEndpoint` (`:141`),
+same server at `/mcp` — stateless, JSON responses — behind `McpHttpEndpoint` (`mcp_server.py:141`),
 an ASGI endpoint that:
 
 1. **Authenticates an agent**, not a user: a `Bearer rla_…` token is matched against the
@@ -2326,10 +2398,10 @@ an ASGI endpoint that:
    stashes it in the ASGI scope (`relife.memory_client`); the tool handler reads it back
    from `server.request_context.request`. Nothing in the request body can name a space.
 3. **Guards against DNS rebinding** with the MCP SDK's transport security, allowed
-   hosts and origins derived from the bind address (`allowed_hosts_for`, `:131`).
+   hosts and origins derived from the bind address (`allowed_hosts_for`, `mcp_server.py:131`).
 
 Tokens are `rla_` + 32 random bytes, shown once and stored only as a hash
-(`issue_token`, `agents.py:355`); a lost token is rotated, not recovered.
+(`issue_token`, `agents.py:470`); a lost token is rotated, not recovered.
 
 ### Why the low-level server and not FastMCP
 
@@ -2361,7 +2433,7 @@ permission policy, memory and learning. `relife crew` uses each for what it's go
 at: **CrewAI orchestrates; ReLife provides the members, and the memory for every
 member.**
 
-### The pipeline (`runner.run_crew`, `runner.py:71`)
+### The pipeline (`runner.run_crew`, `runner.py:394`)
 
 ```
 task ─► plan (Claude, one tool-less call — or the user's --spec file) ─► validated CrewSpec
@@ -2371,19 +2443,21 @@ task ─► plan (Claude, one tool-less call — or the user's --spec file) ─�
 ```
 
 Everything that spends budget sits behind the confirmation (unless `--yes`): planning
-is one call and `--plan-only` stops after it. The record is saved *before* the prompt,
-so a declined plan is still on disk (`cancelled`), and the `finally` block always
-stamps and saves it (`done` / `error` / `interrupted`) and runs one
-`maybe_consolidate()` for the whole crew.
+is one call and `--plan-only` stops after it. `run_crew` is two halves composed:
+`prepare_crew` (`:85`, plan or validate, record `planned`) and `execute_crew` (`:136`,
+run a recorded plan) — the server calls them separately. The record is saved *before*
+the prompt, so a declined plan is still on disk (`cancelled`), and `execute_crew`'s
+`finally` block always stamps and saves it (`done` / `error` / `paused` /
+`interrupted`) and runs one `maybe_consolidate()` for the whole crew.
 
 ### The plan is untrusted output (`spec.py`, `planner.py`)
 
-`plan_crew` (`planner.py:75`) asks Claude — through `ask_model_oneshot`, so no tools
+`plan_crew` (`planner.py:86`) asks Claude — through `ask_model_oneshot`, so no tools
 and no API key — for a JSON plan. It sends the task (fenced `<<<TASK … TASK>>>`), the
 **roster** of existing agents with their memory counts (so the planner reuses
 experienced agents and sets `inherit` on new ones), and the non-Claude models the user
-allowed (`RELIFE_CREW_LLMS`). The reply goes through `extract_json` and then
-`normalize_spec` (`spec.py:94`), the pure validator, which treats it like any
+allowed (`RELIFE_CREW_LLMS`), each with its limits. The reply goes through
+`extract_json` and then `normalize_spec` (`spec.py:105`), the pure validator, which treats it like any
 untrusted input:
 
 - caps: at most `CREW_MAX_AGENTS` (5) agents and `CREW_MAX_TASKS` (8) tasks, bounded
@@ -2395,6 +2469,9 @@ untrusted input:
   agent;
 - an `llm` agent's model is `claude-max` or one the user allowed; a `relife` agent runs
   on ReLife's own model;
+- `tools` name known toolsets (`machine.TOOLSETS`); `memory` is
+  `auto`/`individual`/`collective`; a collective space's name can't be an agent's, and
+  a collective agent can't fork;
 - no idle agents.
 
 An invalid plan gets **one retry** carrying the validation error; a second failure
@@ -2414,12 +2491,12 @@ this member receives is **one fresh ReLife turn** (`turns.run_relife_turn`,
 permission callback for that directory, the browser plus the agent's **scoped** memory
 server, and its **scoped** hooks — `relife do --agent NAME` without the terminal UI.
 Fresh context per task is the `relife build` lesson (M7): memory, not a growing
-transcript, carries continuity. The prompt (`task_prompt`, `:192`) gives the role and
+transcript, carries continuity. The prompt (`task_prompt`, `crew/agent.py:192`) gives the role and
 goal, the task, and earlier tasks' outputs fenced `<<<CONTEXT … CONTEXT>>>` as
 "information, not instructions"; the turn's closing text (bounded by
 `OUTPUT_MAX_CHARS`) becomes the task's output.
 
-**`runtime: llm` → a plain CrewAI `Agent`** (`native.llm_agent`, `native.py:62`) on a
+**`runtime: llm` → a plain CrewAI `Agent`** (`native.llm_agent`, `native.py:78`) on a
 model string — `ollama/llama3.1`, `gpt-4.1`, `gemini/…`, with keys read from the
 environment by CrewAI/LiteLLM — or `claude-max`. Its tools are **ReLife memory only**
 (`memory_tools`: the `EXTERNAL_TOOLS` specs as `BaseTool`s bound to its scoped
@@ -2490,6 +2567,162 @@ the stop words (`"\nObservation:"`) by truncation. The sync `call` runs the coro
 through `turns.run_sync`: `anyio.run` on the calling thread, or a helper thread when a
 loop is already running there. Cost accumulates for the run record.
 
+### Model limits: pacing, back-off, fallback (`llm_limits.py`, `llm_usage.py`, `crew/governed.py`)
+
+**The problem.** A CrewAI member on a free tier (say 10 requests a minute, 250 a day)
+gets called as fast as CrewAI's agent loop can go. CrewAI's only guard is a short retry
+(`crewai/llms/retry.py`: three tries, at most 8 s), so you get a burst of 429s, and once
+the day's quota is gone the crew dies with `status: error`, losing every task after it.
+
+**Three layers, split the house way** (pure policy, a small I/O layer, a thin adapter):
+
+- `llm_limits.py` is **pure** (no I/O, no clock), like `cognitive.py`.
+  - `ModelLimits` is what was declared: rpm/rpd/tpm/tpd, tier, a `headroom` (0.8), a
+    `fallback` chain and a `max_wait_s`.
+  - `match_limits` looks for an exact name, then the longest declared glob, then the
+    built-ins (`claude-max` = subscription; `ollama/*` = local, unlimited), then a
+    conservative `RELIFE_LLM_DEFAULT_RPM` for anything undeclared.
+  - `decide(limits, usage, learned, now, est_tokens)` returns `go`, `wait` (how long, why)
+    or `exhausted` (until when). It checks a sliding 60 s window and a **rolling 24 h**
+    window, so it is right whatever time of day the provider resets. Per-minute limits are
+    paced at headroom × the learned factor. Daily limits are used in full; a quota error
+    still catches a key that another app shares.
+  - `adapt` is AIMD: a 429 halves the factor (floor 0.1) and sets a cooldown (from
+    `retry-after` when given), and the factor recovers 10% per quiet minute (computed
+    lazily in `effective_factor`, so nothing is written on success). A *daily* quota error
+    marks the model exhausted.
+  - `classify_error` walks the cause chain for a 429 status, a throttle code or rate-limit
+    text, plus retry hints (headers, Gemini's `retryDelay`, OpenAI/Groq's "try again in
+    7.66s"). It separates **throttle** (slow down) from **quota** (`insufficient_quota`,
+    "per day"). Gemini words its per-minute and per-day 429s identically except for the
+    metric name, so the marker list is deliberately specific.
+  - `tightness` counts only *declared* numbers. The default rpm is a guess, and a guess
+    shouldn't decide anything that lasts longer than one call's pacing.
+- `llm_usage.py` holds the state.
+  - A SQLite ledger (`data/llm_usage.db`, next to `spend.db` and built the same way): one
+    row per request, refused ones included because the provider counted them, plus the
+    `learned` row per model. It is one file, so the CLI, the server and two crews on the
+    same free key are paced *together*.
+  - `LimitsStore` is the declared-limits JSON file (`relife llm set`), with `AgentStore`'s
+    rules: nothing written until a change, atomic, unreadable records dropped (never
+    widened to unlimited), the original kept aside.
+  - Ledger errors are swallowed, like `budget.record`.
+- `crew/governed.py` has `GovernedLLM(BaseLLM)`, a delegating wrapper that `build_crew`
+  puts around **every** CrewAI LLM: each member's (from whatever `llm_factory` built it,
+  so injected test models are governed too) and the hierarchical manager. On each call:
+  1. Ask `decide` for each model in `[preferred, *fallback]`. The first one that can go
+     (or must wait no longer than its budget) is used, so a fallback switches back to the
+     preferred model as soon as that one resets.
+  2. Sleep in ≤5 s slices so a crew stop is seen.
+  3. Call the model and record the tokens (the LLM's own usage counter if it has one,
+     else chars/4).
+  4. If the provider refuses, record it and loop; if it raises anything else, re-raise.
+     After `MAX_ATTEMPTS` (20) refusals in one call it gives up on the call with
+     `QuotaPaused` (resume in a minute).
+  - With every model spent, wait if the soonest reset is within the wait budget, else
+    raise `QuotaPaused`.
+  - Switches are kept per member and charged to the task they happened in
+    (`TaskOutcome.model_switches`); the plan display shows each model's limits and
+    fallback.
+
+**CrewAI contract details the wrapper depends on** (read from the pinned 1.15.27
+source, then pinned by `tests/test_governed.py`):
+
+- `BaseLLM.__init_subclass__` wraps every subclass's `call`/`acall` in that short retry,
+  and **skips it for a nested call** (a context variable). Inside our `call`, the inner
+  model's 429 therefore reaches us on its first try.
+- Whatever *we* raise must never look like a throttle, or CrewAI retries us. So the
+  refusal is handled after the `except` block (no `__context__` to walk), and the pause
+  message avoids CrewAI's markers.
+- CrewAI's agent re-runs a failed task up to `max_retry_limit` times, except for
+  `HookAborted`. `QuotaPaused` and `GovernorStopped` subclass it: re-running a task
+  against an empty quota only burns time.
+- The per-call stop-word override is keyed by `id(llm)`, so the wrapper re-applies it to
+  the inner model (`call_stop_override(inner, self.stop_sequences)`).
+- **The provider SDK's own retry is off** (`native.default_llm` builds with `max_retries=0`
+  where the provider class has that field; OpenAI-compatible, Anthropic and Azure do). The
+  OpenAI SDK otherwise resends a 429 twice on its own. Every resend is a request the
+  provider counts, but the ledger never sees it and the wrapper learns nothing from it. A
+  smoke against a throttling fake endpoint showed 4 requests reaching a 3-rpm model while
+  the ledger counted 2. With the SDK retry off, the wrapper is the only one that retries.
+- The executor reads only `call`/`acall`, `supports_function_calling`/`stop_words`,
+  `stop`, `stream`, `get_context_window_size` and `get_token_usage_summary`, and the
+  wrapper forwards all of them. A real `kickoff()` with a native-function-calling fake
+  behind the wrapper is the spike test.
+
+**Up-front frugality.** A *tight* model's member also gets `max_iter =
+RELIFE_LLM_TIGHT_MAX_ITER` (8, against CrewAI's 25) and `respect_context_window`, since
+every loop iteration is one request. The planner is shown each model's limits and told to
+give tight ones few, short tasks.
+
+### Out of quota everywhere: pause, keep what finished, resume (`runner.py`, `record.py`)
+
+When a member's preferred model *and* its whole fallback chain are spent beyond the wait
+budget, the crew **pauses** instead of failing:
+
+- **Between tasks when it can.** In a sequential crew, `build_crew`'s `task_callback`
+  knows who is next and calls that member's `GovernedLLM.preflight()` (the same `_admit`,
+  without sleeping), so `QuotaPaused` is raised at the task boundary rather than part-way
+  into the next task.
+- **Mid-task otherwise.** A call that can't be admitted raises `QuotaPaused` from inside
+  the task. That task is lost and reruns on resume.
+- **Recorded as a pause, not an error.** `execute_crew` finds the `QuotaPaused` (walking the
+  cause chain, in case CrewAI wraps it) and records `status: paused`, `resume_after` (the
+  soonest reset) and `paused_reason`. It keeps every finished task through the same "keep
+  whatever finished" path an error takes.
+
+**Resume** (`resume_crew` · `prepare_resume` · `remaining_spec`):
+
+1. Only a `paused` or `interrupted` record resumes.
+2. `remaining_spec` keeps the tasks without a successful outcome, in order. A remaining
+   task that read a *finished* task's output gets that output in its description, fenced
+   as data, because CrewAI context needs a live `Task`. Only the agents that still have
+   work stay on the crew.
+3. `resume_blocked` checks every remaining `llm` member with `llm_usage.chain_blocked`. If
+   one is still spent, the resume is refused and `resume_after` moves to the new reset, so
+   an automatic retry can't spin.
+4. The same record and workspace continue, `resumed` is counted, and the finished tasks
+   are never redone.
+
+**Ways to resume:**
+
+- `relife crew --resume [ID]` (no ID: the most recent paused or interrupted crew).
+- `POST /crews/{id}/resume`, the console's **resume** button.
+- **Automatically**: each scheduler tick calls `CrewService.resume_due(now)`, which resumes
+  paused crews whose `resume_after` has passed. It is still subject to the daily budget and
+  `AGENT_MAX_CREWS`; a resume refused for those reasons is retried next tick.
+  `RELIFE_CREW_AUTO_RESUME=0` turns it off.
+
+`build_host(resume=True)` checks for a **live** host rather than any host ever registered,
+since a resumed crew had one before.
+
+### Memory for every member, whatever its model (`memory_policy.py`)
+
+`memory_policy.resolve(spec_agent, limits)` (pure) decides two things per member:
+
+- **mode**, for a *new* agent: `auto` (the default in a plan) becomes collective when the
+  model's *declared* limits are tight, individual otherwise; an explicit `individual` or
+  `collective` wins.
+- **access**: `lean` for a tight model (`RELIFE_LLM_LEAN_MEMORY=always|never` overrides
+  it), else `full`. ReLife members are always full, because their memory arrives through
+  hooks rather than requests.
+
+`ensure_profiles` creates new agents with the resolved mode. It **never moves a
+registered agent**: when auto would choose differently, the note says so and names the
+command (`relife agent set NAME --memory …`), for the same reason a plan's `inherit` is
+run-only. The plan display shows each member's `memory <mode> · <access>`.
+
+**Lean access** in `build_crew`: no memory tools (`llm_agent(with_memory_tools=False)`)
+and the recalled block at `LLM_LEAN_INJECT_BUDGET` (800 chars; `build_context(budget=)`)
+instead of 2400.
+
+**Every** `llm` member, lean or full, also gets the outcome of each finished task saved
+as an `episode` in its own memory (or the collective): `"[crew task] <description> →
+<output>"`, importance 0.4. ReLife writes it from the task callback with no model call.
+Before this, a CrewAI member learned only if its model chose to call `memory_save`, so
+"every agent has its own memory" was true of the *space* but not of what landed in it. An
+exact duplicate is reinforced, not re-added (`save`'s duplicate path).
+
 ### Contract surprises, and the defaults that stay off
 
 Two things CrewAI's docs don't say, found by reading the pinned 1.15.27 source and
@@ -2518,7 +2751,7 @@ ReLife hasn't vetted don't become autonomous by arriving with a crew.
 
 ### Where memory flows
 
-`ensure_profiles` (`build.py:32`) is the handoff point: a planned agent that doesn't
+`ensure_profiles` (`build.py:70`) is the handoff point: a planned agent that doesn't
 exist is created with the plan's `inherit`/`fork` (M13); one that exists is reused —
 and a planned `inherit` on it widens its reads **for that run only** (`build.run_scope`).
 It used to `attach` permanently, which let model output (the plan) change a registered
@@ -2533,9 +2766,9 @@ is the user's call.
 CrewAI 1.15 requires Python < 3.14, and ReLife on this machine runs on 3.14. The
 `[crewai]` extra carries the marker `python_version < '3.14'`, so it installs nothing
 there; the crew modules that import CrewAI (`llm`, `agent`, `native`, `memory_tools`,
-`build`) are imported only after `_crewai_or_exit()` gives a one-line fix, while
-`spec`, `planner`, `record`, `turns` and `runner` are CrewAI-free and tested
-everywhere. Crews run from a 3.12 `.venv`, where `tests/test_crew.py`
+`machine_tools`, `governed`, `build`) are imported only after `_crewai_or_exit()` gives
+a one-line fix, while `spec`, `planner`, `record`, `turns`, `runner`, `machine` and
+`memory_policy` are CrewAI-free and tested everywhere. Crews run from a 3.12 `.venv`, where `tests/test_crew.py`
 (`importorskip("crewai")`) runs a real `Crew.kickoff()` — a ReLife member on a fake
 turn runner and a CrewAI member on `ClaudeMaxLLM` with a stub model — with zero model
 calls.
@@ -2778,7 +3011,7 @@ multi-process test, not locally — which is why those tests exist.
    unsupported today. (Server *state* no longer dies with the process — sessions sleep to
    disk and resume, M9 — but it is still one user's server.)
 5. **Live verification is expensive and rationed.** Because live runs consume Max
-   budget, the team relies on the ~920 deterministic tests and avoids hammering live
+   budget, the team relies on the ~1,000 deterministic tests and avoids hammering live
    runs (the daily cap, M11, now makes "don't hammer" enforceable). Some end-to-end behaviors are validated less often than unit-level logic. The
    live crew smokes ran once (a plan, then a two-agent crew: $0.26 + $0.47) and caught two
    things no stub could: a warning on every run and crew episodes that all looked alike.
@@ -2840,8 +3073,10 @@ multi-process test, not locally — which is why those tests exist.
   cross-database merges; a `space` column keeps them single queries (M13).
 - **Why not writable attachments?** A save can only land in one place; a second
   writable space is a write that goes somewhere unexpected. Share a `--space` instead.
-- **Why not give CrewAI agents the shell?** `classify()` gates the Claude SDK's loop,
-  not CrewAI's. Machine-touching work goes to ReLife members (M15).
+- **Why not hand CrewAI agents ReLife's own tools?** `classify()` gates the Claude SDK's
+  loop, not CrewAI's. So a non-Claude member gets files or the shell only as opt-in
+  gated tools that ask the policy themselves (`classify_confined`, M15), and real
+  engineering work still goes to ReLife members.
 - **Why not CrewAI's own memory and planning?** They default to OpenAI embeddings and
   models and would demand a key, and they'd be a second memory beside ReLife's.
 - **Why not `anthropic/claude-…` through LiteLLM for Claude members?** That needs
@@ -2866,7 +3101,7 @@ multi-process test, not locally — which is why those tests exist.
 2. **`build_options`** (`agent.py:67`) assembles `ClaudeAgentOptions`: model, effort,
    preset+persona system prompt, the permission callback, MCP servers, hooks,
    `setting_sources=None`, `env` with `gh` on PATH.
-3. **Streaming client** starts (`agent.py:356`). `client.query(prompt)` sends the task.
+3. **Streaming client** starts (`agent.py:359`). `client.query(prompt)` sends the task.
 4. **`UserPromptSubmit` → `_recall_hook`** fires first: stashes the prompt by session,
    recalls top memories/skills/workflows through `default_client()` (reinforcing
    them), de-dups + budget-caps, and **injects** the surviving context.
@@ -2880,7 +3115,7 @@ multi-process test, not locally — which is why those tests exist.
 8. **`Stop` → `_episode_hook`** pops the prompt, sees ≥3 events, collapses the tool
    sequence, and saves `"Task: add a /health endpoint and push | Approach: Read → Edit
    → test → git-push"` as an episode.
-9. **`_maybe_consolidate`** (`agent.py:259`) asks the memory side to decide-and-run:
+9. **`_maybe_consolidate`** (`agent.py:261`) asks the memory side to decide-and-run:
    if enough events accrued it fades unused memories (two-tier), merges duplicates,
    and mines n-grams — if `Read → Edit → test → git-push` has now recurred ≥3 times,
    it synthesizes a workflow that **future `_recall_hook` calls will surface**. The
@@ -2895,7 +3130,7 @@ multi-process test, not locally — which is why those tests exist.
 1. **`relife serve`** is running: `create_app()` built the app, the lifespan started the
    reaper and the `Scheduler` tick loop.
 2. At 09:00:07 a tick finds the schedule due (`enabled and next_run_at <= now`). Its
-   session was reaped overnight, so `_submit` **creates one** in the schedule's
+   session was reaped overnight, so `_start` (via `_submit`) **creates one** in the schedule's
    confined workspace (`resolve_workspace`) — M2's three pieces with the UI approval
    callback — and stores the new `session_id` on the schedule.
 3. The scheduler **subscribes** to the session, then submits `scheduled_prompt()`
@@ -2904,7 +3139,7 @@ multi-process test, not locally — which is why those tests exist.
 4. The worker dequeues the turn and **echoes it as a `user` event** — the recorder sees
    the echo whose text equals its prompt and starts collecting.
 5. `_recall_hook` injects what ReLife knows about this inbox; the agent calls
-   `mcp__claude_ai_Gmail__search_messages` → `classify()` sees a **read verb → allow**.
+   `mcp__claude_ai_Gmail__search_threads` → `classify()` sees a **read verb → allow**.
 6. It decides to reply to one thread: `mcp__claude_ai_Gmail__send_message` → **write
    verb → ask**. `make_approval_callback` → `broker.request()` publishes an
    `approval_request` (tool + `to=… subject=…` brief) and awaits the future. Nobody is
@@ -2961,10 +3196,12 @@ multi-process test, not locally — which is why those tests exist.
 
 | File | Responsibility |
 |---|---|
-| `cli.py` | Typer CLI: `do`/`chat` (`--agent`)/`work`/`build`/`serve`/`doctor`/`consolidate`/`dream` + `memory {search,list,show,forget,stats,serve,ping,spaces,export,import}` + `agent {list,create,show,attach,detach,promote,token,connect,delete}` + `mcp` + `crew`/`crews`; wires permissions + MCP + hooks. |
+| `cli.py` | Typer CLI: `do`/`chat` (`--agent`)/`work`/`build`/`serve`/`doctor`/`consolidate`/`dream` + `memory {search,list,show,forget,stats,serve,ping,spaces,export,import}` + `agent {list,create,show,set,attach,detach,promote,token,connect,delete}` + `llm {list,set,unset,reset}` + `mcp` + `crew` (`--resume`)/`crews`; wires permissions + MCP + hooks. |
 | `__main__.py` | `python -m relife` (what MCP client configs launch). |
 | `agents.py` | `AgentProfile` (identity → `MemoryScope`), `AgentStore` (`data/agents.json`; writes re-read under a thread lock + file lock, `put(new=)`), `create_agent` (inherit/fork), `attach`/`detach`/`promote`/`delete_agent`, hashed `rla_` tokens, `mcp_config`. |
 | `budget.py` | The spend ledger (`data/spend.db`): `record`, `CostMeter` (cumulative → per turn), `spent`/`by_kind`/`status`, the optional daily cap (`check`, `exceeded`, `BudgetExceeded`). |
+| `llm_limits.py` | Pure model-limits policy: `ModelLimits`/`Learned`/`Usage`, `match_limits` (exact → glob → built-in → default), `decide` (60 s + rolling 24 h windows, headroom, AIMD factor), `adapt`, `classify_error` (throttle vs quota, retry hints), `tightness`. |
+| `llm_usage.py` | The model-usage ledger (`data/llm_usage.db`: calls + learned back-off, shared across processes) and `LimitsStore` (`data/llm_limits.json`); `model_status` for CLI/doctor/`GET /llms`. |
 | `_atomic.py` | `replace`/`read_text` retrying Windows sharing violations — every atomic JSON store uses it. |
 | `_filelock.py` | `file_lock(path)`: cross-process exclusive lock on a `.lock` sidecar (`msvcrt` / `fcntl`). |
 | `_proc.py` | `pid_alive` (Windows: `OpenProcess`/`GetExitCodeProcess`, never `os.kill`). |
@@ -2972,7 +3209,7 @@ multi-process test, not locally — which is why those tests exist.
 | `agent.py` | `build_options`, `run_task`/`run_chat`, `to_event` (shared taxonomy), `_render`, `ask_model_oneshot`, `maybe_consolidate` (+ `_off_loop`), `_tool_brief`, Windows UTF-8 fix. |
 | `permissions.py` | `classify()` pure policy; nested-shell re-classification; `_OUTWARD_SHELL` denylist (both shells); `_global_install`; `_gh_outward` (verb-based `gh`); `_write_targets`/`_delete_targets`/`_escapes` shell containment (+ `_msys_to_windows`); `_under()`; connector verb policy; grants (`normalize_grants`, `grant_allows`, `_pr_create_matches`); `make_permission_callback` (TTY) + `make_approval_callback` (UI, `preauthorize`). |
 | `hooks.py` | `_make_hooks(get_client)` → recall (inject+reinforce via `build_context`), event (journal), episode (capture); module trio over `default_client()`; `memory_hooks(client)` for a scoped agent; every call `off_loop`. |
-| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/budget/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/agents), `default_probes()`, `to_json`. |
+| `doctor.py` | `run_checks(Probes)` pure check matrix (CLI/login/api-key/model/budget/node/gh/FTS5/dirs/extras/daemon/agent server/schedules/connectors/crews/model limits/agents), `default_probes()`, `to_json`. |
 | `config.py` | All paths (`RELIFE_HOME`), model id, every cognitive/recall/REM/daemon/server/scheduler/grant/crew tunable, `default_mcp_servers(memory_client)`, `agent_env`. |
 | `web/index.html` | Self-contained console: auth prompt, transcript via `EventSource`, approval cards, reattach via `localStorage` + `?last_id=0`, schedules panel with watch/run/runs, work toggle and pre-approvals. |
 | `memory/cognitive.py` | Pure ACT-R math: `activation`, `sigmoid`, `fused_score`, `should_archive`, `should_hard_delete`. |
@@ -2983,7 +3220,7 @@ multi-process test, not locally — which is why those tests exist.
 | `memory/embeddings.py` | Soft-optional local ONNX embeddings; `available`/`embed`/`cosine`. |
 | `memory/service.py` | `MemoryService` facade: memory + `archive(id)`/`get(id)` + skills + workflows + events + spaces (`spaces`/`copy_space`/`archive_space`/`export_space`/`import_pack`) + `maybe_consolidate` (throttle decided here) + `dream`. |
 | `memory/client.py` | `MemoryClient` protocol, `LocalMemoryClient`, `ScopedMemoryClient` (the scope enforcement point), `default_client()` (env-selected transport), `off_loop`, daemon-sidecar warning. |
-| `memory/spaces.py` | `DEFAULT_SPACE`, `validate_space`, `space_dir`, `MemoryScope(read, write, source)`. |
+| `memory/spaces.py` | `DEFAULT_SPACE`, `validate_space`, `space_dir`, `MemoryScope(read, write, source)`; the collective (`COLLECTIVE_SPACE`, `is_collective`, `collective_space`). |
 | `memory/remote/wire.py` | Dependency-free dict ⇄ dataclass for every type that crosses the HTTP seam. |
 | `memory/remote/daemon.py` | FastAPI daemon: `_bind_db`/`_bind_dirs` (module-global binding, spaces dir included), routes mirroring the protocol (incl. `/spaces/*`), bulk routes off the loop (`bulk()`), constant-time token check, `/mcp` + its lifespan, sidecar file, `serve()`. |
 | `memory/remote/http_client.py` | `HttpMemoryClient`: pooled httpx, rebuilds real objects, 400→`ValueError`, `dream` off-thread with no timeout. |
@@ -3003,9 +3240,9 @@ multi-process test, not locally — which is why those tests exist.
 | `build/orchestrator.py` | `run_build`: fresh vs resume, ledger wiring, session persistence + expired-session fallback. |
 | `server/app.py` | `create_app()` (auth/cookie/CSRF wiring, sessions (restored on demand), SSE, approvals, schedules, runs, agents, crews, `/budget` routes; lifespan closes interrupted runs), `serve()` with `guard_bind`. |
 | `server/session.py` | `ApprovalBroker` (future + timeout), `EventStream` (ring, subscribers, `preload`), `AgentSession` (lazy `ClaudeSDKClient` with resume, `CostMeter`, `snapshot`, `busy`, per-turn grants + use cap), `SessionStore` (`data/sessions/`), `SessionManager` (ceiling, reaper that sleeps, `restore`, `close(forget=)`). |
-| `server/security.py` | Pure: `token_matches`, `presented_token`, `same_origin`, `is_loopback`, `guard_bind`, `resolve_workspace`, `AttemptLimiter`. |
-| `server/schedules.py` | `Schedule` record (grants, `work`, `worked`), `parse_every`/`parse_at`/`parse_days`/`normalize_spec`/`next_run` (explicit `now`), `normalize_work`, `check_grants_fit`, `ScheduleStore` (atomic JSON, corrupt file preserved). |
-| `server/crews.py` | `CrewHost` (a crew run as a session: `EventStream`, worker thread, `member_event`, cooperative stop), `LoopBroker` (cross-loop approvals), `CrewService` (plan / build_host / launch / start, `_pending` reservations, `AGENT_MAX_CREWS`), `crewai_available`. |
+| `server/security.py` | Pure: `token_matches`, `presented_token`, `same_origin`, `host_allowed`, `is_loopback`, `guard_bind`, `resolve_workspace`, `AttemptLimiter`. |
+| `server/schedules.py` | `Schedule` record (grants, `work`, `worked`, `crew`), `parse_every`/`parse_at`/`parse_days`/`normalize_spec`/`next_run` (explicit `now`), `normalize_work`, `normalize_crew`, `check_grants_fit`, `ScheduleStore` (atomic JSON, corrupt file preserved). |
+| `server/crews.py` | `CrewHost` (a crew run as a session: `EventStream`, worker thread, `member_event`, cooperative stop), `LoopBroker` (cross-loop approvals), `CrewService` (plan / build_host / launch / start / resume / `resume_due`, `_pending` reservations, `AGENT_MAX_CREWS`), `crewai_available`. |
 | `server/scheduler.py` | `Scheduler`: tick loop, `fire`/`_submit` (per-schedule session, skip-when-busy, advance-from-now), `_prepare_work` + `pick_issue` (work schedules), `bind_grants`, `_record` recorder, `scheduled_prompt`. |
 | `server/runs.py` | `summarize_events` (closing summary + denied + acted lists), `RunRecord`, `RunStore` (bounded per-schedule files). |
 | `crew/spec.py` | `AgentSpec`/`TaskSpec`/`CrewSpec`; `normalize_spec` (the plan's validator); `load_spec_file`; `single_agent_spec`. |
@@ -3013,11 +3250,15 @@ multi-process test, not locally — which is why those tests exist.
 | `crew/turns.py` | `run_relife_turn` (one fresh scoped ReLife turn), `TurnResult`, `result_from_events`, `run_sync`. |
 | `crew/agent.py` | `ReLifeAgent(BaseAgentAdapter)`, `crew_tools_server` (outside the trusted prefix), `task_prompt` (context fenced). |
 | `crew/llm.py` | `ClaudeMaxLLM(BaseLLM)`: Claude via `ask_model_oneshot`, ReAct text, stop words by truncation. |
-| `crew/native.py` | `default_llm`, `llm_agent` (CrewAI `Agent` with ReLife memory tools, no delegation), `journal_step`. |
+| `crew/memory_policy.py` | Pure `resolve(spec_agent, limits)` → `MemoryPlan(mode, collective, access, why)`: auto → collective for a tight model; lean access for a tight model. |
+| `crew/governed.py` | `GovernedLLM(BaseLLM)`: every crew model call paced under its limits; fallback chain; `QuotaPaused`/`GovernorStopped` (`HookAborted` subclasses, never retried by CrewAI). |
+| `crew/native.py` | `default_llm` (provider SDK retry off), `llm_agent` (CrewAI `Agent` with ReLife memory tools unless lean, gated machine tools if any, no delegation), `journal_step`. |
 | `crew/memory_tools.py` | `RelifeMemoryTool(BaseTool)` over a `ToolSpec`; `memory_tools(client)`. |
-| `crew/build.py` | `ensure_profiles` (the handoff point), `run_scope` (a reused agent's run-only reads), `build_crew` (scoped members, recall block for CrewAI tasks, stop + budget check per task, CrewAI memory/planning off). |
-| `crew/runner.py` | `prepare_crew` (plan/validate → record `planned`) + `execute_crew` (profiles → kickoff → outcomes → consolidate, owner `pid`), composed by `run_crew`; `roster`, `describe_plan`, telemetry off. |
-| `crew/record.py` | `TaskOutcome`, `CrewRunRecord` (+ `pid`), `CrewRunStore` (`data/crews/<id>/record.json`, id-shape checked, `reserve_id` by `mkdir`, `running` → `interrupted` once the owner is gone). |
+| `crew/machine.py` | Pure (no CrewAI): `MachineTools` — `read_file`/`list_files`/`write_file`/`edit_file`/`run_shell`, each described as a ReLife tool and judged by the injected `can_use_tool` before it acts; `TOOLSETS`, `TOOL_NAMES`. |
+| `crew/machine_tools.py` | `GatedMachineTool(BaseTool)` over a `MachineTools` method; `machine_tools(tools, toolsets)`. |
+| `crew/build.py` | `ensure_profiles` (the handoff point), `run_scope` (a reused agent's run-only reads), `build_crew` (scoped members, `GovernedLLM` around every CrewAI LLM, gated machine tools, recall block for CrewAI tasks, per-task episode for `llm` members, stop + budget + quota preflight per task, CrewAI memory/planning off), `terminal_approvals`. |
+| `crew/runner.py` | `prepare_crew` (plan/validate → record `planned`) + `execute_crew` (profiles → kickoff → outcomes → consolidate, owner `pid`, `paused` on `QuotaPaused`), composed by `run_crew`; `resume_crew`/`prepare_resume`/`remaining_spec`/`resume_blocked`; `roster`, `describe_plan`, telemetry off. |
+| `crew/record.py` | `TaskOutcome` (+ `model_switches`), `CrewRunRecord` (+ `pid`, `resume_after`, `paused_reason`, `resumed`), `CrewRunStore` (`data/crews/<id>/record.json`, id-shape checked, `reserve_id` by `mkdir`, `running` → `interrupted` once the owner is gone). |
 
 ---
 
@@ -3086,7 +3327,9 @@ extra Host names a tokenless server answers to (DNS-rebinding guard).
   `AGENT_SESSION_RETENTION_DAYS = 14` (sleeping sessions kept),
   `AGENT_REAP_INTERVAL = 60s`, `AGENT_MAX_MESSAGE_CHARS = 16000`,
   `AGENT_MAX_QUEUED_TURNS = 8`, `AGENT_MAX_SUBSCRIBERS = 8`.
-- `AGENT_WORKSPACE_ROOT = ./workspace` — containment root for server-created sessions.
+- `AGENT_WORKSPACE_ROOT = <RELIFE_HOME>/workspace` (`RELIFE_AGENT_WORKSPACE_ROOT`; the
+  same `DEFAULT_WORKSPACE` the CLI's `--workspace` defaults to) — containment root for
+  server-created sessions.
 
 **Scheduler / runs:** `AGENT_SCHEDULER = on` (`RELIFE_AGENT_SCHEDULER=0` disables),
 `AGENT_SCHEDULER_TICK = 30s`, `AGENT_MAX_SCHEDULES = 32`, `AGENT_MAX_CREWS = 1` (crews running at once),
@@ -3097,9 +3340,17 @@ per schedule, `AGENT_SCHEDULE_RUN_TIMEOUT = 7200s` (recorder gives up; agent not
 killed), `AGENT_GRANT_MAX_USES = 3` (pre-approved actions per run before falling back
 to asking).
 
-**Crews:** `CREW_MAX_AGENTS = 5`, `CREW_MAX_TASKS = 8`, `CREW_LLMS` (`RELIFE_CREW_LLMS`,
+**Crews:** `CREW_AUTO_RESUME = on` (a crew paused for quota resumes after the reset; `RELIFE_CREW_AUTO_RESUME=0`
+leaves it to `relife crew --resume`), `CREW_MAX_AGENTS = 5`, `CREW_MAX_TASKS = 8`, `CREW_LLMS` (`RELIFE_CREW_LLMS`,
 comma-separated non-Claude models the planner may staff; keys stay in the env for
 CrewAI/LiteLLM), `CREW_CLAUDE_LLM = claude-max` (always available).
+
+**Model limits:** `LLM_LIMITS_PATH = data/llm_limits.json` (`relife llm set`), `LLM_USAGE_PATH =
+data/llm_usage.db`, `LLM_DEFAULT_RPM = 10` (undeclared remote models; 0 = unpaced),
+`LLM_MAX_WAIT = 900s` (wait for a reset before falling back / pausing), `LLM_QUOTA_BACKOFF =
+3600s` (a daily-quota error with no retry-after), `LLM_TIGHT_RPM = 15` / `LLM_TIGHT_RPD = 500`
+(declared limits at or under these make a model *tight*), `LLM_TIGHT_MAX_ITER = 8`, `LLM_LEAN_MEMORY = auto` (`always`/`never`), `LLM_LEAN_INJECT_BUDGET = 800`
+chars, `COLLECTIVE_MAX_IMPORTANCE = 0.6`.
 
 Most are overridable via `RELIFE_*` environment variables (see `config.py`).
 
@@ -3109,5 +3360,5 @@ Most are overridable via `RELIFE_*` environment variables (see `config.py`).
 policy shape argument), then M5→M6 (the relevance gate and why reinforcement is
 safe), then M8→M10 (why the daemon binds globals, why auth needs a cookie, why a
 scheduled run is a turn), then M13→M15 (why scope comes from identity, why tools are
-defined once, why a CrewAI agent gets no shell), and finally M9's *Sessions sleep* and
+defined once, why a CrewAI agent's tools must carry the gate themselves), and finally M9's *Sessions sleep* and
 M11's budget (why a cost is cumulative, why the cap is checked only at the door).*
