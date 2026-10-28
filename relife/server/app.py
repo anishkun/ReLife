@@ -85,6 +85,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from .. import __version__
 from .. import agents as agents_mod
 from .. import budget
 from .. import config
@@ -237,7 +238,7 @@ def create_app(
 
     app = FastAPI(
         title="ReLife agent server",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
         dependencies=[Depends(require_known_host)],
     )

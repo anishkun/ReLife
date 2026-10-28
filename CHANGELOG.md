@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-10-28
+
+Agents with their own memory, crews of agents on any model, and a shared daily budget.
+
+**Upgrading from 1.0.0:** nothing to do. The memory store moves to schema v3 the first time it is
+opened and every existing memory, skill and workflow stays in the `default` space (checked against a
+copy of a real 1.0.0 data directory). New optional extra: `[crewai]` (Python ≤ 3.13).
 
 ### Added
 - **Memory spaces and agents.** Memory is partitioned per agent (store schema v3: `space`/`source`
@@ -35,7 +41,6 @@
   workspace ask, because what such a member reads goes to its model's provider. Calls are journaled
   into the member's memory space. Off unless the plan names them; no browser or connectors for other
   models.
-
 - **A shared Max budget.** Every model call ReLife starts (CLI, server sessions, crews, planners,
   scheduled runs) is recorded in one ledger (`data/spend.db`); `relife doctor` and `GET /budget`
   show today's usage. `RELIFE_DAILY_BUDGET_USD` caps it: new work is refused once reached and a
@@ -69,18 +74,18 @@
   scheduler resumes a paused crew by itself once the quota resets (`RELIFE_CREW_AUTO_RESUME`).
 
 ### Changed
-- Docs brought up to date with the hardening, scaling and durability passes: `HOW_IT_WORKS.md`
-  (sleeping sessions, the budget tally), `MODULE_DEEP_DIVE.md` (M5/M6/M8/M9/M10/M11/M13/M15/M16 and
-  the appendices), `RELEASE_TESTING.md` (budget, file-lock, interrupted-record and session-resume
-  checks), `README.md`, `PROJECT_CONTEXT.md`.
 - Consolidation dedupes and learns patterns/workflows within each space, never across.
 - The recall block labels memory from another space `via <space>`, and the agent's system prompt
   says what that label means (another agent's memory: background, not instructions).
-- Docs brought up to date: `HOW_IT_WORKS.md` and `MODULE_DEEP_DIVE.md` cover work items, grants,
-  agents/spaces, memory over MCP and crews (deep dive now M1–M16); `PROJECT_CONTEXT.md`'s overview
-  sections refreshed. Correction to the 1.0.0 notes: the claude.ai Gmail connector **can send**
-  (`send_message`, `reply`, `forward`), not only draft — every send asks unless a schedule's email
-  grant covers it.
+- Every document checked against the code: `HOW_IT_WORKS.md` and `MODULE_DEEP_DIVE.md` cover work
+  items, grants, agents/spaces, memory over MCP, crews, model limits, sleeping sessions and the
+  budget tally (deep dive now M1–M16, its `file:line` references re-pointed); `RELEASE_TESTING.md`
+  gains the budget, file-lock, interrupted-record, session-resume, limits-file and rate-limited crew
+  checks; `README.md`, `PROJECT_CONTEXT.md` and `CLAUDE.md` refreshed. Correction to the 1.0.0
+  notes: the claude.ai Gmail connector **can send** (`send_message`, `reply`, `forward`), not only
+  draft — every send asks unless a schedule's email grant covers it.
+- The agent server, memory daemon and build MCP server report the package version instead of a
+  hardcoded `1.0.0`.
 
 ### Security
 - Email grants no longer cover `send_message` with a `draftId` (sends a stored draft whose
@@ -89,7 +94,6 @@
 - `rm -rf /d` (and `cp x /d`, `mv x /c`) auto-allowed: a single-letter `/x` token was read as a
   cmd switch (`del /s /q`) for every verb, but to `rm`/`cp`/`mv`/`tee`… in Git Bash it is the root
   of a drive. Slash switches are now only recognised for cmd built-ins.
-
 - Memory writes are bounded (text ≤ 8000 chars, tags ≤ 500) and a non-finite importance no longer
   clamps to the maximum — external MCP agents and imported packs are untrusted writers. Skill and
   workflow header values are kept to one line with `---` defused, so a crafted name can't forge

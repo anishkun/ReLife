@@ -15,6 +15,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from .. import __version__
 from .ledger import BuildLedger
 
 
@@ -94,6 +95,6 @@ def build_server(ledger: BuildLedger):
     """Return the MCP server config bound to ``ledger``."""
     return create_sdk_mcp_server(
         name="relife_build",
-        version="1.0.0",
+        version=__version__,
         tools=build_tools(ledger),
     )

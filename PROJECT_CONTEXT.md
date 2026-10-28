@@ -18,23 +18,22 @@ measurably better at recurring tasks.
   web console with schedules and run records, GitHub work items (`relife work`, work
   schedules), Gmail/Calendar/Drive via the claude.ai connectors with narrow
   pre-approvals, `relife doctor`.
-- **Platform pass (built 2026-10-10, unreleased):** agents with their own memory spaces,
+- **1.1.0 (2026-10-28)** releases everything below (PRs #7–#14; see `CHANGELOG.md`).
+- **Platform pass (built 2026-10-10):** agents with their own memory spaces,
   memory handoff (inherit/fork/promote/packs), ReLife memory over MCP for any LLM, and
   `relife crew` (CrewAI plans a team, ReLife staffs it).
-- **Platform in the server (built 2026-10-10, unreleased):** `/agents` `/spaces` `/crews`
+- **Platform in the server (built 2026-10-10):** `/agents` `/spaces` `/crews`
   routes, crews run under `relife serve` with members' approvals in the browser, crew
   schedules, Agents + Crews panels in the web console.
-- **Hardening, scaling and durability (built 2026-10-10/11, merged as PRs #9 and #10,
-  unreleased):** bounded memory writes and untrusted-input fixes, memory that stays fast
+- **Hardening, scaling and durability (built 2026-10-10/11, merged as PRs #9 and #10):** bounded memory writes and untrusted-input fixes, memory that stays fast
   at size (indexed dedupe, cached procedures, per-thread WAL connections, per-space event
   mining), a shared Max budget with an optional daily cap, console sessions that sleep and
   resume across restarts, a cross-process lock on the agent registry, and records that
   read `interrupted` once their process is gone.
-- **Gated machine tools for non-Claude crew members (built 2026-10-11, unreleased):** an
+- **Gated machine tools for non-Claude crew members (built 2026-10-11, PR #12):** an
   `llm` member the plan gives `"tools": ["files", "shell"]` acts through tools that ask
   ReLife's permission gate themselves (`crew/machine.py`), reads held to the workspace.
-- **Limit-aware crew models, collective memory, crew pause/resume (built 2026-10-12, on branch
-  `feat/crew-resume` — not yet merged or pushed):** every crew model call paced under its
+- **Limit-aware crew models, collective memory, crew pause/resume (built 2026-10-12, PR #14):** every crew model call paced under its
   declared/learned limits with a fallback chain (`relife llm …`), agents with individual or
   collective memory (lean access for tight models), and a crew that pauses when every model is out
   of quota and resumes later (§8).
