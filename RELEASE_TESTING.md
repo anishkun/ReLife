@@ -108,7 +108,12 @@ Max budget (roughly $4–7 in total) and should run once per release, not per co
       backs off (`relife llm list` shows it cooling), the fallback takes over when the quota runs out and
       the run record lists the switch; with the whole chain spent the crew records `paused`, and after the
       reset `relife crew --resume` runs only the unfinished tasks. The provider's request count matches
-      `llm_usage.db` (its SDK must not retry on its own)
+      `llm_usage.db` (its SDK must not retry on its own). Against a fake endpoint, name a real OpenAI
+      model (`openai/gpt-4o-mini` + `OPENAI_BASE_URL`): CrewAI's native provider rejects an unknown
+      name unless LiteLLM is installed
+- [ ] **denials reach the record**: a one-member `--spec` crew whose task runs `curl -X POST …`, run
+      non-interactively → the runner echoes "1 action(s) denied", `relife crew` ends with a "needed you"
+      block naming the command, and `relife crews <id>` lists it under the task
 
 - [ ] **session resume** (scratch `RELIFE_HOME`, idle timeout 20 s, ~$1): turn 1 gives a code word ("don't
       save it, no tools"); after the session sleeps, turn 2 asks for it → recalled; force-kill and restart

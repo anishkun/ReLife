@@ -39,6 +39,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.routing import Route
 
+from ... import __version__
 from .. import events as _events
 from .. import mcp_server as _mcp
 from .. import skills as _skills
@@ -119,7 +120,7 @@ def create_app(
         async with mcp_manager.run():
             yield
 
-    app = FastAPI(title="ReLife memory daemon", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="ReLife memory daemon", version=__version__, lifespan=lifespan)
     # Any MCP client, as a registered agent (bearer token), scoped to its spaces.
     app.router.routes.append(
         Route(

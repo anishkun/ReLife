@@ -49,7 +49,7 @@ from .memory_policy import MemoryPlan, resolve
 from .machine import CanUseTool, MachineTools
 from .native import _UNSERIALIZABLE_CALLBACK, LlmFactory, default_llm, llm_agent
 from .spec import CARRIED_MARK, CrewSpec
-from .turns import OnEvent
+from .turns import OnEvent, recording_denials
 
 # (agent name, workspace, policy) -> the can_use_tool its machine tools ask.
 Approvals = Callable[[str, Path, Any], CanUseTool]
@@ -144,7 +144,7 @@ def build_crew(
     ``kickoff()`` raises. ``approvals`` builds the gate for an ``llm`` member's
     machine tools (default: :func:`terminal_approvals`). ``llm_outcomes``, if
     given, is filled as each ``llm`` member's task finishes: ``{task: {"output",
-    "cost_usd", "model_switches"}}`` — CrewAI members have no turn result, so
+    "cost_usd", "model_switches", "denied"}}`` — CrewAI members have no turn result, so
     this is where their cost (the change in their LLM's running total) comes
     from. ``on_note(agent, text)`` hears the governor pace, back off or switch
     models; ``limits`` is the declared-limits table (default: the user's file)."""
@@ -157,6 +157,7 @@ def build_crew(
     members: dict[str, Any] = {}
     llms: dict[str, Any] = {}
     scoped: dict[str, ScopedMemoryClient] = {}
+    refused: dict[str, list[dict[str, Any]]] = {}  # llm member -> machine-tool calls denied since its last task
     for a in spec.agents:
         scoped[a.name] = ScopedMemoryClient(client, run_scope(a, store))
         if a.runtime == "relife":
@@ -179,9 +180,10 @@ def build_crew(
                 from .machine_tools import machine_tools
 
                 mem = scoped[a.name]
+                refused[a.name] = []
                 tools = MachineTools(
                     workspace,
-                    approvals(a.name, workspace, classify_confined),
+                    recording_denials(approvals(a.name, workspace, classify_confined), refused[a.name]),
                     journal=lambda tool, brief, m=mem, t=task_id: m.log_event(tool, brief=brief, task_id=t),
                 )
                 gated = machine_tools(tools, a.tools)
@@ -230,12 +232,15 @@ def build_crew(
             switched[agent_name] = len(switches)
             raw = str(getattr(output, "raw", "") or "")
             remember(agent_name, description, raw)
+            denied = refused.get(agent_name, [])
             if llm_outcomes is not None:
                 llm_outcomes[task_name] = {
                     "output": raw,
                     "cost_usd": cost,
                     "model_switches": [s.line() for s in new],
+                    "denied": list(denied),
                 }
+            denied.clear()
 
         return done
 

@@ -65,6 +65,28 @@ def result_from_events(events: list[dict[str, Any]]) -> TurnResult:
     )
 
 
+def recording_denials(can_use_tool: Any, sink: list[dict[str, Any]]) -> Any:
+    """``can_use_tool`` that also notes every call it refuses in ``sink`` —
+    ``{tool, brief, reason}``, the shape a task outcome's ``denied`` has. The
+    approval events go to the broker or the terminal, never into the member's
+    own event stream, so without this a crew task never listed what it was
+    refused (the "needed you" list stayed empty)."""
+
+    async def gate(tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+        decision = await can_use_tool(tool_name, tool_input, context)
+        if getattr(decision, "behavior", None) != "allow":
+            from ..agent import _tool_brief
+
+            sink.append({
+                "tool": tool_name,
+                "brief": _tool_brief(tool_input),
+                "reason": getattr(decision, "message", "") or "",
+            })
+        return decision
+
+    return gate
+
+
 async def run_relife_turn(
     prompt: str,
     *,
@@ -80,9 +102,10 @@ async def run_relife_turn(
     from ..agent import build_options, to_event
     from ..hooks import memory_hooks
 
+    denied: list[dict[str, Any]] = []
     options = build_options(
         cwd=workspace,
-        can_use_tool=can_use_tool,
+        can_use_tool=recording_denials(can_use_tool, denied),
         mcp_servers={**config.default_mcp_servers(memory_client), **(extra_mcp or {})},
         hooks=memory_hooks(memory_client),
     )
@@ -100,7 +123,9 @@ async def run_relife_turn(
                         on_event(ev)
     except Exception as e:  # noqa: BLE001 — a failed member is an outcome, not a crash
         events.append({"type": "error", "message": str(e)})
-    return result_from_events(events)
+    result = result_from_events(events)
+    result.denied = [*result.denied, *denied]
+    return result
 
 
 def run_sync(fn: Callable[[], Awaitable[Any]]) -> Any:

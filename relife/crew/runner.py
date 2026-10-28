@@ -230,7 +230,7 @@ def execute_crew(
                     tool_calls=r.tool_calls if r else 0,
                     cost_usd=r.cost_usd if r else lr.get("cost_usd"),
                     error=r.error if r else None,
-                    denied=r.denied if r else [],
+                    denied=r.denied if r else lr.get("denied", []),
                     model_switches=lr.get("model_switches", []),
                 )
             )
@@ -267,7 +267,7 @@ def execute_crew(
                     TaskOutcome(
                         name=name, agent=t.agent if t else "?", runtime="llm",
                         output=lr.get("output", ""), cost_usd=lr.get("cost_usd"),
-                        model_switches=lr.get("model_switches", []),
+                        model_switches=lr.get("model_switches", []), denied=lr.get("denied", []),
                     )
                 )
     finally:
