@@ -22,7 +22,7 @@
 > passes (PRs #9 and #10) are folded into the modules they changed — M5, M6, M8, M9,
 > M10, M11, M13, M15 and M16; the gated machine tools, model limits and crew
 > pause/resume are in M15. The test suite is **~980–1,020 deterministic tests** (4 of
-> them `semantic`) — on 2026-10-14, 969 passed + 13 skipped on Python 3.14, and 1,016
+> them `semantic`) — on 2026-10-28, 974 passed + 13 skipped on Python 3.14, and 1,021
 > passed + 1 skipped in the 3.12 `.venv` where CrewAI, sqlite-vec and fastembed are installed
 > (`python -m pytest tests/` — use the interpreter ReLife is installed into; on this
 > machine that is `py -3`, or `.venv\Scripts\python` for the crew tests).
@@ -1455,7 +1455,7 @@ lifetime. The split is the payoff of M5's seams — and the interesting part is 
 - **`daemon.py`** — `create_app(db_path, token, skills_dir, workflows_dir,
   spaces_dir, agents_path, mcp_hosts)` returns the FastAPI app; `serve()` runs
   uvicorn. Routes mirror the `MemoryClient` protocol one-to-one
-  (`daemon.py:170–345`, after `/health`): `/save`, `/recall`, `/forget`, `/archive`, `/memories`,
+  (`daemon.py:171–346`, after `/health`): `/save`, `/recall`, `/forget`, `/archive`, `/memories`,
   `/memories/{id}`, `/count`, `/spaces`, `/spaces/copy`, `/spaces/archive`,
   `/spaces/{space}/export`, `/spaces/import`, `/consolidate`, `/consolidate/maybe`,
   `/dream`, `/skills/*`, `/workflows/*`, `/events/*` — plus `/mcp`, the same memory
@@ -1468,9 +1468,9 @@ lifetime. The split is the payoff of M5's seams — and the interesting part is 
 ### The binding trick (the thing to really understand)
 
 The obvious design is "inject a `MemoryStore` into the service." The daemon
-deliberately does **not** do that. `_bind_db()` (`daemon.py:54`) instead **reassigns
+deliberately does **not** do that. `_bind_db()` (`daemon.py:55`) instead **reassigns
 the module-level globals** `store._DB_PATH` and `events._DB_PATH` to the daemon's DB,
-and `_bind_dirs()` (`daemon.py:71`) does the same for `skills._SKILLS_DIR`,
+and `_bind_dirs()` (`daemon.py:72`) does the same for `skills._SKILLS_DIR`,
 `workflows._WORKFLOWS_DIR` and `spaces._SPACES_DIR` (where non-default spaces keep
 their procedures). Then it constructs a plain default `MemoryService()`.
 
@@ -1517,7 +1517,7 @@ failure modes match, not just success modes.
 ### The sidecar: advisory, never a lock
 
 `serve()` writes `data/relife.db.daemon` (pid + url) next to the DB and removes it on
-shutdown (`daemon.py:350, 388`). A process that then goes in-process **without**
+shutdown (`daemon.py:351, 389`). A process that then goes in-process **without**
 `RELIFE_MEMORY_URL` sees the sidecar and **warns** (`client._warn_if_daemon_running`,
 `client.py:311`) — it does not refuse. A crash or SIGKILL can orphan the sidecar, and a
 stale marker must never brick the default path. `relife doctor` surfaces the same
@@ -1637,7 +1637,7 @@ as the daemon; the difference is that here a suspended coroutine is a *blocked a
 run*, which is precisely what you want — the agent physically cannot proceed past
 an outward action until a human clicks.
 
-### The SSE stream and reconnect (`app.py:394`)
+### The SSE stream and reconnect (`app.py:395`)
 
 `GET /sessions/{id}/events` is a `StreamingResponse` (no `sse-starlette`
 dependency). It:
@@ -1661,7 +1661,7 @@ up in use: every reload spawned a **second `ClaudeSDKClient` subprocess**, orpha
 the first until the idle reaper, lost the transcript, and after
 `AGENT_MAX_SESSIONS` reloads returned 429 with no way out. So the page remembers its
 session id in `localStorage` (`web/index.html:435`), **probes** `GET /sessions/{id}`
-(`app.py:344`) on load, and if alive reattaches by streaming `?last_id=0` — replay the
+(`app.py:345`) on load, and if alive reattaches by streaming `?last_id=0` — replay the
 whole ring (`web/index.html:586`). A fresh page has no `Last-Event-ID` (that's
 per-`EventSource`), which is why the query form exists; the route prefers the header
 so an *automatic* reconnect still resumes rather than replays. A "new session" button
@@ -1691,19 +1691,19 @@ a plain function with no I/O — the `cognitive.py` discipline applied to securi
   *before* checking so `..` and symlinks are caught (M3's `_under`, one level up).
 - **`AttemptLimiter`** (`:132`) — fixed-window per-address counter for token guessing.
 
-`app.py` only wires these to routes (`app.py:229–269`).
+`app.py` only wires these to routes (`app.py:230–270`).
 
 ### Why auth accepts a cookie (and why you must not "simplify" it away)
 
 A browser **`EventSource` cannot set request headers.** With header-only bearer auth,
 the SSE stream — the one route that carries the *entire transcript and every approval
 prompt* — was the one route the UI could never authenticate. So `POST /auth`
-(`app.py:301`) exchanges the token for an **HttpOnly, `SameSite=Strict`** cookie, and
+(`app.py:302`) exchanges the token for an **HttpOnly, `SameSite=Strict`** cookie, and
 every route accepts *either* carrier. Bearer stays for programmatic clients.
 
 Cookie auth is *ambient* — the browser attaches it to any request to that origin —
 which is why mutating routes additionally require same-origin (`mutate =
-[same_origin, token]`, `app.py:269`). Drop the cookie and the UI can't see its own
+[same_origin, token]`, `app.py:270`). Drop the cookie and the UI can't see its own
 agent; drop the Origin check and a cross-site page could drive it. Both halves are
 load-bearing. Failed `/auth` attempts are rate-limited per client address.
 
@@ -1714,7 +1714,7 @@ load-bearing. Failed `/auth` attempts are rate-limited per client address.
 auto-allow blast radius — `{"workspace": "C:\\"}` and the whole disk is writable
 without a prompt. `resolve_workspace` confines every server-created session to
 `AGENT_WORKSPACE_ROOT` (default `<RELIFE_HOME>/workspace`) and rejects escapes with a 400
-(`app.py:336`). The CLI's `--workspace` is deliberately *not* confined: that's the
+(`app.py:337`). The CLI's `--workspace` is deliberately *not* confined: that's the
 local user speaking directly, not a request body.
 
 ### Everything is bounded, because the process never exits
@@ -1741,7 +1741,7 @@ event so the console shows the brain ticking.
 
 ### Testing with zero model calls
 
-`create_app(session_factory=...)` (`app.py:140`) accepts an injected factory. Tests
+`create_app(session_factory=...)` (`app.py:141`) accepts an injected factory. Tests
 pass a fake `AgentSession` that emits scripted events, so the **whole HTTP + SSE +
 approval flow** — auth, cookie, CSRF, 429s, reattach, approval resolve/timeout — runs
 without a model, the same discipline as `rem.ask_model`. Nothing in `create_app`
@@ -2487,14 +2487,18 @@ reject the plan's own history.
 **`runtime: relife` → `ReLifeAgent(BaseAgentAdapter)`** (`crew/agent.py:90`). CrewAI's
 "bring your own agent" contract lets a crew contain agents it didn't build. Each task
 this member receives is **one fresh ReLife turn** (`turns.run_relife_turn`,
-`turns.py:68`): a new `ClaudeSDKClient` in `<workspace>/crews/<id>/`, ReLife's
+`turns.py:90`): a new `ClaudeSDKClient` in `<workspace>/crews/<id>/`, ReLife's
 permission callback for that directory, the browser plus the agent's **scoped** memory
 server, and its **scoped** hooks — `relife do --agent NAME` without the terminal UI.
 Fresh context per task is the `relife build` lesson (M7): memory, not a growing
 transcript, carries continuity. The prompt (`task_prompt`, `crew/agent.py:192`) gives the role and
 goal, the task, and earlier tasks' outputs fenced `<<<CONTEXT … CONTEXT>>>` as
 "information, not instructions"; the turn's closing text (bounded by
-`OUTPUT_MAX_CHARS`) becomes the task's output.
+`OUTPUT_MAX_CHARS`) becomes the task's output. The permission callback goes in wrapped by
+`recording_denials` (`turns.py:68`), which notes every call it refuses: the approval itself
+is decided by the broker or the terminal, outside the turn's event stream, so without it a
+task's `denied` — the record's "needed you" list — stayed empty. An `llm` member's gated
+machine tools get the same wrapper in `build_crew`, drained into that task's outcome.
 
 **`runtime: llm` → a plain CrewAI `Agent`** (`native.llm_agent`, `native.py:78`) on a
 model string — `ollama/llama3.1`, `gpt-4.1`, `gemini/…`, with keys read from the

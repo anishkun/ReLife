@@ -53,6 +53,22 @@ def test_create_inherit_show_list(cli):
     assert r.exit_code == 0 and "reads" in r.output and "researcher" in r.output
 
 
+@pytest.mark.parametrize("status,code", [("done", 0), ("paused", 0), ("error", 1), ("interrupted", 1)])
+def test_crew_exit_code_follows_the_outcome(cli, monkeypatch, status, code):
+    from types import SimpleNamespace
+
+    from relife import cli as cli_mod
+    from relife.crew import runner
+
+    record = SimpleNamespace(id="c1", status=status, tasks=[], cost_usd=0.0, final_output="",
+                             error="boom" if status == "error" else None)
+    monkeypatch.setattr(cli_mod, "_crewai_or_exit", lambda: None)
+    monkeypatch.setattr(runner, "run_crew", lambda *a, **kw: record)
+    r = run("crew", "anything", "--yes", "-w", str(cli[1]))
+    assert r.exit_code == code, r.output
+    assert f"crew c1: {status}" in r.output
+
+
 def test_create_errors_exit_2(cli):
     assert run("agent", "create", "default").exit_code == 2
     assert run("agent", "create", "x", "--inherit", "ghost").exit_code == 2

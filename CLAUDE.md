@@ -16,7 +16,7 @@ pip install -e ".[server]"        # + optional always-on agent server + web UI (
 pip install -e ".[crewai]"        # + `relife crew` (CrewAI). CrewAI needs Python <= 3.13: on this machine
                                   #   use the 3.12 venv (`py -3.12 -m venv .venv`; `.venv\Scripts\python`);
                                   #   on 3.14 the extra installs nothing and tests/test_crew.py skips
-python -m pytest tests/           # run all tests (~970 pass on 3.14, ~1,016 in the 3.12 venv; deterministic + 4 semantic) — use the interpreter
+python -m pytest tests/           # run all tests (~975 pass on 3.14, ~1,020 in the 3.12 venv; deterministic + 4 semantic) — use the interpreter
                                   #   ReLife is installed into (plain `python` may lack the SDK; `py -3` here)
 python -m ruff check relife tests scripts   # lint baseline ([tool.ruff] in pyproject); kept at zero findings
 python -m pytest tests/test_permissions.py::test_name -v   # single test

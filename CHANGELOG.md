@@ -116,6 +116,12 @@ copy of a real 1.0.0 data directory). New optional extra: `[crewai]` (Python ≤
   space's own recent events, so a busy agent no longer hides a quiet one's patterns.
 
 ### Fixed
+- A crew task never listed what it was refused: approvals are decided by the broker (console card)
+  or the terminal, outside the member's own event stream, so every task outcome's `denied` was empty
+  and the "needed you" list never showed — for ReLife members and for other models' gated machine
+  tools alike. The gate now records each refusal itself (found by the live smoke).
+- `relife crew` exited 0 when the crew ended in `error` or `interrupted`; it now exits 1 (a paused
+  crew still exits 0 — it resumes).
 - A crew model's provider SDK no longer retries a refused request on its own (the OpenAI SDK resent
   each 429 twice): those requests counted against a free tier's quota but never reached the usage
   ledger. CrewAI LLMs are built with `max_retries=0` where the provider has that setting; the

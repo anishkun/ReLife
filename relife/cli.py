@@ -1096,6 +1096,10 @@ def crew_cmd(
         "`relife agent promote NAME` moves it into your main memory",
         fg=typer.colors.BRIGHT_BLACK,
     )
+    # A paused crew is an expected outcome (it resumes); an error is not, and a
+    # script or scheduler wrapping `relife crew` must be able to tell.
+    if record.status not in ("done", "paused"):
+        raise typer.Exit(1)
 
 
 @app.command("crews")

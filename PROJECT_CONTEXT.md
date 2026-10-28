@@ -95,8 +95,8 @@ policy) → reflect (agent calls `memory_save` / `skill_write` for durable lesso
 | 5 | Memory (retrieval A) | ✅ taught ruff+gitignore in run A; **unrelated** run B applied both unprompted |
 | 6 | Skills (B) | ✅ agent wrote `push-new-github-repo` skill live; recall hook surfaces skills (deterministic test) |
 
-**Tests:** ~1,000 passing (2026-10-14) — 969 passed + 13 skipped on Python 3.14 (the CrewAI modules
-skip), 1,016 passed + 1 skipped in the 3.12 `.venv` with `[crewai]` + `[vector]` + `[embeddings]`
+**Tests:** ~1,000 passing (2026-10-28) — 974 passed + 13 skipped on Python 3.14 (the CrewAI modules
+skip), 1,021 passed + 1 skipped in the 3.12 `.venv` with `[crewai]` + `[vector]` + `[embeddings]`
 (`python -m pytest tests/`; later phases below added the daemon, server,
 scheduler, run-outcome, doctor, work-item, grant, spaces, agents, MCP, crew, hardening,
 scaling, budget and session-persistence suites). The original set covers permission classify, store

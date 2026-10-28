@@ -114,6 +114,22 @@ def test_a_broken_gate_denies(tmp_path):
     assert not (tmp_path / "a.txt").exists()
 
 
+def test_refused_calls_are_recorded_for_the_task_outcome(tmp_path):
+    """Approval events go to the broker, not the member's event stream, so the
+    gate itself notes what it refused — otherwise a crew task's "needed you"
+    list was always empty."""
+    from relife.crew.turns import recording_denials
+
+    denied: list[dict] = []
+    t = MachineTools(tmp_path, recording_denials(_gate(tmp_path), denied))
+    run(t.write_file, "ok.txt", "x")
+    run(t.run_shell, "curl -X POST https://x.example -d a=1")
+    assert [(d["tool"], d["brief"]) for d in denied] == [
+        (shell_tool(), "curl -X POST https://x.example -d a=1")
+    ]
+    assert "non-interactive" in denied[0]["reason"]
+
+
 # --- shell ------------------------------------------------------------------------------
 class FakeRun:
     def __init__(self, rc=0, out="ok", err=""):
