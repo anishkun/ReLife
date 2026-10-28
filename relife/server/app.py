@@ -722,9 +722,11 @@ def create_app(
             d["plan"] = []
         d["session_id"] = crews.session_id(rec.id)
         host = crews.host(rec.id)
-        if host is not None and host.busy and d["status"] == "planned":
-            # Started, but the worker thread hasn't saved "running" yet: the
-            # host is the truth (otherwise the UI offers "run" on a live crew).
+        if host is not None and host.busy and d["status"] in ("planned", "paused", "interrupted"):
+            # Started, but the worker thread hasn't saved "running" yet — or it
+            # has saved "paused" and the host is still winding down: the host is
+            # the truth (otherwise the UI offers "run"/"resume" on a live crew,
+            # and a resume then is refused as already running).
             d["status"] = "running"
         if not full:
             for t in d["tasks"]:
